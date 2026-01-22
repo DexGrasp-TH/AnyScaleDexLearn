@@ -20,7 +20,9 @@ model:
   grasp_type_emb:
     name: LearnableTypeCond
     out_feat_dim: 128
-    disabled: False
+    in_feat_dim: ${..backbone.out_feat_dim}
+    use_predictor: false
+    disabled: false
   head:
     name: FlowRT_MLPRTJ
     in_feat_dim:

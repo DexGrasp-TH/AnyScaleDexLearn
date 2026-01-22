@@ -6,7 +6,7 @@ Learning-based grasp synthesis baselines (e.g., diffusion model and normalizing 
 ## TODO list
 
 - [x] Support BODex and Dexonomy datasets
-- [ ] Release grasp type classifier for Dexonomy
+- [x] Release grasp type classifier for Dexonomy
 
 ## Installation
 ```bash
@@ -16,7 +16,12 @@ conda create -n dexlearn python=3.10
 conda activate dexlearn
 
 # pytorch
+<<<<<<< HEAD
 conda install pytorch==2.2.2 pytorch-cuda=12.1 -c pytorch -c nvidia 
+=======
+conda install -c conda-forge mkl=2020.2 -y
+conda install pytorch==2.0.1 pytorch-cuda=11.7 -c pytorch -c nvidia 
+>>>>>>> 5f9de7c89c6e2f329d6cdbd76a86d463de6d271a
 
 # pytorch3d (TO CHECK)
 wget https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch3d/linux-64/pytorch3d-0.7.8-py310_cu121_pyt222.tar.bz2
@@ -48,7 +53,12 @@ cd ../..
 
 # dexlearn
 pip install -e .
+pip install numpy==1.26.4
+pip install hydra-core
 ```
+you may need to run the following command to avoid potential errors related to MKL such as `undefined symbol: iJIT_NotifyEvent`
+```
+conda install -c conda-forge mkl=2020.2 -y
 
 ## Getting Started
 1. **Prepare assets**. Download Dexonomy dataset from [Hugging Face](https://huggingface.co/datasets/JiayiChenPKU/Dexonomy). The folder should be organized as below:
@@ -76,6 +86,18 @@ Similarly, you can download BODex dataset from [Hugging Face](https://huggingfac
 CUDA_VISIBLE_DEVICES=0 python -m dexlearn.train exp_name=type1 algo=nflow data=dexonomy_shadow
 CUDA_VISIBLE_DEVICES=0 python -m dexlearn.sample -e dexonomy_shadow_nflow_type1       
 ```
+If you want to use our pre-trained models, please download the checkpoints from [Hugging Face](https://huggingface.co/datasets/JiayiChenPKU/Dexonomy) and put them in the `output` folder.
+```
+DexLearn/output
+|- dexonomy_shadow_nflow_cond
+|   |- .hydra
+|   |- ckpts
+```
+and then you can run the sampling command below:
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m dexlearn.sample -e dexonomy_shadow_nflow_cond algo.model.grasp_type_emb.use_predictor=True
+```
+Now we donot support the training of predictor for grasp type.
 
 
 

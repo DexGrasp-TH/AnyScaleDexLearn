@@ -3,7 +3,7 @@ __pycache__/
 
 # .vscode
 *.npy
-
+*.json
 debug*
 output*
 *.tar.bz2

@@ -18,12 +18,12 @@ class BaseModel(torch.nn.Module):
 
     def forward(self, data: dict):
         global_feature, local_feature = self.backbone(data)
-        cond_feat = torch.cat([global_feature, self.grasp_type_emb(data)], dim=-1)
+        cond_feat = torch.cat([global_feature, self.grasp_type_emb(data,global_feature)], dim=-1)
         ret_dict = self.output_head.forward(data, cond_feat)
         return ret_dict
 
     def sample(self, data: dict, sample_num: int = 1):
         global_feature, local_feature = self.backbone(data)
-        cond_feat = torch.cat([global_feature, self.grasp_type_emb(data)], dim=-1)
+        cond_feat = torch.cat([global_feature, self.grasp_type_emb(data,global_feature,True)], dim=-1)
         robot_pose, log_prob = self.output_head.sample(cond_feat, sample_num)
         return robot_pose, log_prob
