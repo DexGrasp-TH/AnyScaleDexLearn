@@ -7,12 +7,13 @@
 
         {
             "name": "Python Debugger: Current File with Arguments",
-            "type": "debugpy",
+            "type": "python",
             "request": "launch",
             "program": "${file}",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["-e", "bodex_tabletop_leap_tac3d_nflow_realworld", "data.pc_centering=True"],
+            // "args": ["-e", "bodex_tabletop_leap_tac3d_nflow_realworld", "data.pc_centering=True"],
+            "args": ["exp_name=debug", "data=human", "algo=nflow_human"]
         }
     ]
 }

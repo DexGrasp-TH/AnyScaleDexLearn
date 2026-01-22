@@ -8,3 +8,5 @@ debug*
 output*
 *.tar.bz2
 assets/
+
+third_party/manopth/

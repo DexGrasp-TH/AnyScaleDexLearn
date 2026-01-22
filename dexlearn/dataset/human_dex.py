@@ -2,21 +2,27 @@ import os
 from os.path import join as pjoin
 from glob import glob
 import random
-
+import time
 import numpy as np
 from torch.utils.data import Dataset
 
 from dexlearn.utils.rot import numpy_quaternion_to_matrix
 from dexlearn.utils.util import load_json, load_scene_cfg
+from scipy.spatial.transform import Rotation as sciR
 
 import pdb
 
 
-class DexDataset(Dataset):
+class HumanDexDataset(Dataset):
     def __init__(self, config: dict, mode: str, sc_voxel_size: float = None):
         self.config = config
         self.sc_voxel_size = sc_voxel_size
         self.mode = mode
+
+        # Initialize cache dict
+        self.grasp_path_dict = {} # {grasp_type: {obj_id: [path1, path2, ...]}}
+        self.pc_path_dict = {}    # {obj_name: [pc_path1, ...]}
+        # self.pc_data_cache = {}   # 内存缓存点云数据 (可选)
 
         if self.config.grasp_type_lst is not None:
             self.grasp_type_lst = self.config.grasp_type_lst
@@ -30,7 +36,7 @@ class DexDataset(Dataset):
         elif mode == "test":
             self.init_test()
         return
-
+    
     def init_train_eval(self, mode):
         split_name = "test" if mode == "eval" else "train"
         self.obj_id_lst = load_json(
@@ -39,29 +45,36 @@ class DexDataset(Dataset):
 
         self.grasp_obj_dict = {}
         self.data_num = 0
+        
+        print(f"Pre-indexing {mode} data paths...")
         for grasp_type in self.grasp_type_lst:
             self.grasp_obj_dict[grasp_type] = []
+            self.grasp_path_dict[grasp_type] = {}
+            
             for obj_id in self.obj_id_lst:
-                obj_grasp_data = len(
-                    glob(
-                        pjoin(self.config.grasp_path, grasp_type, obj_id, "**/**.npy"),
-                        recursive=True,
-                    )
+                # 只在这里执行一次 glob
+                found_paths = glob(
+                    pjoin(self.config.grasp_path, grasp_type, obj_id, "**/**.npy"),
+                    recursive=True,
                 )
-                if obj_grasp_data == 0:
+                
+                if len(found_paths) == 0:
                     continue
-                self.data_num += obj_grasp_data
+                
+                self.data_num += len(found_paths)
                 self.grasp_obj_dict[grasp_type].append(obj_id)
+                self.grasp_path_dict[grasp_type][obj_id] = sorted(found_paths)
+                
             if len(self.grasp_obj_dict[grasp_type]) == 0:
                 self.grasp_obj_dict.pop(grasp_type)
+        
         print(
             f"mode: {mode}, grasp type number: {self.grasp_type_num}, grasp data num: {self.data_num}"
         )
-        return
 
     def init_test(self):
         """
-        TODO
+        TODO: for human grasp dataset
         """
         split_name = self.config.test_split
         self.obj_id_lst = []
@@ -92,58 +105,64 @@ class DexDataset(Dataset):
         return self.data_num
 
     def __getitem__(self, id: int):
+        # print(f"data id: {id}") # DEBUG
+
+        t_start = time.perf_counter()
+        metrics = {}
+
         ret_dict = {}
 
         if self.mode == "train" or self.mode == "eval":
+
+            t0 = time.perf_counter()
+
             # random select grasp data
             rand_grasp_type = random.choice(self.grasp_type_lst)
             grasp_obj_lst = self.grasp_obj_dict[rand_grasp_type]
             rand_obj_id = random.choice(grasp_obj_lst)
-            grasp_npy_lst = glob(
-                pjoin(
-                    self.config.grasp_path, rand_grasp_type, rand_obj_id, "**/**.npy"
-                ),
-                recursive=True,
-            )
+            grasp_npy_lst = self.grasp_path_dict[rand_grasp_type][rand_obj_id]
             grasp_path = random.choice(sorted(grasp_npy_lst))
+
+            metrics['glob_time'] = time.perf_counter() - t0
+
+            t1 = time.perf_counter()
+
             grasp_data = np.load(grasp_path, allow_pickle=True).item()
 
-            robot_pose = np.stack(
-                [
-                    grasp_data["pregrasp_qpos"],
-                    grasp_data["grasp_qpos"],
-                    grasp_data["squeeze_qpos"],
-                ],
-                axis=-2,
-            )
-            if len(robot_pose.shape) == 3:
-                rand_pose_id = np.random.randint(robot_pose.shape[0])
-                robot_pose = robot_pose[rand_pose_id : rand_pose_id + 1]  # 1, 3, J
-            else:
-                raise NotImplementedError
+            metrics['grasp_load_time'] = time.perf_counter() - t1
 
-            scene_cfg = load_scene_cfg(grasp_data["scene_path"])
+            ret_dict["path"] = grasp_path
+
+            ret_dict["hand_trans"] = np.asarray(grasp_data['hand']['right']['trans']).reshape(1, 1, 3)
+            ret_dict["hand_rot"] = sciR.from_rotvec(grasp_data['hand']['right']['rot']).as_matrix().reshape(1, 1, 3, 3)
+
+            obj_name = grasp_data['object']['name']
+            obj_scale = grasp_data['object']['rel_scale']
+            obj_pose = grasp_data['object']['pose']
+
+            t2 = time.perf_counter()
 
             # read point cloud
-            pc_path_lst = glob(
-                pjoin(self.object_pc_folder, scene_cfg["scene_id"], "partial_pc**.npy")
-            )
-            pc_path = random.choice(sorted(pc_path_lst))
+            if obj_name not in self.pc_path_dict:
+                # store the pointcloud file path
+                self.pc_path_dict[obj_name] = sorted(glob(pjoin(self.object_pc_folder, obj_name, "**.npy")))
+            pc_path = random.choice(self.pc_path_dict[obj_name])
+
             raw_pc = np.load(pc_path, allow_pickle=True)
             idx = np.random.choice(
                 raw_pc.shape[0], self.config.num_points, replace=True
             )
-            pc = raw_pc[idx]
-            if "scene_scale" in grasp_data:
-                pc *= grasp_data["scene_scale"][rand_pose_id]
+            scaled_pc = raw_pc[idx] * obj_scale # re-scale the raw mesh (pointcloud) to the actual scale
+            R = obj_pose[:3, :3]  # (3, 3)
+            t = obj_pose[:3, 3]   # (3,)
+            transformed_pc = np.matmul(scaled_pc, R.T) + t # transform the object pointcloud based on the object pose
+            pc = transformed_pc
 
-            ret_dict["hand_trans"] = robot_pose[:, :, :3]  # (K, n, 3)
-            ret_dict["hand_rot"] = numpy_quaternion_to_matrix(
-                robot_pose[:, :, 3:7]
-            )  # (K, n, 3, 3)
-            ret_dict["hand_joint"] = robot_pose[:, :, 7:]  # (K, n, Q)
+            metrics['pc_process_time'] = time.perf_counter() - t2
 
         elif self.mode == "test":
+            # TODO: for human grasp dataset
+
             rand_grasp_type = self.grasp_type_lst[id // len(self.test_cfg_lst)]
             scene_path = self.test_cfg_lst[id % len(self.test_cfg_lst)]
             scene_cfg = load_scene_cfg(scene_path)
@@ -178,4 +197,11 @@ class DexDataset(Dataset):
         if self.sc_voxel_size is not None:
             ret_dict["coors"] = pc / self.sc_voxel_size  # (N, 3)
             ret_dict["feats"] = pc  # (N, 3)
+
+        # total_time = time.perf_counter() - t_start
+        # print(f"\n--- Data ID {id} Profiling ---")
+        # for k, v in metrics.items():
+        #     print(f"{k}: {v:.4f}s ({v/total_time:.1%})")
+        # print(f"Total Time: {total_time:.4f}s")
+
         return ret_dict

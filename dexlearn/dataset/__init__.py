@@ -8,6 +8,7 @@ import torch
 from copy import deepcopy
 
 from .base_dex import DexDataset
+from .human_dex import HumanDexDataset
 
 
 def create_dataset(config, mode):
@@ -21,14 +22,22 @@ def create_dataset(config, mode):
         for p in config.data.object_path:
             new_data_config = deepcopy(config.data)
             new_data_config.object_path = p
-            dataset_lst.append(DexDataset(new_data_config, mode, sp_voxel_size))
+            if getattr(config.data, "human", None):
+                single_dataset = HumanDexDataset(new_data_config, mode, sp_voxel_size)
+            else:
+                single_dataset = DexDataset(new_data_config, mode, sp_voxel_size)
+            dataset_lst.append(single_dataset)
         dataset = torch.utils.data.ConcatDataset(dataset_lst)
     else:
-        dataset = DexDataset(config.data, mode, sp_voxel_size)
+        if getattr(config.data, "human", None):
+            dataset = HumanDexDataset(config.data, mode, sp_voxel_size)
+        else:
+            dataset = DexDataset(config.data, mode, sp_voxel_size)
+
     return dataset
 
 
-def create_train_dataloader(config: DictConfig):
+def create_train_dataloader(config: DictConfig, train_shuffle=True):
     train_dataset = create_dataset(config, mode="train")
     val_dataset = create_dataset(config, mode="eval")
 
@@ -38,7 +47,7 @@ def create_train_dataloader(config: DictConfig):
             batch_size=config.algo.batch_size,
             drop_last=True,
             num_workers=config.data.num_workers,
-            shuffle=True,
+            shuffle=train_shuffle,
             collate_fn=minkowski_collate_fn,
         ),
         config.device,
@@ -84,8 +93,9 @@ class InfLoader:
         try:
             data = next(self.iter_loader)
         except StopIteration:
+            # reset to the init when reaching the dataset end
             self.iter_loader = iter(self.loader)
-            data = next(self.iter_loader)
+            data = next(self.iter_loader) 
 
         for k, v in data.items():
             if type(v).__module__ == "torch":

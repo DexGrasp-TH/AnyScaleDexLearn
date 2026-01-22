@@ -21,10 +21,10 @@ class MobiusFlow(nn.Module):
     def __init__(self, D, K, real_dim, feature_dim=None):
         super(MobiusFlow, self).__init__()
 
-        self.D = D
+        self.D = D # what is this?
         self.K = K
         self.real_dim = real_dim
-        self.cond_real_dim = real_dim // 2
+        self.cond_real_dim = real_dim // 2 # TODO: ?
         self.tran_real_dim = real_dim - self.cond_real_dim
 
         self.feature_dim = feature_dim
@@ -62,7 +62,7 @@ class MobiusFlow(nn.Module):
         w = torch.einsum("nij,nkj->nki", proj, w)
         r = -x
         r = r / r.norm(dim=-1, keepdim=True)
-        v = torch.cross(y, r)
+        v = torch.cross(y, r, dim=-1)
         v = v / v.norm(dim=-1, keepdim=True)
 
         weights = torch.nn.functional.softplus(weights)
