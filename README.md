@@ -16,12 +16,7 @@ conda create -n dexlearn python=3.10
 conda activate dexlearn
 
 # pytorch
-<<<<<<< HEAD
 conda install pytorch==2.2.2 pytorch-cuda=12.1 -c pytorch -c nvidia 
-=======
-conda install -c conda-forge mkl=2020.2 -y
-conda install pytorch==2.0.1 pytorch-cuda=11.7 -c pytorch -c nvidia 
->>>>>>> 5f9de7c89c6e2f329d6cdbd76a86d463de6d271a
 
 # pytorch3d (TO CHECK)
 wget https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch3d/linux-64/pytorch3d-0.7.8-py310_cu121_pyt222.tar.bz2
@@ -159,6 +154,13 @@ CUDA_VISIBLE_DEVICES=x python -m dexlearn.sample -e bodex_tabletop_xxx_nflow_deb
 ```
 
 ### Human Grasp
+
+Train:
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m dexlearn.train exp_name=debug algo=nflow_human data=human
+CUDA_VISIBLE_DEVICES=0 python -m dexlearn.train exp_name=debug algo=h_nflow data=human
+```
+
+Sample (Inference): 
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m dexlearn.sample -e human_h_nflow_debug
 ```

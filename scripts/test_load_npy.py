@@ -4,7 +4,7 @@ import numpy as np
 # data = np.load(file, allow_pickle=True).item()
 
 
-file = "/data/dataset/BODex/object/DGN_2k/vision_data/azure_kinect_dk/core_bottle_1a7ba1f4c892e2da30711cdbdbc73924/tabletop_ur10e/scale006_pose004_0/partial_pc_00.npy"
+file = "/data/dataset/BODex/object/DGN_2k/scene_cfg/core_bottle_1a7ba1f4c892e2da30711cdbdbc73924/floating/scale006.npy"
 data = np.load(file, allow_pickle=True)
 
 a = 1

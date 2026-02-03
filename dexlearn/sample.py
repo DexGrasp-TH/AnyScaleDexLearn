@@ -42,21 +42,25 @@ def main_func(config: DictConfig) -> None:
 
             # select top k predictions with higher log_prob
             topk_indices = torch.topk(log_prob, config.algo.test_topk, dim=1).indices
-            batch_indices = (
-                torch.arange(robot_pose.size(0))
-                .unsqueeze(1)
-                .expand(-1, config.algo.test_topk)
-            )
+            batch_indices = torch.arange(robot_pose.size(0)).unsqueeze(1).expand(-1, config.algo.test_topk)
             robot_pose = robot_pose[batch_indices, topk_indices]
             log_prob = log_prob[batch_indices, topk_indices]
 
-            save_dict = {
-                "pregrasp_qpos": robot_pose[..., 0, :],
-                "grasp_qpos": robot_pose[..., 1, :],
-                "squeeze_qpos": robot_pose[..., 2, :],
-                "grasp_error": -log_prob,
-                "scene_path": data["scene_path"],
-            }
+            if config.algo.human:
+                save_dict = {
+                    "grasp_pose": robot_pose[..., 0, :],
+                    "grasp_error": -log_prob,
+                    "scene_path": data["scene_path"],
+                    "pc_path": data["pc_path"],
+                }
+            else:
+                save_dict = {
+                    "pregrasp_qpos": robot_pose[..., 0, :],
+                    "grasp_qpos": robot_pose[..., 1, :],
+                    "squeeze_qpos": robot_pose[..., 2, :],
+                    "grasp_error": -log_prob,
+                    "scene_path": data["scene_path"],
+                }
 
             logger.save_samples(save_dict, ckpt_iter, data["save_path"])
 
@@ -64,7 +68,6 @@ def main_func(config: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -76,11 +79,7 @@ if __name__ == "__main__":
     )
     args, unknown = parser.parse_known_args()
 
-    sys.argv = (
-        sys.argv[:1]
-        + unknown
-        + list(OmegaConf.load(f"output/{args.exp_name}/.hydra/overrides.yaml"))
-    )
+    sys.argv = sys.argv[:1] + unknown + list(OmegaConf.load(f"output/{args.exp_name}/.hydra/overrides.yaml"))
 
     # remove duplicated args. Note: cmd has the priority!
     check_dict = {}

@@ -13,7 +13,10 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             // "args": ["-e", "bodex_tabletop_leap_tac3d_nflow_realworld", "data.pc_centering=True"],
-            "args": ["exp_name=debug", "data=human", "algo=nflow_human"]
+            // "args": ["data=human", "algo=h_nflow", "data.pc_centering=True", "exp_name=debug"],
+            // "args": ["exp_name=debug", "data.pc_centering=True", "-e", "human_h_nflow_debug"]
+             "args": ["exp_name=debug", "data.pc_centering=True", "data=human_DGN", "algo=h_nflow",
+                      "-e", "human_DGN_h_nflow_debug"]
         }
     ]
 }

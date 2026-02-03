@@ -1,3 +1,4 @@
+human: True
 batch_size: 256
 max_iter: 50000
 lr: 0.001
@@ -20,7 +21,9 @@ model:
   grasp_type_emb:
     name: LearnableTypeCond
     out_feat_dim: 128
-    disabled: False
+    in_feat_dim: ${..backbone.out_feat_dim}
+    use_predictor: false
+    disabled: false
   head:
     name: FlowRT
     in_feat_dim:

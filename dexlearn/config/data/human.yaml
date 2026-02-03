@@ -15,5 +15,5 @@ pc_path: vision_data/complete_pc    # relative to object_path
 
 
 test_split: test
-test_scene_cfg: tabletop_ur10e/**.npy
+test_scene_cfg: "**/*.npy"
 mini_test: False

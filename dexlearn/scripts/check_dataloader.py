@@ -2,7 +2,6 @@ import sys
 import os
 
 import torch
-from torch.optim.lr_scheduler import CosineAnnealingLR
 import hydra
 from omegaconf import DictConfig
 from tqdm import trange
@@ -13,11 +12,11 @@ from pytorch3d.transforms import matrix_to_axis_angle
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.logger import Logger
 from dexlearn.utils.util import set_seed
-from dexlearn.dataset import create_train_dataloader
 from dexlearn.network.models import *
 
 from dexlearn.dataset import create_dataset, minkowski_collate_fn, InfLoader
 from manopth.manolayer import ManoLayer
+
 
 def visualize_with_trimesh(verts, faces, joints=None):
     """
@@ -44,7 +43,8 @@ def visualize_with_trimesh(verts, faces, joints=None):
 
     return scene_contents
 
-@hydra.main(config_path="config", config_name="base", version_base=None)
+
+@hydra.main(config_path="../config", config_name="base", version_base=None)
 def main(config: DictConfig) -> None:
     set_seed(config.seed)
     logger = Logger(config)
@@ -79,10 +79,10 @@ def main(config: DictConfig) -> None:
         data = train_loader.get()
 
         for i in range(config.algo.batch_size):
-            print("path: ", data['path'][i])
+            print("path: ", data["path"][i])
 
             scene_elements = []
-        
+
             ############# Hand base pose ##############
             hand_trans = data["hand_trans"][i, 0, 0, :]
             hand_pose = torch.eye(4)
@@ -90,7 +90,12 @@ def main(config: DictConfig) -> None:
             hand_pose[:3, 3] = hand_trans
             hand_pose_np = hand_pose.cpu().numpy()
             # Create the coordinate axis at the hand_pose
-            axis = trimesh.creation.axis(transform=hand_pose_np, origin_size=0.01, axis_radius=0.005, axis_length=0.1)
+            axis = trimesh.creation.axis(
+                transform=hand_pose_np,
+                origin_size=0.01,
+                axis_radius=0.005,
+                axis_length=0.1,
+            )
             scene_elements.append(axis)
 
             ############# MANO ##############
@@ -98,7 +103,7 @@ def main(config: DictConfig) -> None:
             mano_pose = torch.zeros((1, 45), device=config.device)
             mano_params = torch.cat([hand_rot, mano_pose], dim=-1)
             mano_betas = torch.zeros((1, 10), device=config.device)
-            
+
             verts, joints = mano_layer(mano_params, th_betas=mano_betas)
             verts = (verts / 1000.0) + hand_trans.unsqueeze(0)
             joints = (joints / 1000.0) + hand_trans.unsqueeze(0)
@@ -110,11 +115,15 @@ def main(config: DictConfig) -> None:
             scene_elements.extend(visualize_with_trimesh(v_np, f_np, j_np))
 
             ############# Object pointcloud ##############
-            pc_np = data['point_clouds'][i, ...].cpu().numpy()
-            points = trimesh.points.PointCloud(pc_np, colors=[255, 0, 0, 255]) # Red points
+            pc_np = data["point_clouds"][i, ...].cpu().numpy()
+            points = trimesh.points.PointCloud(
+                pc_np, colors=[255, 0, 0, 255]
+            )  # Red points
             scene_elements.append(points)
 
-            world_axis = trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3)
+            world_axis = trimesh.creation.axis(
+                origin_size=0.01, axis_radius=0.001, axis_length=0.3
+            )
             scene_elements.append(world_axis)
 
             # Create a scene to hold both objects

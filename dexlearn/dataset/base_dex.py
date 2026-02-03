@@ -33,9 +33,7 @@ class DexDataset(Dataset):
 
     def init_train_eval(self, mode):
         split_name = "test" if mode == "eval" else "train"
-        self.obj_id_lst = load_json(
-            pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json")
-        )
+        self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
 
         self.grasp_obj_dict = {}
         self.data_num = 0
@@ -54,21 +52,14 @@ class DexDataset(Dataset):
                 self.grasp_obj_dict[grasp_type].append(obj_id)
             if len(self.grasp_obj_dict[grasp_type]) == 0:
                 self.grasp_obj_dict.pop(grasp_type)
-        print(
-            f"mode: {mode}, grasp type number: {self.grasp_type_num}, grasp data num: {self.data_num}"
-        )
+        print(f"mode: {mode}, grasp type number: {self.grasp_type_num}, grasp data num: {self.data_num}")
         return
 
     def init_test(self):
-        """
-        TODO
-        """
         split_name = self.config.test_split
         self.obj_id_lst = []
         self.test_cfg_lst = []
-        self.obj_id_lst = load_json(
-            pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json")
-        )
+        self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
         if self.config.mini_test:
             self.obj_id_lst = self.obj_id_lst[:100]
         for o in self.obj_id_lst:
@@ -100,9 +91,7 @@ class DexDataset(Dataset):
             grasp_obj_lst = self.grasp_obj_dict[rand_grasp_type]
             rand_obj_id = random.choice(grasp_obj_lst)
             grasp_npy_lst = glob(
-                pjoin(
-                    self.config.grasp_path, rand_grasp_type, rand_obj_id, "**/**.npy"
-                ),
+                pjoin(self.config.grasp_path, rand_grasp_type, rand_obj_id, "**/**.npy"),
                 recursive=True,
             )
             grasp_path = random.choice(sorted(grasp_npy_lst))
@@ -125,22 +114,16 @@ class DexDataset(Dataset):
             scene_cfg = load_scene_cfg(grasp_data["scene_path"])
 
             # read point cloud
-            pc_path_lst = glob(
-                pjoin(self.object_pc_folder, scene_cfg["scene_id"], "partial_pc**.npy")
-            )
+            pc_path_lst = glob(pjoin(self.object_pc_folder, scene_cfg["scene_id"], "partial_pc**.npy"))
             pc_path = random.choice(sorted(pc_path_lst))
             raw_pc = np.load(pc_path, allow_pickle=True)
-            idx = np.random.choice(
-                raw_pc.shape[0], self.config.num_points, replace=True
-            )
+            idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
             pc = raw_pc[idx]
             if "scene_scale" in grasp_data:
                 pc *= grasp_data["scene_scale"][rand_pose_id]
 
             ret_dict["hand_trans"] = robot_pose[:, :, :3]  # (K, n, 3)
-            ret_dict["hand_rot"] = numpy_quaternion_to_matrix(
-                robot_pose[:, :, 3:7]
-            )  # (K, n, 3, 3)
+            ret_dict["hand_rot"] = numpy_quaternion_to_matrix(robot_pose[:, :, 3:7])  # (K, n, 3, 3)
             ret_dict["hand_joint"] = robot_pose[:, :, 7:]  # (K, n, Q)
 
         elif self.mode == "test":
@@ -154,27 +137,22 @@ class DexDataset(Dataset):
             )
             pc_path = random.choice(sorted(pc_path_lst))
             raw_pc = np.load(pc_path, allow_pickle=True)
-            idx = np.random.choice(
-                raw_pc.shape[0], self.config.num_points, replace=True
-            )
+            idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
             pc = raw_pc[idx]
 
-            ret_dict["save_path"] = pjoin(
-                rand_grasp_type, scene_cfg["scene_id"], os.path.basename(pc_path)
-            )
+            ret_dict["save_path"] = pjoin(rand_grasp_type, scene_cfg["scene_id"], os.path.basename(pc_path))
             ret_dict["scene_path"] = scene_path
+            ret_dict["pc_path"] = pc_path
 
         # Move the pointcloud centroid to the origin. Move the robot pose accordingly.
         if self.config.pc_centering:
             pc_centroid = np.mean(pc, axis=-2, keepdims=True)
-            pc = pc - pc_centroid # normalization
+            pc = pc - pc_centroid  # normalization
             if self.mode != "test":
                 ret_dict["hand_trans"] = ret_dict["hand_trans"] - pc_centroid[None, :, :]
 
         ret_dict["point_clouds"] = pc  # (N, 3)
-        ret_dict["grasp_type_id"] = (
-            int(rand_grasp_type.split("_")[0]) if self.config.grasp_type_cond else 0
-        )
+        ret_dict["grasp_type_id"] = int(rand_grasp_type.split("_")[0]) if self.config.grasp_type_cond else 0
         if self.sc_voxel_size is not None:
             ret_dict["coors"] = pc / self.sc_voxel_size  # (N, 3)
             ret_dict["feats"] = pc  # (N, 3)

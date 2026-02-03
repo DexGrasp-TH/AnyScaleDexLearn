@@ -35,54 +35,12 @@ class FlowRT(torch.nn.Module):
         return result_dict
 
     def sample(self, global_feature, sample_num):
-        # TODO
         grasp_rot, grasp_trans, log_prob = self.flow.sample_and_log_prob(
             sample_num, global_feature, allow_fail=False
         )
-
-        global_feature = repeat(global_feature, "b c -> (b n) c", n=sample_num)
-        in_mlp_feat = torch.cat(
-            [
-                global_feature,
-                rearrange(grasp_rot, "b n x y -> (b n) (x y)"),
-                rearrange(grasp_trans, "b n c -> (b n) c"),
-            ],
-            dim=-1,
-        )
-        pred_info = self.joint_mlp(in_mlp_feat)
-        pose_num = self.cfg.traj_length - 1
-        hand_trans = rearrange(
-            pred_info[:, : pose_num * 3],
-            "(b t) (n c) -> b t n c",
-            t=sample_num,
-            n=pose_num,
-        )
-        hand_rot = rearrange(
-            pred_info[:, pose_num * 3 : pose_num * 12],
-            "(b t) (n x y) -> b t n x y",
-            t=sample_num,
-            n=pose_num,
-            x=3,
-        )
-
-        hand_joint = rearrange(
-            pred_info[:, pose_num * 12 :],
-            "(b t) (n c) -> b t n c",
-            t=sample_num,
-            n=pose_num + 1,
-        )
-
-        final_trans = torch.cat([hand_trans, grasp_trans.unsqueeze(-2)], dim=-2)
-        final_quat = pttf.matrix_to_quaternion(
-            torch.cat(
-                [
-                    proper_svd(hand_rot.reshape(-1, 3, 3)).reshape_as(hand_rot),
-                    grasp_rot.unsqueeze(-3),
-                ],
-                dim=-3,
-            ),
-        )
-        robot_pose = torch.cat([final_trans, final_quat, hand_joint], dim=-1)
+        final_trans = grasp_trans.unsqueeze(-2)
+        final_quat = pttf.matrix_to_quaternion(grasp_rot.unsqueeze(-3))
+        robot_pose = torch.cat([final_trans, final_quat], dim=-1)
         return robot_pose, log_prob
 
 

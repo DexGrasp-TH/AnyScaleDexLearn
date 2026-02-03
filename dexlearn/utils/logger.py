@@ -61,7 +61,7 @@ class Logger:
                 for k, v in dic.items():
                     if type(v).__module__ == "torch":
                         save_dict[k] = v[i, j].detach().cpu().numpy()
-                    elif k == "scene_path":
+                    elif k in ["scene_path", "pc_path"]:
                         save_dict[k] = v[i]
                     else:
                         raise NotImplementedError
