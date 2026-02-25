@@ -7,6 +7,10 @@ from dexlearn.utils.rot import proper_svd
 from pytorch3d import transforms as pttf
 
 
+class BiFlowRT(torch.nn.Module):
+    pass
+
+
 class FlowRT(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -35,9 +39,7 @@ class FlowRT(torch.nn.Module):
         return result_dict
 
     def sample(self, global_feature, sample_num):
-        grasp_rot, grasp_trans, log_prob = self.flow.sample_and_log_prob(
-            sample_num, global_feature, allow_fail=False
-        )
+        grasp_rot, grasp_trans, log_prob = self.flow.sample_and_log_prob(sample_num, global_feature, allow_fail=False)
         final_trans = grasp_trans.unsqueeze(-2)
         final_quat = pttf.matrix_to_quaternion(grasp_rot.unsqueeze(-3))
         robot_pose = torch.cat([final_trans, final_quat], dim=-1)
@@ -51,9 +53,7 @@ class FlowRT_MLPRTJ(torch.nn.Module):
         self.flow_thresh = 20
         self.flow = Flow(cfg.mobius, cfg.in_feat_dim, 3)
         self.flow.mask()
-        self.joint_mlp = BasicMLP(
-            cfg.in_feat_dim + 9 + 3, (cfg.joint_num + 12) * cfg.traj_length - 12
-        )
+        self.joint_mlp = BasicMLP(cfg.in_feat_dim + 9 + 3, (cfg.joint_num + 12) * cfg.traj_length - 12)
         self.joint_loss = torch.nn.SmoothL1Loss(reduction="none")
         return
 
@@ -94,16 +94,12 @@ class FlowRT_MLPRTJ(torch.nn.Module):
         result_dict["loss_rot"] = loss_others[:, pose_num * 3 : pose_num * 12].mean()
         result_dict["loss_joint"] = loss_others[:, pose_num * 12 :].mean()
         with torch.no_grad():
-            result_dict["abs_dis_joint"] = (
-                (out_info - gt_info)[pose_num * 12 :].abs().mean()
-            )
+            result_dict["abs_dis_joint"] = (out_info - gt_info)[pose_num * 12 :].abs().mean()
 
         return result_dict
 
     def sample(self, global_feature, sample_num):
-        grasp_rot, grasp_trans, log_prob = self.flow.sample_and_log_prob(
-            sample_num, global_feature, allow_fail=False
-        )
+        grasp_rot, grasp_trans, log_prob = self.flow.sample_and_log_prob(sample_num, global_feature, allow_fail=False)
 
         global_feature = repeat(global_feature, "b c -> (b n) c", n=sample_num)
         in_mlp_feat = torch.cat(
@@ -158,9 +154,7 @@ class FlowRT_MLPRTJ_woMF(torch.nn.Module):
         self.flow_thresh = 20
         self.flow = Flow(cfg.mobius, cfg.in_feat_dim, 12)
         self.flow.mask()
-        self.joint_mlp = BasicMLP(
-            cfg.in_feat_dim + 9 + 3, (cfg.joint_num + 12) * cfg.traj_length - 12
-        )
+        self.joint_mlp = BasicMLP(cfg.in_feat_dim + 9 + 3, (cfg.joint_num + 12) * cfg.traj_length - 12)
         self.joint_loss = torch.nn.SmoothL1Loss(reduction="none")
         return
 
@@ -176,9 +170,7 @@ class FlowRT_MLPRTJ_woMF(torch.nn.Module):
 
         # Use Flow to predict grasp rot and trans
         grasp_rot = hand_rot[:, -1]
-        other_info = torch.cat(
-            [rearrange(grasp_rot, "b x y -> b (x y)"), hand_trans[:, -1]], dim=-1
-        )
+        other_info = torch.cat([rearrange(grasp_rot, "b x y -> b (x y)"), hand_trans[:, -1]], dim=-1)
         loss_nll = -self.flow.log_prob(grasp_rot, other_info, global_feature)
         loss_nll[loss_nll > self.flow_thresh] = self.flow_thresh
         result_dict["loss_nll"] = loss_nll.mean()
@@ -200,20 +192,14 @@ class FlowRT_MLPRTJ_woMF(torch.nn.Module):
         result_dict["loss_rot"] = loss_others[:, pose_num * 3 : pose_num * 12].mean()
         result_dict["loss_joint"] = loss_others[:, pose_num * 12 :].mean()
         with torch.no_grad():
-            result_dict["abs_dis_joint"] = (
-                (out_info - gt_info)[pose_num * 12 :].abs().mean()
-            )
+            result_dict["abs_dis_joint"] = (out_info - gt_info)[pose_num * 12 :].abs().mean()
 
         return result_dict
 
     def sample(self, global_feature, sample_num):
-        _, grasp_rot_trans, log_prob = self.flow.sample_and_log_prob(
-            sample_num, global_feature, allow_fail=False
-        )
+        _, grasp_rot_trans, log_prob = self.flow.sample_and_log_prob(sample_num, global_feature, allow_fail=False)
         grasp_rot = rearrange(
-            proper_svd(
-                rearrange(grasp_rot_trans[..., :9], "b n (x y) -> (b n) x y", x=3)
-            ),
+            proper_svd(rearrange(grasp_rot_trans[..., :9], "b n (x y) -> (b n) x y", x=3)),
             "(b n) x y -> b n x y",
             n=sample_num,
         )
@@ -270,9 +256,7 @@ class FlowRTJ(torch.nn.Module):
         super().__init__()
         self.cfg = cfg
         self.flow_thresh = 20
-        self.flow = Flow(
-            cfg.mobius, cfg.in_feat_dim, (cfg.joint_num + 12) * cfg.traj_length - 9
-        )
+        self.flow = Flow(cfg.mobius, cfg.in_feat_dim, (cfg.joint_num + 12) * cfg.traj_length - 9)
         self.flow.mask()
         return
 
@@ -303,9 +287,7 @@ class FlowRTJ(torch.nn.Module):
         return result_dict
 
     def sample(self, global_feature, sample_num):
-        grasp_rot, pred_info, log_prob = self.flow.sample_and_log_prob(
-            sample_num, global_feature, allow_fail=False
-        )
+        grasp_rot, pred_info, log_prob = self.flow.sample_and_log_prob(sample_num, global_feature, allow_fail=False)
         pose_num = self.cfg.traj_length
         other_rot = rearrange(
             pred_info[..., : (pose_num - 1) * 9],
@@ -343,9 +325,7 @@ class FlowRTJ_woMF(torch.nn.Module):
         super().__init__()
         self.cfg = cfg
         self.flow_thresh = 20
-        self.flow = Flow(
-            cfg.mobius, cfg.in_feat_dim, (cfg.joint_num + 12) * cfg.traj_length
-        )
+        self.flow = Flow(cfg.mobius, cfg.in_feat_dim, (cfg.joint_num + 12) * cfg.traj_length)
         self.flow.mask()
         return
 
@@ -376,9 +356,7 @@ class FlowRTJ_woMF(torch.nn.Module):
         return result_dict
 
     def sample(self, global_feature, sample_num):
-        _, pred_info, log_prob = self.flow.sample_and_log_prob(
-            sample_num, global_feature, allow_fail=False
-        )
+        _, pred_info, log_prob = self.flow.sample_and_log_prob(sample_num, global_feature, allow_fail=False)
         pose_num = self.cfg.traj_length
         hand_rot = rearrange(
             pred_info[..., : pose_num * 9],
@@ -397,9 +375,7 @@ class FlowRTJ_woMF(torch.nn.Module):
             n=pose_num,
         )
 
-        final_quat = pttf.matrix_to_quaternion(
-            proper_svd(hand_rot.reshape(-1, 3, 3)).reshape_as(hand_rot)
-        )
+        final_quat = pttf.matrix_to_quaternion(proper_svd(hand_rot.reshape(-1, 3, 3)).reshape_as(hand_rot))
         robot_pose = torch.cat([hand_trans, final_quat, hand_joint], dim=-1)
         return robot_pose, log_prob
 
@@ -459,9 +435,7 @@ class FlowRTJ_MLPRTJ(torch.nn.Module):
         result_dict["loss_rot"] = loss_others[:, pose_num * 3 : pose_num * 12].mean()
         result_dict["loss_joint"] = loss_others[:, pose_num * 12 :].mean()
         with torch.no_grad():
-            result_dict["abs_dis_joint"] = (
-                (out_info - gt_info)[pose_num * 12 :].abs().mean()
-            )
+            result_dict["abs_dis_joint"] = (out_info - gt_info)[pose_num * 12 :].abs().mean()
 
         return result_dict
 
@@ -502,12 +476,8 @@ class FlowRTJ_MLPRTJ(torch.nn.Module):
             n=pose_num,
         )
 
-        final_trans = torch.cat(
-            [hand_trans, grasp_trans_joint[..., :3].unsqueeze(-2)], dim=-2
-        )
-        final_joint = torch.cat(
-            [hand_joint, grasp_trans_joint[..., 3:].unsqueeze(-2)], dim=-2
-        )
+        final_trans = torch.cat([hand_trans, grasp_trans_joint[..., :3].unsqueeze(-2)], dim=-2)
+        final_joint = torch.cat([hand_joint, grasp_trans_joint[..., 3:].unsqueeze(-2)], dim=-2)
         final_quat = pttf.matrix_to_quaternion(
             torch.cat(
                 [
@@ -528,9 +498,7 @@ class FlowRT_MLPJ(torch.nn.Module):
         self.flow_thresh = 20
         self.flow = Flow(cfg.mobius, cfg.in_feat_dim, 12 * cfg.traj_length - 9)
         self.flow.mask()
-        self.joint_mlp = BasicMLP(
-            cfg.in_feat_dim + 12 * cfg.traj_length, cfg.joint_num * cfg.traj_length
-        )
+        self.joint_mlp = BasicMLP(cfg.in_feat_dim + 12 * cfg.traj_length, cfg.joint_num * cfg.traj_length)
         self.joint_loss = torch.nn.SmoothL1Loss(reduction="none")
         return
 
@@ -572,16 +540,12 @@ class FlowRT_MLPJ(torch.nn.Module):
         return result_dict
 
     def sample(self, global_feature, sample_num):
-        grasp_rot, other_rt, log_prob = self.flow.sample_and_log_prob(
-            sample_num, global_feature, allow_fail=False
-        )
+        grasp_rot, other_rt, log_prob = self.flow.sample_and_log_prob(sample_num, global_feature, allow_fail=False)
 
         global_feature = repeat(global_feature, "b c -> (b n) c", n=sample_num)
 
         pose_num = self.cfg.traj_length
-        hand_trans = rearrange(
-            other_rt[..., (pose_num - 1) * 9 :], "b t (n c) -> b t n c", n=pose_num
-        )
+        hand_trans = rearrange(other_rt[..., (pose_num - 1) * 9 :], "b t (n c) -> b t n c", n=pose_num)
         hand_rot = rearrange(
             other_rt[..., : (pose_num - 1) * 9],
             "b t (n x y) -> b t n x y",
@@ -599,12 +563,8 @@ class FlowRT_MLPJ(torch.nn.Module):
             dim=-1,
         )
         pred_info = self.joint_mlp(in_mlp_feat)
-        hand_joint = rearrange(
-            pred_info, "(b t) (n c) -> b t n c", t=sample_num, n=pose_num
-        )
+        hand_joint = rearrange(pred_info, "(b t) (n c) -> b t n c", t=sample_num, n=pose_num)
 
-        final_quat = pttf.matrix_to_quaternion(
-            torch.cat([hand_rot, grasp_rot.unsqueeze(-3)], dim=-3)
-        )
+        final_quat = pttf.matrix_to_quaternion(torch.cat([hand_rot, grasp_rot.unsqueeze(-3)], dim=-3))
         robot_pose = torch.cat([hand_trans, final_quat, hand_joint], dim=-1)
         return robot_pose, log_prob

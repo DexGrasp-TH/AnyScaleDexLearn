@@ -10,7 +10,7 @@ from dexlearn.utils.util import load_json
 from scipy.spatial.transform import Rotation as sciR
 
 
-class HumanDexDataset(Dataset):
+class HumanBiDexDataset(Dataset):
     def __init__(self, config: dict, mode: str, sc_voxel_size: float = None):
         self.config = config
         self.sc_voxel_size = sc_voxel_size
@@ -37,31 +37,23 @@ class HumanDexDataset(Dataset):
     def init_train_eval(self, mode):
         split_name = "test" if mode == "eval" else "train"
         self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
-
-        self.grasp_obj_dict = {}
         self.data_num = 0
 
         print(f"Pre-indexing {mode} data paths...")
-        for grasp_type in self.grasp_type_lst:
-            self.grasp_obj_dict[grasp_type] = []
-            self.grasp_path_dict[grasp_type] = {}
+        self.grasp_path_dict = {}
 
-            for obj_id in self.obj_id_lst:
-                # 只在这里执行一次 glob
-                found_paths = glob(
-                    pjoin(self.config.grasp_path, grasp_type, obj_id, "**/**.npy"),
-                    recursive=True,
-                )
+        for obj_id in self.obj_id_lst:
+            # 只在这里执行一次 glob
+            found_paths = glob(
+                pjoin(self.config.grasp_path, obj_id, "**/**.npy"),
+                recursive=True,
+            )
 
-                if len(found_paths) == 0:
-                    continue
+            if len(found_paths) == 0:
+                continue
 
-                self.data_num += len(found_paths)
-                self.grasp_obj_dict[grasp_type].append(obj_id)
-                self.grasp_path_dict[grasp_type][obj_id] = sorted(found_paths)
-
-            if len(self.grasp_obj_dict[grasp_type]) == 0:
-                self.grasp_obj_dict.pop(grasp_type)
+            self.data_num += len(found_paths)
+            self.grasp_path_dict[obj_id] = sorted(found_paths)
 
         print(f"mode: {mode}, grasp type number: {self.grasp_type_num}, grasp data num: {self.data_num}")
 
@@ -116,32 +108,53 @@ class HumanDexDataset(Dataset):
             t0 = time.perf_counter()
 
             # random select grasp data
-            rand_grasp_type = random.choice(self.grasp_type_lst)
-            grasp_obj_lst = self.grasp_obj_dict[rand_grasp_type]
+            grasp_obj_lst = self.obj_id_lst
             rand_obj_id = random.choice(grasp_obj_lst)
-            grasp_npy_lst = self.grasp_path_dict[rand_grasp_type][rand_obj_id]
+            grasp_npy_lst = self.grasp_path_dict[rand_obj_id]
             grasp_path = random.choice(sorted(grasp_npy_lst))
-
             metrics["glob_time"] = time.perf_counter() - t0
 
             t1 = time.perf_counter()
-
             grasp_data = np.load(grasp_path, allow_pickle=True).item()
-
             metrics["grasp_load_time"] = time.perf_counter() - t1
 
             ret_dict["path"] = grasp_path
 
-            ret_dict["hand_trans"] = np.asarray(grasp_data["hand"]["right"]["trans"]).reshape(1, 1, 3)
-            ret_dict["hand_rot"] = sciR.from_rotvec(grasp_data["hand"]["right"]["rot"]).as_matrix().reshape(1, 1, 3, 3)
+            # grasp type
+            l_contacts = grasp_data["hand"]["left"]["contacts"] if grasp_data["hand"]["left"] else [False] * 5
+            r_contacts = grasp_data["hand"]["right"]["contacts"] if grasp_data["hand"]["right"] else [False] * 5
+            has_l = any(l_contacts)
+            has_r = any(r_contacts)
+            if has_l and has_r:
+                grasp_type = "2_both"  # Both
+            elif has_l:
+                grasp_type = "1_left"  # Left Only
+            elif has_r:
+                grasp_type = "0_right"  # Right Only
+            else:
+                raise ValueError(f"Grasp data has no contact: {grasp_path}")
+            assert grasp_type in self.grasp_type_lst, f"Grasp type {grasp_type} not in grasp_type_lst"
+            rand_grasp_type = grasp_type
 
+            # wrist pose
+            for side, is_active in grasp_data["hand"].items():
+                if is_active:
+                    ret_dict[f"{side}_hand_trans"] = np.asarray(grasp_data["hand"][side]["trans"]).reshape(1, 1, 3)
+                    ret_dict[f"{side}_hand_rot"] = (
+                        sciR.from_rotvec(grasp_data["hand"][side]["rot"]).as_matrix().reshape(1, 1, 3, 3)
+                    )
+                else:
+                    ret_dict[f"{side}_hand_trans"] = np.zeros((1, 1, 3))  # assign zero
+                    ret_dict[f"{side}_hand_rot"] = np.zeros((1, 1, 3, 3))
+
+            # object info
             obj_name = grasp_data["object"]["name"]
             obj_scale = grasp_data["object"]["rel_scale"]
             obj_pose = grasp_data["object"]["pose"]
 
             t2 = time.perf_counter()
 
-            # read point cloud
+            # read object point cloud
             if obj_name not in self.pc_path_dict:
                 # store the pointcloud file path
                 self.pc_path_dict[obj_name] = sorted(glob(pjoin(self.object_pc_folder, obj_name, "**.npy")))
@@ -192,7 +205,9 @@ class HumanDexDataset(Dataset):
             pc_centroid = np.mean(pc, axis=-2, keepdims=True)
             pc = pc - pc_centroid  # normalization
             if self.mode != "test":
-                ret_dict["hand_trans"] = ret_dict["hand_trans"] - pc_centroid[None, :, :]
+                for side, is_active in grasp_data["hand"].items():
+                    if is_active:
+                        ret_dict[f"{side}_hand_trans"] -= pc_centroid[None, :, :]
 
         ret_dict["point_clouds"] = pc  # (N, 3)
         ret_dict["grasp_type_id"] = int(rand_grasp_type.split("_")[0]) if self.config.grasp_type_cond else 0

@@ -14,7 +14,7 @@ from dexlearn.dataset import create_test_dataloader
 from dexlearn.network.models import *
 
 
-def main_func(config: DictConfig) -> None:
+def task_sample(config: DictConfig):
     set_seed(config.seed)
     config.wandb.mode = "disabled"
     logger = Logger(config)
@@ -37,7 +37,7 @@ def main_func(config: DictConfig) -> None:
     model.eval()
 
     with torch.no_grad():
-        for data in tqdm(test_loader):
+        for data in tqdm(test_loader, desc="Sampling grasps (inference)"):
             robot_pose, log_prob = model.sample(data, config.algo.test_grasp_num)
 
             # select top k predictions with higher log_prob
@@ -65,29 +65,3 @@ def main_func(config: DictConfig) -> None:
             logger.save_samples(save_dict, ckpt_iter, data["save_path"])
 
     return
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "-e",
-        "--exp_name",
-        type=str,
-        required=True,
-        help="experiment folder, e.g. shadow_tabletop_debug",
-    )
-    args, unknown = parser.parse_known_args()
-
-    sys.argv = sys.argv[:1] + unknown + list(OmegaConf.load(f"output/{args.exp_name}/.hydra/overrides.yaml"))
-
-    # remove duplicated args. Note: cmd has the priority!
-    check_dict = {}
-    for argv in sys.argv[1:]:
-        arg_key = argv.split("=")[0]
-        if arg_key not in check_dict:
-            check_dict[arg_key] = True
-        else:
-            sys.argv.remove(argv)
-
-    hydra.main(config_path="config", config_name="base", version_base=None)(main_func)()

@@ -9,30 +9,24 @@ from copy import deepcopy
 
 from .base_dex import DexDataset
 from .human_dex import HumanDexDataset
+from .human_bidex import HumanBiDexDataset
 
 
 def create_dataset(config, mode):
-    sp_voxel_size = (
-        config.algo.model.backbone.voxel_size
-        if "MinkUNet" in config.algo.model.backbone.name
-        else None
-    )
-    if isinstance(config.data.object_path, ListConfig):
+    sp_voxel_size = config.algo.model.backbone.voxel_size if "MinkUNet" in config.algo.model.backbone.name else None
+
+    data_config = config.data if mode != "test" else config.test_data
+
+    if isinstance(data_config.object_path, ListConfig):
         dataset_lst = []
-        for p in config.data.object_path:
-            new_data_config = deepcopy(config.data)
+        for p in data_config.object_path:
+            new_data_config = deepcopy(data_config)
             new_data_config.object_path = p
-            if getattr(config.data, "human", None):
-                single_dataset = HumanDexDataset(new_data_config, mode, sp_voxel_size)
-            else:
-                single_dataset = DexDataset(new_data_config, mode, sp_voxel_size)
+            single_dataset = eval(data_config.dataset_type)(new_data_config, mode, sp_voxel_size)
             dataset_lst.append(single_dataset)
         dataset = torch.utils.data.ConcatDataset(dataset_lst)
     else:
-        if getattr(config.data, "human", None):
-            dataset = HumanDexDataset(config.data, mode, sp_voxel_size)
-        else:
-            dataset = DexDataset(config.data, mode, sp_voxel_size)
+        dataset = eval(data_config.dataset_type)(data_config, mode, sp_voxel_size)
 
     return dataset
 
@@ -46,7 +40,7 @@ def create_train_dataloader(config: DictConfig, train_shuffle=True):
             train_dataset,
             batch_size=config.algo.batch_size,
             drop_last=True,
-            num_workers=config.data.num_workers,
+            num_workers=config.num_workers,
             shuffle=train_shuffle,
             collate_fn=minkowski_collate_fn,
         ),
@@ -57,7 +51,7 @@ def create_train_dataloader(config: DictConfig, train_shuffle=True):
             val_dataset,
             batch_size=config.algo.batch_size,
             drop_last=True,
-            num_workers=config.data.num_workers,
+            num_workers=config.num_workers,
             shuffle=False,
             collate_fn=minkowski_collate_fn,
         ),
@@ -73,7 +67,7 @@ def create_test_dataloader(config: DictConfig, mode="test"):
             test_dataset,
             batch_size=config.algo.batch_size,
             drop_last=False,
-            num_workers=config.data.num_workers,
+            num_workers=config.num_workers,
             shuffle=False,
             collate_fn=minkowski_collate_fn,
         ),
@@ -95,15 +89,11 @@ class InfLoader:
         except StopIteration:
             # reset to the init when reaching the dataset end
             self.iter_loader = iter(self.loader)
-            data = next(self.iter_loader) 
+            data = next(self.iter_loader)
 
         for k, v in data.items():
             if type(v).__module__ == "torch":
-                if (
-                    "Int" not in v.type()
-                    and "Long" not in v.type()
-                    and "Short" not in v.type()
-                ):
+                if "Int" not in v.type() and "Long" not in v.type() and "Short" not in v.type():
                     v = v.float()
                 data[k] = v.to(self.device)
         return data
@@ -126,11 +116,7 @@ class FiniteLoader:
         data = next(self.iter_loader)
         for k, v in data.items():
             if type(v).__module__ == "torch":
-                if (
-                    "Int" not in v.type()
-                    and "Long" not in v.type()
-                    and "Short" not in v.type()
-                ):
+                if "Int" not in v.type() and "Long" not in v.type() and "Short" not in v.type():
                     v = v.float()
                 data[k] = v.to(self.device)
         return data
@@ -146,16 +132,12 @@ def minkowski_collate_fn(list_data):
     if "coors" in list_data[0].keys():
         coors_data = [d.pop("coors") for d in list_data]
         feats_data = [d.pop("feats") for d in list_data]
-        coordinates_batch, features_batch = ME.utils.sparse_collate(
-            coors_data, feats_data
-        )
-        coordinates_batch, features_batch, original2quantize, quantize2original = (
-            ME.utils.sparse_quantize(
-                coordinates_batch,
-                features_batch,
-                return_index=True,
-                return_inverse=True,
-            )
+        coordinates_batch, features_batch = ME.utils.sparse_collate(coors_data, feats_data)
+        coordinates_batch, features_batch, original2quantize, quantize2original = ME.utils.sparse_quantize(
+            coordinates_batch,
+            features_batch,
+            return_index=True,
+            return_inverse=True,
         )
 
     res = default_collate(list_data)
@@ -178,9 +160,7 @@ def get_sparse_tensor(pc: torch.tensor, voxel_size: float):
     """
     coors = pc / voxel_size
     feats = pc
-    coordinates_batch, features_batch = ME.utils.sparse_collate(
-        [coor for coor in coors], [feat for feat in feats]
-    )
+    coordinates_batch, features_batch = ME.utils.sparse_collate([coor for coor in coors], [feat for feat in feats])
     coordinates_batch, features_batch, _, quantize2original = ME.utils.sparse_quantize(
         coordinates_batch.float(),
         features_batch,

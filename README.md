@@ -157,10 +157,36 @@ CUDA_VISIBLE_DEVICES=x python -m dexlearn.sample -e bodex_tabletop_xxx_nflow_deb
 
 Train:
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m dexlearn.train exp_name=debug algo=h_nflow data=human
+# single wrist pose, normalizing flow
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=h_nflow data=human exp_name=<XXX> 
+# single wrist pose, diffusion
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=h_diffusion data=human exp_name=<XXX>
+
+# bimanual wrist pose, diffusion
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=hbi_diffusion data=humanbi exp_name=<XXX>
 ```
 
 Sample (Inference): 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m dexlearn.sample -e human_h_nflow_debug
+# single wrist pose, test on human_obj, diffusion
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=human algo=h_diffusion test_data=human_obj exp_name=<XXX>
+# single wrist pose, test on DGN, diffusion
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=human algo=h_diffusion test_data=DGN exp_name=<XXX>
+
+# bimanual wrist pose, test on DGN_grasp_type, diffusion
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanbi algo=hbi_diffusion test_data=DGN_grasp_type ckpt=050000 exp_name=<XXX>
+```
+
+Visualize test results:
+```bash
+# test on DGN, normalizing flow
+python dexlearn/main.py task=visualize_test data=human algo=h_nflow test_data=DGN exp_name=<XXX>
+
+# single wrist pose, test on human_obj, diffusion
+python dexlearn/main.py task=visualize_test data=human algo=h_diffusion test_data=human_obj exp_name=<XXX>
+# single wrist pose, test on DGN, diffusion
+python dexlearn/main.py task=visualize_test data=human algo=h_diffusion test_data=DGN exp_name=<XXX>
+
+# bimanual wrist pose, test on DGN_grasp_type, diffusion
+python dexlearn/main.py task=visualize_test data=humanbi algo=hbi_diffusion test_data=DGN_grasp_type ckpt=050000 exp_name=<XXX>
 ```

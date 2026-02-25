@@ -6,6 +6,7 @@ resume: true
 
 seed: 0
 device: 'cuda:0'
+num_workers: 10
 
 ##########################
 # other config yamls
@@ -13,11 +14,15 @@ device: 'cuda:0'
 
 defaults:
   - _self_
+  - task:
   - algo: nflow
   - data: Dexonomy
+  - test_data: DGN # object dataset for testing/visualization
 
-data_name: ${hydra:runtime.choices.data}
+task_name: ${hydra:runtime.choices.task}
 algo_name: ${hydra:runtime.choices.algo}
+data_name: ${hydra:runtime.choices.data}
+test_data_name: ${hydra:runtime.choices.test_data}
 
 hydra:
   run:

@@ -140,7 +140,9 @@ class DexDataset(Dataset):
             idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
             pc = raw_pc[idx]
 
-            ret_dict["save_path"] = pjoin(rand_grasp_type, scene_cfg["scene_id"], os.path.basename(pc_path))
+            ret_dict["save_path"] = pjoin(
+                self.config.name, rand_grasp_type, scene_cfg["scene_id"], os.path.basename(pc_path)
+            )
             ret_dict["scene_path"] = scene_path
             ret_dict["pc_path"] = pc_path
 

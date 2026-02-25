@@ -14,20 +14,15 @@ from dexlearn.dataset import create_train_dataloader
 from dexlearn.network.models import *
 
 
-@hydra.main(config_path="config", config_name="base", version_base=None)
-def main(config: DictConfig) -> None:
+def task_train(config: DictConfig):
     set_seed(config.seed)
     logger = Logger(config)
     train_loader, val_loader = create_train_dataloader(config)
 
     model = eval(config.algo.model.name)(config.algo.model)
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=config.algo.lr
-    )
-    scheduler = CosineAnnealingLR(
-        optimizer, config.algo.max_iter, eta_min=config.algo.lr_min
-    )
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config.algo.lr)
+    scheduler = CosineAnnealingLR(optimizer, config.algo.max_iter, eta_min=config.algo.lr_min)
 
     # load ckpt if exists
     if config.ckpt is not None:
@@ -80,9 +75,7 @@ def main(config: DictConfig) -> None:
 
         result_dict["lr"] = torch.tensor(scheduler.get_last_lr())
         if (it + 1) % config.algo.log_every == 0:
-            logger.log(
-                {k: v.mean().item() for k, v in result_dict.items()}, "train", it
-            )
+            logger.log({k: v.mean().item() for k, v in result_dict.items()}, "train", it)
 
         if (it + 1) % config.algo.save_every == 0:
             logger.save(
@@ -104,20 +97,12 @@ def main(config: DictConfig) -> None:
                     result_dicts.append(result_dict)
                 logger.log(
                     {
-                        k: torch.cat(
-                            [
-                                (dic[k] if len(dic[k].shape) else dic[k][None])
-                                for dic in result_dicts
-                            ]
-                        ).mean()
+                        k: torch.cat([(dic[k] if len(dic[k].shape) else dic[k][None]) for dic in result_dicts]).mean()
                         for k in result_dicts[0].keys()
                     },
                     "eval",
                     it,
                 )
                 model.train()
+
     return
-
-
-if __name__ == "__main__":
-    main()

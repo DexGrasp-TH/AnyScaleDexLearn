@@ -12,11 +12,16 @@
             "program": "${file}",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            // "args": ["-e", "bodex_tabletop_leap_tac3d_nflow_realworld", "data.pc_centering=True"],
-            // "args": ["data=human", "algo=h_nflow", "data.pc_centering=True", "exp_name=debug"],
-            // "args": ["exp_name=debug", "data.pc_centering=True", "-e", "human_h_nflow_debug"]
-             "args": ["exp_name=debug", "data.pc_centering=True", "data=human_DGN", "algo=h_nflow",
-                      "-e", "human_DGN_h_nflow_debug"]
+            // "args": ["task=train",  "data=humanbi", "algo=hbi_diffusion",
+            //             "algo.batch_size=16", "exp_name=debug2", ]
+
+            // "args": ["task=sample",  "data=human", "algo=h_diffusion", "test_data=human_obj",
+            //         "algo.batch_size=16", "exp_name=debug1"]
+            // "args": ["task=sample",  "data=humanbi", "algo=hbi_diffusion", "test_data=DGN_grasp_type",
+            //         "algo.batch_size=64", "exp_name=debug3"]
+
+            // "args": ["task=visualize_test",  "data=human", "algo=h_nflow", "test_data=DGN", "exp_name=debug1",]
+            "args": ["task=visualize_test",  "data=humanbi", "algo=hbi_diffusion", "test_data=DGN_grasp_type", "exp_name=debug3",]
         }
     ]
 }

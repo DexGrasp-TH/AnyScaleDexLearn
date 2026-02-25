@@ -123,11 +123,7 @@ def trace_df_dz(f, z):
     """
     sum_diag = 0.0
     for i in range(z.shape[1]):
-        sum_diag += (
-            torch.autograd.grad(f[:, i].sum(), z, retain_graph=True)[0]
-            .contiguous()[:, i]
-            .contiguous()
-        )
+        sum_diag += torch.autograd.grad(f[:, i].sum(), z, retain_graph=True)[0].contiguous()[:, i].contiguous()
 
     return sum_diag.contiguous()
 
@@ -152,23 +148,16 @@ class ODEFunc(nn.Module):
             with torch.set_grad_enabled(True):
                 z[0].requires_grad_(True)
                 dz_dt = self._forward(t, z[0])
-                dlogp_z_dt = -trace_df_dz(dz_dt.reshape(z[0].shape[0], -1), z[0]).view(
-                    -1
-                )
+                dlogp_z_dt = -trace_df_dz(dz_dt.reshape(z[0].shape[0], -1), z[0]).view(-1)
             return (dz_dt, dlogp_z_dt)
         else:
             return (self._forward(t, z[0]), torch.zeros_like(z[1]))
 
     def _forward(self, t, z):
-        pred_noise = self.diffusion.model_predictions(
-            z, self.cond, t, exact_t=True
-        ).pred_noise
+        pred_noise = self.diffusion.model_predictions(z, self.cond, t, exact_t=True).pred_noise
         angle = self.angle(t[:, None, None])
         beta = self.beta(angle)
-        return (
-            -0.5 * beta * z
-            + 0.5 * beta * pred_noise / (1 - angle.cos().square()).sqrt()
-        )
+        return -0.5 * beta * z + 0.5 * beta * pred_noise / (1 - angle.cos().square()).sqrt()
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -234,9 +223,7 @@ class GaussianDiffusion1D(nn.Module):
         return self.calculate_loss(*args, **kwargs)
 
     def calculate_loss(self, x, cond):
-        t = torch.randint(
-            0, self.timesteps, (x.shape[0],), device=x.device, dtype=torch.long
-        )
+        t = torch.randint(0, self.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
         noise = torch.randn_like(x)
         noised_x = self.scheduler.add_noise(x, noise, t)
         cond = self.cond_fn(noised_x, t / self.timesteps, cond)
@@ -279,9 +266,7 @@ class GaussianDiffusion1D(nn.Module):
                     dtype=torch.float,
                 )
                 last_t = t.item()
-                t_pad = torch.full(
-                    (x.shape[0],), t.item(), device=x.device, dtype=torch.long
-                )
+                t_pad = torch.full((x.shape[0],), t.item(), device=x.device, dtype=torch.long)
                 cond_now = self.cond_fn(x, t_pad / self.timesteps, cond)
                 model_output = self.model(x, t_pad / self.timesteps, cond=cond_now)
                 alpha_prod = self.scheduler.alphas_cumprod.to(x.device)[t_pad][:, None]
@@ -289,20 +274,16 @@ class GaussianDiffusion1D(nn.Module):
                 if self.prediction_type == "epsilon":
                     noise = model_output
                 elif self.prediction_type == "v_prediction":
-                    noise = (
-                        model_output * alpha_prod.sqrt() + x * (1 - alpha_prod).sqrt()
-                    )
+                    noise = model_output * alpha_prod.sqrt() + x * (1 - alpha_prod).sqrt()
+                else:
+                    raise NotImplementedError
                 score = -1 / (1 - alpha_prod).sqrt() * noise
                 beta = betas * self.timesteps
                 if self.config.ode:
                     dy = (-0.5 * beta * x - score * beta / 2) * dt
                 else:
-                    dy = (
-                        -0.5 * beta * x - score * beta
-                    ) * dt + beta.sqrt() * torch.randn_like(x) * dt.sqrt()
-                log_prob -= (
-                    jacobian_trace(self.config.log_prob_type, dx, -dy / dt) * dt[:, 0]
-                )
+                    dy = (-0.5 * beta * x - score * beta) * dt + beta.sqrt() * torch.randn_like(x) * dt.sqrt()
+                log_prob -= jacobian_trace(self.config.log_prob_type, dx, -dy / dt) * dt[:, 0]
                 x = x - dy
                 x = x.detach()
                 log_prob = log_prob.detach()
@@ -313,3 +294,144 @@ class GaussianDiffusion1D(nn.Module):
 
     def log_prob(self, x, cond):
         raise NotImplementedError()
+
+
+class GaussianDiffusion1DMask(nn.Module):
+    def __init__(self, model, config, cond_fn=lambda x, t, cond: cond):
+        super().__init__()
+        self.config = config
+        self.model = model
+        self.cond_fn = cond_fn
+
+        # ... (Scheduler 初始化代码保持不变) ...
+        self.setup_scheduler(config)
+
+        self.timesteps = config.scheduler.num_train_timesteps
+        self.inference_timesteps = config.num_inference_timesteps
+        self.prediction_type = config.scheduler.prediction_type
+
+        # 必须设置 reduction="none" 才能手动应用 mask
+        self.diff_loss = nn.MSELoss(reduction="none") if config.loss_type == "l2" else nn.SmoothL1Loss(reduction="none")
+
+    def setup_scheduler(self, config):
+        # 这里的逻辑与你之前的一致
+        from diffusers import DDPMScheduler, DDIMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler
+
+        schedulers = {
+            "DDPMScheduler": DDPMScheduler,
+            "DDIMScheduler": DDIMScheduler,
+            "EulerAncestralDiscreteScheduler": EulerAncestralDiscreteScheduler,
+            "EulerDiscreteScheduler": EulerDiscreteScheduler,
+        }
+        self.scheduler = schedulers[config.scheduler_type](**config.scheduler)
+        print(self.scheduler)
+
+    def forward(self, *args, **kwargs):
+        return self.calculate_loss(*args, **kwargs)
+
+    def calculate_loss(self, x, cond, mask):
+        """
+        x: [Batch, Dim]
+        mask: [Batch, Dim]
+        """
+        t = torch.randint(0, self.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
+        noise = torch.randn_like(x)
+        noised_x = self.scheduler.add_noise(x, noise, t)
+
+        # 2. 将无效手的噪声替换为 0 或者真值（可选），防止无效数据干扰模型
+        # 这里建议将无效部分的输入置零或固定，让模型学会只对有效的 hand 做预测
+        noised_x = noised_x * mask
+
+        cond_out = self.cond_fn(noised_x, t / self.timesteps, cond)
+        pred = self.model(noised_x, t / self.timesteps, cond=cond_out)
+
+        # 3. 确定 Target
+        if self.prediction_type == "epsilon":
+            target = noise
+        elif self.prediction_type == "sample":
+            target = x
+        elif self.prediction_type == "v_prediction":
+            target = self.scheduler.get_velocity(x, noise, t)
+        else:
+            raise NotImplementedError()
+
+        # 4. 只计算有效手的 Loss
+        loss = self.diff_loss(pred, target)
+        # 对有效部分的每一个维度取平均
+        loss = (loss * mask).sum() / (mask.sum() + 1e-8)
+
+        return loss
+
+    def sample(self, cond, mask):
+        device = cond.device
+        batch_size = cond.shape[0]
+        x = torch.randn(cond.shape[0], self.model.channels, device=device)
+        assert x.shape == mask.shape, "Mask shape must match x shape."
+
+        # 初始噪声屏蔽：无效手设为 0
+        x = x * mask
+
+        # 初始 Log-prob 计算
+        # 仅计算 mask 部分的 log_prob: log(N(0,1))
+        # 公式: -0.5 * (x^2 + log(2*pi))
+        element_wise_log_prob = -0.5 * (x.square() + np.log(2 * np.pi))
+        # 只累加 mask 为 1 的位置
+        log_prob = (element_wise_log_prob * mask).sum(1)
+
+        self.scheduler.set_timesteps(self.inference_timesteps, device=device)
+
+        need_log_prob = self.config.log_prob_type is not None
+        last_t = self.timesteps
+
+        with torch.set_grad_enabled(need_log_prob):
+            for t in self.scheduler.timesteps:
+                # 设置辅助变量计算 Jacobian Trace (Divergence)
+                dx = torch.zeros_like(x)
+                if need_log_prob:
+                    dx.requires_grad_(True)
+                x += dx
+
+                # 时间步处理
+                dt = torch.full((batch_size, 1), (last_t - t.item()) / self.timesteps, device=device)
+                last_t = t.item()
+                t_pad = torch.full((batch_size,), t.item(), device=device, dtype=torch.long)
+
+                # 模型预测与 Score 计算
+                cond_now = self.cond_fn(x, t_pad / self.timesteps, cond)
+                model_output = self.model(x, t_pad / self.timesteps, cond=cond_now)
+
+                alpha_prod = self.scheduler.alphas_cumprod.to(x.device)[t_pad][:, None]
+                betas = self.scheduler.betas.to(x.device)[t_pad][:, None]
+                if self.prediction_type == "epsilon":
+                    noise = model_output
+                elif self.prediction_type == "v_prediction":
+                    noise = model_output * alpha_prod.sqrt() + x * (1 - alpha_prod).sqrt()
+                else:
+                    raise NotImplementedError
+                score = -1 / (1 - alpha_prod).sqrt() * noise
+                beta = betas * self.timesteps
+                if self.config.ode:
+                    dy = (-0.5 * beta * x - score * beta / 2) * dt
+                else:
+                    dy = (-0.5 * beta * x - score * beta) * dt + beta.sqrt() * torch.randn_like(x) * dt.sqrt()
+
+                # 3. 核心修改：屏蔽无效手的动力学
+                dy = dy * mask
+
+                # 4. 计算 Jacobian Trace (散度)
+                if need_log_prob:
+                    if not self.config.ode:
+                        raise ValueError("Log_prob calculation is only supported for ODE mode.")
+                    f = -dy / (dt + 1e-8)
+                    div = jacobian_trace(self.config.log_prob_type, dx, f)
+                    log_prob -= div * dt[:, 0]
+
+                x = x - dy
+                x = x.detach()
+                log_prob = log_prob.detach()
+
+        # 如果不需要 log_prob，返回全 0
+        if not need_log_prob:
+            log_prob *= 0
+
+        return x, log_prob

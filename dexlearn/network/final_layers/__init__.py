@@ -8,4 +8,9 @@ from .normalizing_flow import (
     FlowRT,
 )
 from .mlp import MLPRTJ
-from .diffusion import DiffusionRT_MLPRTJ, DiffusionRTJ
+from .diffusion import (
+    DiffusionRT_MLPRTJ,
+    DiffusionRTJ,
+    DiffusionRT,
+    DiffusionBiRT,
+)

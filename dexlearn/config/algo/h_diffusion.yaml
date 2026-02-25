@@ -1,3 +1,5 @@
+human: True
+
 batch_size: 256
 max_iter: 50000
 lr: 0.001
@@ -24,7 +26,7 @@ model:
     use_predictor: false
     disabled: False
   head:
-    name: DiffusionRT_MLPRTJ
+    name: DiffusionRT
     in_feat_dim:
     joint_num:  ${....data.joint_num}
     traj_length: ${....data.traj_length}
