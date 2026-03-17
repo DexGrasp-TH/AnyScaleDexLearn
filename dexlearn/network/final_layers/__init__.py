@@ -13,4 +13,5 @@ from .diffusion import (
     DiffusionRTJ,
     DiffusionRT,
     DiffusionBiRT,
+    DiffusionTypeAndBiRT,
 )
