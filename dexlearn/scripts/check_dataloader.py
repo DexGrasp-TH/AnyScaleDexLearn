@@ -14,29 +14,25 @@ from dexlearn.utils.logger import Logger
 from dexlearn.utils.util import set_seed
 from dexlearn.network.models import *
 
-from dexlearn.dataset import create_dataset, minkowski_collate_fn, InfLoader
+from dexlearn.dataset import create_dataset, minkowski_collate_fn, InfLoader, GRASP_TYPES
 from manopth.manolayer import ManoLayer
 
 
-def visualize_with_trimesh(verts, faces, joints=None):
+def visualize_with_trimesh(verts, faces, joints=None, color=(200, 200, 250, 255)):
     """
     verts: (778, 3) numpy array
     faces: (1538, 3) numpy array
     joints: (21, 3) numpy array (optional)
+    color: RGBA tuple for the mesh face color
     """
-    # 1. Create the mesh
-    # Note: MANO faces are typically (1538, 3)
     hand_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-
-    # 2. Aesthetic updates
-    hand_mesh.visual.face_colors = [200, 200, 250, 255]  # Light blue/grey
+    hand_mesh.visual.face_colors = color
 
     scene_contents = [hand_mesh]
 
-    # 3. Add joints as small spheres (optional)
     if joints is not None:
         for joint in joints:
-            sphere = trimesh.creation.uv_sphere(radius=0.005)  # 5mm radius
+            sphere = trimesh.creation.uv_sphere(radius=0.005)
             sphere.visual.face_colors = [255, 0, 0, 255]  # Red
             sphere.apply_translation(joint)
             scene_contents.append(sphere)
@@ -44,23 +40,33 @@ def visualize_with_trimesh(verts, faces, joints=None):
     return scene_contents
 
 
+
 @hydra.main(config_path="../config", config_name="base", version_base=None)
 def main(config: DictConfig) -> None:
     set_seed(config.seed)
     logger = Logger(config)
 
-    mano_layer = ManoLayer(
-        center_idx=0,
-        mano_root="third_party/manopth/mano/models",
-        side="right",
-        use_pca=False,
-        flat_hand_mean=True,
-        ncomps=45,
-        root_rot_mode="axisang",
-        joint_rot_mode="axisang",
-    ).to(config.device)
+    mano_layers = {
+        side: ManoLayer(
+            center_idx=0,
+            mano_root="third_party/manopth/mano/models",
+            side=side,
+            use_pca=True,
+            flat_hand_mean=True,
+            ncomps=24,
+            root_rot_mode="axisang",
+            joint_rot_mode="axisang",
+        ).to(config.device)
+        for side in ["right", "left"]
+    }
+
+    hand_colors = {
+        "right": (200, 200, 250, 255),  # light blue
+        "left": (250, 200, 200, 255),  # light red
+    }
 
     train_dataset = create_dataset(config, mode="train")
+    train_dataset.config.load_mano_params = True  # enable for visualization
 
     config.algo.batch_size = 4
     train_loader = InfLoader(
@@ -79,56 +85,62 @@ def main(config: DictConfig) -> None:
         data = train_loader.get()
 
         for i in range(config.algo.batch_size):
-            print("path: ", data["path"][i])
+            grasp_type_id = int(data["grasp_type_id"][i])
+            grasp_type_name = GRASP_TYPES[grasp_type_id]
+            print(f"path: {data['path'][i]}  |  grasp_type: {grasp_type_name}")
 
             scene_elements = []
 
-            ############# Hand base pose ##############
-            hand_trans = data["hand_trans"][i, 0, 0, :]
-            hand_pose = torch.eye(4)
-            hand_pose[:3, :3] = data["hand_rot"][i, 0, 0, ...]
-            hand_pose[:3, 3] = hand_trans
-            hand_pose_np = hand_pose.cpu().numpy()
-            # Create the coordinate axis at the hand_pose
-            axis = trimesh.creation.axis(
-                transform=hand_pose_np,
-                origin_size=0.01,
-                axis_radius=0.005,
-                axis_length=0.1,
-            )
-            scene_elements.append(axis)
+            for side in ["right", "left"]:
+                hand_trans = data[f"{side}_hand_trans"][i, 0, 0, :]  # (3,)
+                hand_rot_mat = data[f"{side}_hand_rot"][i, 0, 0, ...]  # (3, 3)
 
-            ############# MANO ##############
-            hand_rot = matrix_to_axis_angle(data["hand_rot"][i, 0, 0, ...].unsqueeze(0))
-            mano_pose = torch.zeros((1, 45), device=config.device)
-            mano_params = torch.cat([hand_rot, mano_pose], dim=-1)
-            mano_betas = torch.zeros((1, 10), device=config.device)
+                # Skip inactive hands (all-zero pose)
+                if not hand_rot_mat.any():
+                    continue
 
-            verts, joints = mano_layer(mano_params, th_betas=mano_betas)
-            verts = (verts / 1000.0) + hand_trans.unsqueeze(0)
-            joints = (joints / 1000.0) + hand_trans.unsqueeze(0)
+                ############# Hand base pose axis ##############
+                hand_pose = torch.eye(4)
+                hand_pose[:3, :3] = hand_rot_mat
+                hand_pose[:3, 3] = hand_trans
+                axis = trimesh.creation.axis(
+                    transform=hand_pose.cpu().numpy(),
+                    origin_size=0.01,
+                    axis_radius=0.005,
+                    axis_length=0.1,
+                )
+                scene_elements.append(axis)
 
-            v_np = verts[0].cpu().detach().numpy()
-            j_np = joints[0].cpu().detach().numpy()
-            f_np = mano_layer.th_faces.cpu().numpy()
+                ############# MANO ##############
+                hand_rot_aa = matrix_to_axis_angle(hand_rot_mat.unsqueeze(0))
+                if f"{side}_mano_pose" in data:
+                    mano_pose = data[f"{side}_mano_pose"][i].unsqueeze(0).to(config.device)   # (1, 24)
+                    mano_betas = data[f"{side}_mano_betas"][i].unsqueeze(0).to(config.device) # (1, 10)
+                else:
+                    mano_pose = torch.zeros((1, 24), device=config.device)
+                    mano_betas = torch.zeros((1, 10), device=config.device)
+                mano_params = torch.cat([hand_rot_aa, mano_pose], dim=-1)  # (1, 27)
 
-            scene_elements.extend(visualize_with_trimesh(v_np, f_np, j_np))
+                verts, joints = mano_layers[side](mano_params, th_betas=mano_betas)
+                verts = (verts / 1000.0) + hand_trans.unsqueeze(0)
+                joints = (joints / 1000.0) + hand_trans.unsqueeze(0)
+
+                v_np = verts[0].cpu().detach().numpy()
+                j_np = joints[0].cpu().detach().numpy()
+                f_np = mano_layers[side].th_faces.cpu().numpy()
+
+                scene_elements.extend(visualize_with_trimesh(v_np, f_np, j_np, color=hand_colors[side]))
 
             ############# Object pointcloud ##############
             pc_np = data["point_clouds"][i, ...].cpu().numpy()
-            points = trimesh.points.PointCloud(
-                pc_np, colors=[255, 0, 0, 255]
-            )  # Red points
+            points = trimesh.points.PointCloud(pc_np, colors=[255, 165, 0, 255])  # Orange
             scene_elements.append(points)
 
-            world_axis = trimesh.creation.axis(
-                origin_size=0.01, axis_radius=0.001, axis_length=0.3
-            )
+            world_axis = trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3)
             scene_elements.append(world_axis)
 
-            # Create a scene to hold both objects
             scene = trimesh.Scene(scene_elements)
-            scene.show()
+            scene.show(caption=grasp_type_name)
 
     return
 

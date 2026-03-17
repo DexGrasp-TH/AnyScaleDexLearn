@@ -1,27 +1,68 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
         {
-            "name": "Python Debugger: Current File with Arguments",
+            "name": "check_dataloader: humanMulti",
             "type": "python",
             "request": "launch",
-            "program": "${file}",
+            "program": "${workspaceFolder}/dexlearn/scripts/check_dataloader.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            // "args": ["task=train",  "data=humanbi", "algo=hbi_diffusion",
-            //             "algo.batch_size=16", "exp_name=debug2", ]
-
-            // "args": ["task=sample",  "data=human", "algo=h_diffusion", "test_data=human_obj",
-            //         "algo.batch_size=16", "exp_name=debug1"]
-            // "args": ["task=sample",  "data=humanbi", "algo=hbi_diffusion", "test_data=DGN_grasp_type",
-            //         "algo.batch_size=64", "exp_name=debug3"]
-
-            // "args": ["task=visualize_test",  "data=human", "algo=h_nflow", "test_data=DGN", "exp_name=debug1",]
-            "args": ["task=visualize_test",  "data=humanbi", "algo=hbi_diffusion", "test_data=DGN_grasp_type", "exp_name=debug3",]
+            "args": ["task=train", "data=humanMulti", "algo=hbi_diffusion", "algo.batch_size=16", "exp_name=debug0"]
+        },
+        {
+            "name": "train: humanMulti / hmulti_diffusion",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=train", "data=humanMulti", "algo=hmulti_diffusion", "algo.batch_size=16", "exp_name=debug0"]
+        },
+        {
+            "name": "train: humanbi / hbi_diffusion",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=train", "data=humanbi", "algo=hbi_diffusion", "algo.batch_size=16", "exp_name=debug2"]
+        },
+        {
+            "name": "sample: human / h_diffusion",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=sample", "data=human", "algo=h_diffusion", "test_data=human_obj", "algo.batch_size=16", "exp_name=debug1"]
+        },
+        {
+            "name": "sample: humanbi / hbi_diffusion",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=sample", "data=humanbi", "algo=hbi_diffusion", "test_data=DGN_grasp_type", "algo.batch_size=64", "exp_name=debug3"]
+        },
+        {
+            "name": "visualize_test: human / h_nflow",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=visualize_test", "data=human", "algo=h_nflow", "test_data=DGN", "exp_name=debug1"]
+        },
+        {
+            "name": "visualize_test: humanbi / hbi_diffusion",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=visualize_test", "data=humanbi", "algo=hbi_diffusion", "test_data=DGN_grasp_type", "exp_name=debug3"]
         }
     ]
 }

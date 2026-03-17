@@ -22,12 +22,19 @@ conda install pytorch==2.2.2 pytorch-cuda=12.1 -c pytorch -c nvidia
 wget https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch3d/linux-64/pytorch3d-0.7.8-py310_cu121_pyt222.tar.bz2
 conda install -y --use-local ./pytorch3d-0.7.8-py310_cu12_pyt210.tar.bz2
 
-pip install numpy==1.26
+pip install opencv-python
 
 # Diffusers 
 cd third_party/diffusers
 pip install -e .
 cd ../..
+
+# manopth
+cd third_part/manopth
+pip install -e .
+cd ../..
+
+pip install numpy==1.23.5
 ```
 
 Finish the steps in [detailed steps](https://github.com/NVIDIA/MinkowskiEngine/issues/543#issuecomment-2566883469) and [NVTX_DISABLE](https://github.com/NVIDIA/MinkowskiEngine/issues/543#issuecomment-2886016764) before the installation of MinkowskiEngine.

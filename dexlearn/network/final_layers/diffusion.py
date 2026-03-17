@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from .diffusion_util import MLPWrapper, GaussianDiffusion1D, GaussianDiffusion1DMask
@@ -6,6 +7,174 @@ from .mlp import BasicMLP
 from dexlearn.utils.rot import proper_svd
 from pytorch3d import transforms as pttf
 from dexlearn.utils.RMS import Normalization
+
+
+class DiffusionTypeAndBiRT(torch.nn.Module):
+    """Joint diffusion model that generates grasp type + bimanual wrist poses from a
+    point cloud feature.  No external grasp-type conditioning is needed at inference.
+
+    The denoised vector has 29 dimensions:
+        [0 : 5]  – grasp-type logits  (one-hot × TYPE_SCALE during training)
+        [5 :17]  – right wrist: rot(9) + trans(3)
+        [17:29]  – left  wrist: rot(9) + trans(3)
+
+    During training the left-hand dims are masked out for right-only grasp types
+    (types 0/1/2), exactly as in DiffusionBiRT.  At inference the full 29-dim space
+    is explored; the type is decoded via argmax and the final mask is applied to clean
+    up inactive-hand dims.
+    """
+
+    N_TYPE = 5
+    N_POSE = 24   # right(12) + left(12)
+    N_OUT  = N_TYPE + N_POSE  # 29
+    TYPE_SCALE = 3.0  # scale one-hot so magnitude matches ~N(0,1) normalised poses
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+        policy_mlp_parameters = dict(
+            hidden_layers_dim=[512, 256],
+            output_dim=self.N_OUT,
+            act="mish",
+        )
+        self.policy = MLPWrapper(
+            channels=self.N_OUT,
+            feature_dim=cfg.in_feat_dim,
+            **policy_mlp_parameters,
+        )
+        self.diffusion = GaussianDiffusion1DMask(self.policy, cfg.diffusion)
+        self.RMS = Normalization(self.N_POSE)
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _get_joint_mask(self, grasp_type_id, device):
+        """Return (B, 29) binary mask.
+
+        Type dims  [0 : 5]  → always 1  (always predict the type).
+        Right dims [5 :17]  → always 1  (right hand active in all 5 types).
+        Left  dims [17:29]  → 1 for types 3,4 (both hands); 0 for types 0,1,2.
+        """
+        B = grasp_type_id.shape[0]
+        mask = torch.ones(B, self.N_OUT, device=device)
+        right_only = grasp_type_id < 3  # types 0, 1, 2
+        mask[right_only, self.N_TYPE + 12:] = 0.0
+        return mask
+
+    def _build_joint_target(self, grasp_type_id, right_rot, right_trans, left_rot, left_trans):
+        """Compose the normalised 29-dim training target and its mask."""
+        # Pose part — flatten rotation matrices, concatenate, normalise
+        pose = torch.cat(
+            [
+                rearrange(right_rot, "b x y -> b (x y)"),
+                right_trans,
+                rearrange(left_rot,  "b x y -> b (x y)"),
+                left_trans,
+            ],
+            dim=-1,
+        )  # (B, 24)
+        pose_norm = self.RMS(pose)
+
+        # Type part — scaled one-hot
+        type_onehot = F.one_hot(grasp_type_id, num_classes=self.N_TYPE).float()
+        type_onehot = type_onehot * self.TYPE_SCALE  # (B, 5)
+
+        joint = torch.cat([type_onehot, pose_norm], dim=-1)  # (B, 29)
+        mask  = self._get_joint_mask(grasp_type_id, pose.device)
+        joint = joint * mask  # zero out inactive dims before diffusion
+        return joint, mask
+
+    # ------------------------------------------------------------------
+    # training
+    # ------------------------------------------------------------------
+
+    def forward(self, data, global_feature):
+        result_dict = {}
+
+        batch_num, sample_num, pose_num, _ = data["right_hand_trans"].shape
+
+        right_trans = rearrange(data["right_hand_trans"], "b t n x -> (b t) n x")
+        right_rot   = rearrange(data["right_hand_rot"],   "b t n x y -> (b t) n x y")
+        left_trans  = rearrange(data["left_hand_trans"],  "b t n x -> (b t) n x")
+        left_rot    = rearrange(data["left_hand_rot"],    "b t n x y -> (b t) n x y")
+
+        global_feature = repeat(global_feature, "b c -> (b t) c", t=sample_num)
+        grasp_type_id  = repeat(data["grasp_type_id"], "b -> (b t)", t=sample_num)
+
+        joint, mask = self._build_joint_target(
+            grasp_type_id,
+            right_rot[:, -1], right_trans[:, -1],
+            left_rot[:, -1],  left_trans[:, -1],
+        )
+
+        result_dict["loss_diffusion"] = self.diffusion(joint, global_feature, mask)
+        return result_dict
+
+    # ------------------------------------------------------------------
+    # inference
+    # ------------------------------------------------------------------
+
+    def sample(self, global_feature, sample_num):
+        """Sample grasp type + bimanual wrist poses jointly.
+
+        Args:
+            global_feature: (B, C) point cloud feature.
+            sample_num:     number of samples per scene.
+
+        Returns:
+            robot_pose:  (B, sample_num, 1, 14)  right(trans3+quat4) + left(trans3+quat4)
+            grasp_type:  (B, sample_num)          predicted grasp-type id
+            log_prob:    (B, sample_num)
+        """
+        B = global_feature.shape[0]
+        global_feature_rep = repeat(global_feature, "b c -> (b n) c", n=sample_num)
+
+        # Full mask — type unknown so we let all dims run free.
+        # The model naturally outputs ~0 for left dims when type is right-only
+        # because those dims were always masked (set to 0) during training.
+        full_mask = torch.ones(B * sample_num, self.N_OUT, device=global_feature.device)
+
+        joint, log_prob = self.diffusion.sample(cond=global_feature_rep, mask=full_mask)
+
+        # ---- Decode type ------------------------------------------------
+        type_logits = joint[:, :self.N_TYPE]          # (B*N, 5)
+        grasp_type  = type_logits.argmax(dim=-1)       # (B*N,)  int
+
+        # ---- Apply type-conditioned mask to clean up inactive hand ------
+        pose_mask = self._get_joint_mask(grasp_type, joint.device)[:, self.N_TYPE:]  # (B*N, 24)
+        pose_norm = joint[:, self.N_TYPE:] * pose_mask
+        pose      = self.RMS.inv(pose_norm)            # (B*N, 24)
+
+        # ---- Unpack rotation / translation ------------------------------
+        r_rot_raw = rearrange(pose[..., 0:9],  "(b t) (x y) -> b t x y", t=sample_num, x=3, y=3)
+        r_trans   = rearrange(pose[..., 9:12], "(b t) c     -> b t c",   t=sample_num)
+        l_rot_raw = rearrange(pose[..., 12:21],"(b t) (x y) -> b t x y", t=sample_num, x=3, y=3)
+        l_trans   = rearrange(pose[..., 21:24],"(b t) c     -> b t c",   t=sample_num)
+
+        r_mask = rearrange(pose_mask[..., 9:10],  "(b t) c -> b t c", t=sample_num)
+        l_mask = rearrange(pose_mask[..., 21:22], "(b t) c -> b t c", t=sample_num)
+
+        log_prob   = rearrange(log_prob,   "(b t) -> b t", t=sample_num)
+        grasp_type = rearrange(grasp_type, "(b t) -> b t", t=sample_num)
+
+        def process_pose(rot_raw, trans, hand_mask):
+            rot_matrix = proper_svd(rot_raw.reshape(-1, 3, 3)).reshape_as(rot_raw)
+            quat = pttf.matrix_to_quaternion(rot_matrix)
+            return torch.cat(
+                [(trans * hand_mask).unsqueeze(-2), (quat * hand_mask).unsqueeze(-2)],
+                dim=-1,
+            )  # (B, N, 1, 7)
+
+        right_pose = process_pose(r_rot_raw, r_trans, r_mask)
+        left_pose  = process_pose(l_rot_raw, l_trans, l_mask)
+        robot_pose = torch.cat([right_pose, left_pose], dim=-1)  # (B, N, 1, 14)
+
+        return robot_pose, grasp_type, log_prob
+
+
+
 
 
 class DiffusionBiRT(torch.nn.Module):
