@@ -5,8 +5,6 @@ num_workers: 10
 num_points: 1024
 traj_length: 3
 joint_num: 16
-grasp_type_lst: ["0_right_two", "1_right_three", "2_right_full", "3_both_three", "4_both_full"]
-grasp_type_cond: True
 pc_centering: True
 
 grasp_path: ${oc.env:AnyScaleGraspDataset}/GRAB/grasp

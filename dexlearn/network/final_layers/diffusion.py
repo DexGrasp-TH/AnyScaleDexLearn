@@ -7,26 +7,27 @@ from .mlp import BasicMLP
 from dexlearn.utils.rot import proper_svd
 from pytorch3d import transforms as pttf
 from dexlearn.utils.RMS import Normalization
+from dexlearn.dataset.grasp_types import GRASP_TYPES
 
 
 class DiffusionTypeAndBiRT(torch.nn.Module):
     """Joint diffusion model that generates grasp type + bimanual wrist poses from a
     point cloud feature.  No external grasp-type conditioning is needed at inference.
 
-    The denoised vector has 29 dimensions:
-        [0 : 5]  – grasp-type logits  (one-hot × TYPE_SCALE during training)
-        [5 :17]  – right wrist: rot(9) + trans(3)
-        [17:29]  – left  wrist: rot(9) + trans(3)
+    The denoised vector has 30 dimensions:
+        [0 : 6]  – grasp-type logits  (one-hot × TYPE_SCALE during training)
+        [6 :18]  – right wrist: rot(9) + trans(3)
+        [18:30]  – left  wrist: rot(9) + trans(3)
 
     During training the left-hand dims are masked out for right-only grasp types
-    (types 0/1/2), exactly as in DiffusionBiRT.  At inference the full 29-dim space
+    (types 0/1/2/3), exactly as in DiffusionBiRT.  At inference the full 30-dim space
     is explored; the type is decoded via argmax and the final mask is applied to clean
     up inactive-hand dims.
     """
 
-    N_TYPE = 5
+    N_TYPE = len(GRASP_TYPES)
     N_POSE = 24   # right(12) + left(12)
-    N_OUT  = N_TYPE + N_POSE  # 29
+    N_OUT  = N_TYPE + N_POSE
     TYPE_SCALE = 3.0  # scale one-hot so magnitude matches ~N(0,1) normalised poses
 
     def __init__(self, cfg):
@@ -51,20 +52,20 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _get_joint_mask(self, grasp_type_id, device):
-        """Return (B, 29) binary mask.
+        """Return (B, 30) binary mask.
 
-        Type dims  [0 : 5]  → always 1  (always predict the type).
-        Right dims [5 :17]  → always 1  (right hand active in all 5 types).
-        Left  dims [17:29]  → 1 for types 3,4 (both hands); 0 for types 0,1,2.
+        Type dims  [0 : 6]  → always 1  (always predict the type).
+        Right dims [6 :18]  → always 1  (right hand active in all types except 0_any).
+        Left  dims [18:30]  → 1 for types 4,5 (both hands); 0 for types 0,1,2,3.
         """
         B = grasp_type_id.shape[0]
         mask = torch.ones(B, self.N_OUT, device=device)
-        right_only = grasp_type_id < 3  # types 0, 1, 2
+        right_only = grasp_type_id < 4  # types 0, 1, 2, 3
         mask[right_only, self.N_TYPE + 12:] = 0.0
         return mask
 
     def _build_joint_target(self, grasp_type_id, right_rot, right_trans, left_rot, left_trans):
-        """Compose the normalised 29-dim training target and its mask."""
+        """Compose the normalised 30-dim training target and its mask."""
         # Pose part — flatten rotation matrices, concatenate, normalise
         pose = torch.cat(
             [
@@ -79,9 +80,9 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
 
         # Type part — scaled one-hot
         type_onehot = F.one_hot(grasp_type_id, num_classes=self.N_TYPE).float()
-        type_onehot = type_onehot * self.TYPE_SCALE  # (B, 5)
+        type_onehot = type_onehot * self.TYPE_SCALE  # (B, 6)
 
-        joint = torch.cat([type_onehot, pose_norm], dim=-1)  # (B, 29)
+        joint = torch.cat([type_onehot, pose_norm], dim=-1)  # (B, 30)
         mask  = self._get_joint_mask(grasp_type_id, pose.device)
         joint = joint * mask  # zero out inactive dims before diffusion
         return joint, mask
@@ -102,6 +103,8 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
 
         global_feature = repeat(global_feature, "b c -> (b t) c", t=sample_num)
         grasp_type_id  = repeat(data["grasp_type_id"], "b -> (b t)", t=sample_num)
+
+        assert (grasp_type_id != 0).all(), "grasp_type_id should not be 0 during training"
 
         joint, mask = self._build_joint_target(
             grasp_type_id,
@@ -139,7 +142,7 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
         joint, log_prob = self.diffusion.sample(cond=global_feature_rep, mask=full_mask)
 
         # ---- Decode type ------------------------------------------------
-        type_logits = joint[:, :self.N_TYPE]          # (B*N, 5)
+        type_logits = joint[:, :self.N_TYPE]          # (B*N, 6)
         grasp_type  = type_logits.argmax(dim=-1)       # (B*N,)  int
 
         # ---- Apply type-conditioned mask to clean up inactive hand ------

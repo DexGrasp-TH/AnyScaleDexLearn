@@ -2,7 +2,6 @@ import os
 from os.path import join as pjoin
 from glob import glob
 import random
-import time
 import numpy as np
 from torch.utils.data import Dataset
 
@@ -12,267 +11,237 @@ from scipy.spatial.transform import Rotation as sciR
 
 
 class HumanMultiDexDataset(Dataset):
+    """Dataset for human bimanual grasps with multiple grasp types."""
+
+    _MIRROR = np.diag([-1.0, 1.0, 1.0])  # YZ-plane reflection matrix
+
     def __init__(self, config: dict, mode: str, sc_voxel_size: float = None):
         self.config = config
         self.sc_voxel_size = sc_voxel_size
         self.mode = mode
+        self.grasp_path_dict = {}
+        self.pc_path_dict = {}
+        self.object_pc_folder = pjoin(config.object_path, config.pc_path)
 
-        # Initialize cache dict
-        self.grasp_path_dict = {}  # {grasp_type: {obj_id: [path1, path2, ...]}}
-        self.pc_path_dict = {}  # {obj_name: [pc_path1, ...]}
-        # self.pc_data_cache = {}   # 内存缓存点云数据 (可选)
+        if mode == "test":
+            self.grasp_type_lst = (
+                config.grasp_type_lst
+                if hasattr(config, "grasp_type_lst") and config.grasp_type_lst
+                else [gt for gt in GRASP_TYPES if gt != "0_any"]
+            )
+            self.grasp_type_num = len(self.grasp_type_lst)
 
-        if self.config.grasp_type_lst is not None:
-            self.grasp_type_lst = self.config.grasp_type_lst
-        else:
-            self.grasp_type_lst = os.listdir(self.config.grasp_path)
-        self.grasp_type_num = len(self.grasp_type_lst)
-        self.object_pc_folder = pjoin(self.config.object_path, self.config.pc_path)
-
-        if mode == "train" or mode == "eval":
-            self.init_train_eval(mode)
+        if mode in ["train", "eval"]:
+            self._init_train_eval(mode)
         elif mode == "test":
-            self.init_test()
-        return
+            self._init_test()
 
-    def init_train_eval(self, mode):
+    def _init_train_eval(self, mode):
         split_name = "test" if mode == "eval" else "train"
         self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
-        self.data_num = 0
 
         print(f"Pre-indexing {mode} data paths...")
-        self.grasp_path_dict = {}
-
         for obj_id in self.obj_id_lst:
-            # 只在这里执行一次 glob
-            found_paths = glob(
-                pjoin(self.config.grasp_path, obj_id, "**/**.npy"),
-                recursive=True,
-            )
+            found_paths = glob(pjoin(self.config.grasp_path, obj_id, "**/**.npy"), recursive=True)
+            if found_paths:
+                self.grasp_path_dict[obj_id] = sorted(found_paths)
 
-            if len(found_paths) == 0:
-                continue
+        self.data_num = sum(len(paths) for paths in self.grasp_path_dict.values())
+        print(f"mode: {mode}, grasp data num: {self.data_num}")
 
-            self.data_num += len(found_paths)
-            self.grasp_path_dict[obj_id] = sorted(found_paths)
-
-        print(f"mode: {mode}, grasp type number: {self.grasp_type_num}, grasp data num: {self.data_num}")
-
-    def init_test(self):
+    def _init_test(self):
         split_name = self.config.test_split
         self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
 
         if self.config.mini_test:
             self.obj_id_lst = self.obj_id_lst[:100]
 
-        self.test_cfg_lst = []
+        scene_patterns = (
+            [self.config.test_scene_cfg]
+            if isinstance(self.config.test_scene_cfg, str)
+            else self.config.test_scene_cfg
+        )
 
-        # --- 修改部分：统一将 config 转化为列表 ---
-        scene_patterns = self.config.test_scene_cfg
-        if isinstance(scene_patterns, str):
-            scene_patterns = [scene_patterns]
-
+        test_cfg_set = set()
         for obj_id in self.obj_id_lst:
             base_dir = pjoin(self.config.object_path, "scene_cfg", obj_id)
-
-            # 针对每一个 pattern 进行搜索
             for pattern in scene_patterns:
-                full_pattern = pjoin(base_dir, pattern)
+                test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
 
-                # 使用 recursive=True 以支持 ** 语法
-                # 使用 set 去重，防止同一个文件被多个 pattern 重复匹配
-                found_files = glob(full_pattern, recursive=True)
-                self.test_cfg_lst.extend(found_files)
-
-        # 最终去重并排序（保证实验可复现）
-        self.test_cfg_lst = sorted(list(set(self.test_cfg_lst)))
-
-        self.data_num = self.grasp_type_num * len(self.test_cfg_lst)
+        self.test_cfg_lst = sorted(test_cfg_set)
+        self.data_num = (
+            self.grasp_type_num * len(self.test_cfg_lst)
+            if self.config.grasp_type_cond
+            else len(self.test_cfg_lst)
+        )
         print(
             f"Test split: {split_name}, grasp type number: {self.grasp_type_num}, "
-            f"object cfg num: {len(self.test_cfg_lst)}"
+            f"object cfg num: {len(self.test_cfg_lst)}, grasp_type_cond: {self.config.grasp_type_cond}"
         )
-        return
 
     def __len__(self):
         return self.data_num
 
     def __getitem__(self, id: int):
-        # print(f"data id: {id}") # DEBUG
-
-        t_start = time.perf_counter()
-        metrics = {}
-
         ret_dict = {}
 
-        if self.mode == "train" or self.mode == "eval":
-            t0 = time.perf_counter()
-
-            # random select grasp data
-            grasp_obj_lst = self.obj_id_lst
-            rand_obj_id = random.choice(grasp_obj_lst)
-            grasp_npy_lst = self.grasp_path_dict[rand_obj_id]
-            grasp_path = random.choice(sorted(grasp_npy_lst))
-            metrics["glob_time"] = time.perf_counter() - t0
-
-            t1 = time.perf_counter()
-            grasp_data = np.load(grasp_path, allow_pickle=True).item()
-            metrics["grasp_load_time"] = time.perf_counter() - t1
-
-            ret_dict["path"] = grasp_path
-
-            # grasp type
-            l_contacts = grasp_data["hand"]["left"]["contacts"] if grasp_data["hand"]["left"] else [False] * 5
-            r_contacts = grasp_data["hand"]["right"]["contacts"] if grasp_data["hand"]["right"] else [False] * 5
-            has_l = any(l_contacts)
-            has_r = any(r_contacts)
-            l_count = sum(l_contacts)
-            r_count = sum(r_contacts)
+        if self.mode in ["train", "eval"]:
+            rand_grasp_type, pc, mirrored, grasp_data = self._load_train_data(ret_dict)
+        else:  # test
+            rand_grasp_type, pc = self._load_test_data(id, ret_dict)
             mirrored = False
+            grasp_data = None
 
-            if has_l and has_r:
-                if l_count > 3 or r_count > 3:
-                    grasp_type = GRASP_TYPES[4]  # 4_both_full
-                else:
-                    grasp_type = GRASP_TYPES[3]  # 3_both_three
-            elif has_r:
-                if r_count <= 2:
-                    grasp_type = GRASP_TYPES[0]  # 0_right_two
-                elif r_count == 3:
-                    grasp_type = GRASP_TYPES[1]  # 1_right_three
-                else:
-                    grasp_type = GRASP_TYPES[2]  # 2_right_full
-            elif has_l:
-                mirrored = True
-                if l_count <= 2:
-                    grasp_type = GRASP_TYPES[0]  # 0_right_two
-                elif l_count == 3:
-                    grasp_type = GRASP_TYPES[1]  # 1_right_three
-                else:
-                    grasp_type = GRASP_TYPES[2]  # 2_right_full
-            else:
-                raise ValueError(f"Grasp data has no contact: {grasp_path}")
-            assert grasp_type in self.grasp_type_lst, f"Grasp type {grasp_type} not in grasp_type_lst"
-            rand_grasp_type = grasp_type
-
-            # wrist pose
-            _MIRROR = np.diag([-1.0, 1.0, 1.0])  # YZ-plane reflection matrix
-            if not mirrored:
-                for side, is_active in grasp_data["hand"].items():
-                    if is_active:
-                        ret_dict[f"{side}_hand_trans"] = np.asarray(grasp_data["hand"][side]["trans"]).reshape(1, 1, 3)
-                        ret_dict[f"{side}_hand_rot"] = (
-                            sciR.from_rotvec(grasp_data["hand"][side]["rot"]).as_matrix().reshape(1, 1, 3, 3)
-                        )
-                    else:
-                        ret_dict[f"{side}_hand_trans"] = np.zeros((1, 1, 3))  # assign zero
-                        ret_dict[f"{side}_hand_rot"] = np.zeros((1, 1, 3, 3))
-            else:
-                # Mirror left-only grasp to right hand via YZ-plane reflection
-                l_trans = np.asarray(grasp_data["hand"]["left"]["trans"])  # (3,)
-                l_rot = sciR.from_rotvec(grasp_data["hand"]["left"]["rot"]).as_matrix()  # (3, 3)
-                ret_dict["right_hand_trans"] = (_MIRROR @ l_trans).reshape(1, 1, 3)
-                ret_dict["right_hand_rot"] = (_MIRROR @ l_rot @ _MIRROR).reshape(1, 1, 3, 3)
-                ret_dict["left_hand_trans"] = np.zeros((1, 1, 3))
-                ret_dict["left_hand_rot"] = np.zeros((1, 1, 3, 3))
-
-            # mano parameters (optional, for visualization)
-            if getattr(self.config, "load_mano_params", False):
-                if not mirrored:
-                    for side, is_active in grasp_data["hand"].items():
-                        if is_active:
-                            pose = np.asarray(grasp_data["hand"][side]["mano_pose"]).flatten()[:24]
-                            betas = np.asarray(grasp_data["hand"][side]["mano_betas"]).flatten()[:10]
-                            ret_dict[f"{side}_mano_pose"] = pose
-                            ret_dict[f"{side}_mano_betas"] = betas
-                        else:
-                            ret_dict[f"{side}_mano_pose"] = np.zeros(24, dtype=np.float32)
-                            ret_dict[f"{side}_mano_betas"] = np.zeros(10, dtype=np.float32)
-                else:
-                    # Use left hand's mano params for the mirrored right hand
-                    ret_dict["right_mano_pose"] = np.asarray(grasp_data["hand"]["left"]["mano_pose"]).flatten()[:24]
-                    ret_dict["right_mano_betas"] = np.asarray(grasp_data["hand"]["left"]["mano_betas"]).flatten()[:10]
-                    ret_dict["left_mano_pose"] = np.zeros(24, dtype=np.float32)
-                    ret_dict["left_mano_betas"] = np.zeros(10, dtype=np.float32)
-
-            # object info
-            obj_name = grasp_data["object"]["name"]
-            obj_scale = grasp_data["object"]["rel_scale"]
-            obj_pose = grasp_data["object"]["pose"]
-
-            t2 = time.perf_counter()
-
-            # read object point cloud
-            if obj_name not in self.pc_path_dict:
-                # store the pointcloud file path
-                self.pc_path_dict[obj_name] = sorted(glob(pjoin(self.object_pc_folder, obj_name, "**.npy")))
-            pc_path = random.choice(self.pc_path_dict[obj_name])
-
-            raw_pc = np.load(pc_path, allow_pickle=True)
-            idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
-            scaled_pc = raw_pc[idx] * obj_scale  # re-scale the raw mesh (pointcloud) to the actual scale
-            R = obj_pose[:3, :3]  # (3, 3)
-            t = obj_pose[:3, 3]  # (3,)
-            transformed_pc = np.matmul(scaled_pc, R.T) + t  # transform the object pointcloud based on the object pose
-            if mirrored:
-                transformed_pc = transformed_pc.copy()
-                transformed_pc[:, 0] = -transformed_pc[:, 0]
-            pc = transformed_pc
-
-            metrics["pc_process_time"] = time.perf_counter() - t2
-
-        elif self.mode == "test":
-            rand_grasp_type = self.grasp_type_lst[id // len(self.test_cfg_lst)]
-            scene_path = self.test_cfg_lst[id % len(self.test_cfg_lst)]
-
-            scene_cfg = np.load(scene_path, allow_pickle=True).item()
-
-            obj_name = scene_cfg["object"]["name"]
-            obj_scale = scene_cfg["object"]["rel_scale"]
-            obj_pose = scene_cfg["object"]["pose"]
-
-            # read point cloud
-            if obj_name not in self.pc_path_dict:
-                # store the pointcloud file path
-                self.pc_path_dict[obj_name] = sorted(glob(pjoin(self.object_pc_folder, obj_name, "**.npy")))
-            pc_path = random.choice(self.pc_path_dict[obj_name])
-
-            raw_pc = np.load(pc_path, allow_pickle=True)
-            idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
-            scaled_pc = raw_pc[idx] * obj_scale  # re-scale the raw mesh (pointcloud) to the actual scale
-            R = obj_pose[:3, :3]  # (3, 3)
-            t = obj_pose[:3, 3]  # (3,)
-            transformed_pc = np.matmul(scaled_pc, R.T) + t  # transform the object pointcloud based on the object pose
-            pc = transformed_pc
-
-            ret_dict["save_path"] = pjoin(
-                self.config.name, rand_grasp_type, scene_cfg["scene_id"], os.path.basename(pc_path)
-            )
-            ret_dict["scene_path"] = scene_path
-            ret_dict["pc_path"] = pc_path
-
-        # Move the pointcloud centroid to the origin. Move the robot pose accordingly.
         if self.config.pc_centering:
-            pc_centroid = np.mean(pc, axis=-2, keepdims=True)
-            pc = pc - pc_centroid  # normalization
-            if self.mode != "test":
-                if mirrored:
-                    ret_dict["right_hand_trans"] -= pc_centroid[None, :, :]
-                else:
-                    for side, is_active in grasp_data["hand"].items():
-                        if is_active:
-                            ret_dict[f"{side}_hand_trans"] -= pc_centroid[None, :, :]
+            pc = self._apply_pc_centering(pc, ret_dict, mirrored, grasp_data)
 
-        ret_dict["point_clouds"] = pc  # (N, 3)
-        ret_dict["grasp_type_id"] = int(rand_grasp_type.split("_")[0]) if self.config.grasp_type_cond else 0
+        ret_dict["point_clouds"] = pc
+        ret_dict["grasp_type_id"] = int(rand_grasp_type.split("_")[0])
         if self.sc_voxel_size is not None:
-            ret_dict["coors"] = pc / self.sc_voxel_size  # (N, 3)
-            ret_dict["feats"] = pc  # (N, 3)
-
-        # total_time = time.perf_counter() - t_start
-        # print(f"\n--- Data ID {id} Profiling ---")
-        # for k, v in metrics.items():
-        #     print(f"{k}: {v:.4f}s ({v/total_time:.1%})")
-        # print(f"Total Time: {total_time:.4f}s")
+            ret_dict["coors"] = pc / self.sc_voxel_size
+            ret_dict["feats"] = pc
 
         return ret_dict
+
+    def _determine_grasp_type(self, grasp_data):
+        """Determine grasp type and whether mirroring is needed."""
+        l_contacts = grasp_data["hand"]["left"]["contacts"] if grasp_data["hand"]["left"] else [False] * 5
+        r_contacts = grasp_data["hand"]["right"]["contacts"] if grasp_data["hand"]["right"] else [False] * 5
+        has_l, has_r = any(l_contacts), any(r_contacts)
+        l_count, r_count = sum(l_contacts), sum(r_contacts)
+
+        if not (has_l or has_r):
+            raise ValueError("Grasp data has no contact")
+
+        if has_l and has_r:
+            grasp_type = GRASP_TYPES[5] if (l_count > 3 or r_count > 3) else GRASP_TYPES[4]
+            return grasp_type, False
+
+        # Single hand grasp - determine type by finger count
+        count = l_count if has_l else r_count
+        if count <= 2:
+            grasp_type = GRASP_TYPES[1]
+        elif count == 3:
+            grasp_type = GRASP_TYPES[2]
+        else:
+            grasp_type = GRASP_TYPES[3]
+
+        # Mirror left-only grasps to right hand
+        mirrored = has_l and not has_r
+        return grasp_type, mirrored
+
+    def _extract_hand_poses(self, grasp_data, mirrored, ret_dict):
+        """Extract and process hand poses from grasp data."""
+        if not mirrored:
+            for side, is_active in grasp_data["hand"].items():
+                if is_active:
+                    ret_dict[f"{side}_hand_trans"] = np.asarray(grasp_data["hand"][side]["trans"]).reshape(1, 1, 3)
+                    ret_dict[f"{side}_hand_rot"] = (
+                        sciR.from_rotvec(grasp_data["hand"][side]["rot"]).as_matrix().reshape(1, 1, 3, 3)
+                    )
+                else:
+                    ret_dict[f"{side}_hand_trans"] = np.zeros((1, 1, 3))
+                    ret_dict[f"{side}_hand_rot"] = np.zeros((1, 1, 3, 3))
+        else:
+            # Mirror left-only grasp to right hand
+            l_trans = np.asarray(grasp_data["hand"]["left"]["trans"])
+            l_rot = sciR.from_rotvec(grasp_data["hand"]["left"]["rot"]).as_matrix()
+            ret_dict["right_hand_trans"] = (self._MIRROR @ l_trans).reshape(1, 1, 3)
+            ret_dict["right_hand_rot"] = (self._MIRROR @ l_rot @ self._MIRROR).reshape(1, 1, 3, 3)
+            ret_dict["left_hand_trans"] = np.zeros((1, 1, 3))
+            ret_dict["left_hand_rot"] = np.zeros((1, 1, 3, 3))
+
+        if getattr(self.config, "load_mano_params", False):
+            self._extract_mano_params(grasp_data, mirrored, ret_dict)
+
+    def _extract_mano_params(self, grasp_data, mirrored, ret_dict):
+        """Extract MANO parameters for visualization."""
+        if not mirrored:
+            for side, is_active in grasp_data["hand"].items():
+                if is_active:
+                    ret_dict[f"{side}_mano_pose"] = np.asarray(grasp_data["hand"][side]["mano_pose"]).flatten()[:24]
+                    ret_dict[f"{side}_mano_betas"] = np.asarray(grasp_data["hand"][side]["mano_betas"]).flatten()[:10]
+                else:
+                    ret_dict[f"{side}_mano_pose"] = np.zeros(24, dtype=np.float32)
+                    ret_dict[f"{side}_mano_betas"] = np.zeros(10, dtype=np.float32)
+        else:
+            ret_dict["right_mano_pose"] = np.asarray(grasp_data["hand"]["left"]["mano_pose"]).flatten()[:24]
+            ret_dict["right_mano_betas"] = np.asarray(grasp_data["hand"]["left"]["mano_betas"]).flatten()[:10]
+            ret_dict["left_mano_pose"] = np.zeros(24, dtype=np.float32)
+            ret_dict["left_mano_betas"] = np.zeros(10, dtype=np.float32)
+
+    def _load_pointcloud(self, obj_name, obj_scale, obj_pose, mirrored=False):
+        """Load and transform object point cloud."""
+        if obj_name not in self.pc_path_dict:
+            self.pc_path_dict[obj_name] = sorted(glob(pjoin(self.object_pc_folder, obj_name, "**.npy")))
+        pc_path = random.choice(self.pc_path_dict[obj_name])
+
+        raw_pc = np.load(pc_path, allow_pickle=True)
+        idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
+        scaled_pc = raw_pc[idx] * obj_scale
+
+        R, t = obj_pose[:3, :3], obj_pose[:3, 3]
+        pc = np.matmul(scaled_pc, R.T) + t
+
+        if mirrored:
+            pc = pc.copy()
+            pc[:, 0] = -pc[:, 0]
+
+        return pc, pc_path
+
+    def _load_train_data(self, ret_dict):
+        """Load training/eval data."""
+        rand_obj_id = random.choice(self.obj_id_lst)
+        grasp_path = random.choice(self.grasp_path_dict[rand_obj_id])
+        grasp_data = np.load(grasp_path, allow_pickle=True).item()
+
+        ret_dict["path"] = grasp_path
+
+        grasp_type, mirrored = self._determine_grasp_type(grasp_data)
+        self._extract_hand_poses(grasp_data, mirrored, ret_dict)
+
+        obj_name = grasp_data["object"]["name"]
+        obj_scale = grasp_data["object"]["rel_scale"]
+        obj_pose = grasp_data["object"]["pose"]
+
+        pc, _ = self._load_pointcloud(obj_name, obj_scale, obj_pose, mirrored)
+
+        return grasp_type, pc, mirrored, grasp_data
+
+    def _load_test_data(self, id, ret_dict):
+        """Load test data."""
+        if self.config.grasp_type_cond:
+            grasp_type = self.grasp_type_lst[id // len(self.test_cfg_lst)]
+            scene_path = self.test_cfg_lst[id % len(self.test_cfg_lst)]
+        else:
+            grasp_type = GRASP_TYPES[0]
+            scene_path = self.test_cfg_lst[id]
+
+        scene_cfg = np.load(scene_path, allow_pickle=True).item()
+        obj_name = scene_cfg["object"]["name"]
+        obj_scale = scene_cfg["object"]["rel_scale"]
+        obj_pose = scene_cfg["object"]["pose"]
+
+        pc, pc_path = self._load_pointcloud(obj_name, obj_scale, obj_pose)
+
+        ret_dict["save_path"] = pjoin(self.config.name, grasp_type, scene_cfg["scene_id"], os.path.basename(pc_path))
+        ret_dict["scene_path"] = scene_path
+        ret_dict["pc_path"] = pc_path
+
+        return grasp_type, pc
+
+    def _apply_pc_centering(self, pc, ret_dict, mirrored, grasp_data):
+        """Center point cloud and adjust hand poses accordingly."""
+        pc_centroid = np.mean(pc, axis=-2, keepdims=True)
+        pc = pc - pc_centroid
+
+        if self.mode != "test":
+            if mirrored:
+                ret_dict["right_hand_trans"] -= pc_centroid[None, :, :]
+            else:
+                for side, is_active in grasp_data["hand"].items():
+                    if is_active:
+                        ret_dict[f"{side}_hand_trans"] -= pc_centroid[None, :, :]
+
+        return pc
+

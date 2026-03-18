@@ -3,7 +3,7 @@ human: True
 dataset_type: HumanMultiDexDataset
 
 num_points: 1024
-grasp_type_lst: ["0_right_two", "1_right_three", "2_right_full", "3_both_three", "4_both_full"]
+grasp_type_lst: ["1_right_two", "2_right_three", "3_right_full", "4_both_three", "5_both_full"]
 grasp_type_cond: True
 pc_centering: True
 
