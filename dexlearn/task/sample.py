@@ -53,6 +53,8 @@ def task_sample(config: DictConfig):
                     "scene_path": data["scene_path"],
                     "pc_path": data["pc_path"],
                 }
+                if "grasp_type_id" in data:
+                    save_dict["grasp_type_id"] = data["grasp_type_id"]
             else:
                 save_dict = {
                     "pregrasp_qpos": robot_pose[..., 0, :],

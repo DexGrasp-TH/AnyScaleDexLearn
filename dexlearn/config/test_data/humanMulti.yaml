@@ -1,20 +1,15 @@
+name: ${test_data_name}
 human: True
 dataset_type: HumanMultiDexDataset
-num_workers: 10
 
 num_points: 1024
-traj_length: 3
-joint_num: 16
 grasp_type_lst: ["0_right_two", "1_right_three", "2_right_full", "3_both_three", "4_both_full"]
 grasp_type_cond: True
 pc_centering: True
 
-grasp_path: ${oc.env:AnyScaleGraspDataset}/GRAB/grasp
-object_path: ${oc.env:AnyScaleGraspDataset}/GRAB/object
+object_path: /data/dataset/AnyScaleGrasp/GRAB/object
 split_path: valid_split   # relative to object_path
 pc_path: vision_data/complete_pc    # relative to object_path
-load_mano_params: False
-
 test_split: test
-test_scene_cfg: ["**/*.npy", "*.npy"]
+test_scene_cfg: "**/*.npy"
 mini_test: False

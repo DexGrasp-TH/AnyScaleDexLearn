@@ -1,6 +1,25 @@
 {
     "version": "0.2.0",
     "configurations": [
+         {
+            "name": "sample: humanbi / humanBiDiffusion",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=sample", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "algo.batch_size=64", "exp_name=debug3"]
+        },
+        {
+            "name": "visualize_test: humanbi / humanBiDiffusion",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=visualize_test", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "exp_name=debug3"]
+        },
+
         {
             "name": "check_dataloader: humanMulti",
             "type": "python",
@@ -20,49 +39,14 @@
             "args": ["task=train", "data=humanMulti", "algo=humanMultiDiffusion", "algo.batch_size=16", "exp_name=debug0"]
         },
         {
-            "name": "train: humanbi / humanBiDiffusion",
+            "name": "sample: humanMulti / humanMultiDiffusion",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=train", "data=humanbi", "algo=humanBiDiffusion", "algo.batch_size=16", "exp_name=debug2"]
+            "args": ["task=sample", "data=humanMulti", "algo=humanMultiDiffusion", "test_data=humanMulti", "exp_name=debug1"]
         },
-        {
-            "name": "sample: human / humanDiffusion",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/dexlearn/main.py",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "args": ["task=sample", "data=human", "algo=humanDiffusion", "test_data=human_obj", "algo.batch_size=16", "exp_name=debug1"]
-        },
-        {
-            "name": "sample: humanbi / humanBiDiffusion",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/dexlearn/main.py",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "args": ["task=sample", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "algo.batch_size=64", "exp_name=debug3"]
-        },
-        {
-            "name": "visualize_test: human / humanNflow",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/dexlearn/main.py",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "args": ["task=visualize_test", "data=human", "algo=humanNflow", "test_data=DGN", "exp_name=debug1"]
-        },
-        {
-            "name": "visualize_test: humanbi / humanBiDiffusion",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/dexlearn/main.py",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "args": ["task=visualize_test", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "exp_name=debug3"]
-        }
+       
     ]
 }

@@ -15,3 +15,16 @@ ignore = ["F401"]
 # Exclude a variety of commonly ignored directories.
 respect-gitignore = true
 ignore-init-module-imports = true
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dexlearn"
+version = "0.1.0"
+dependencies = ["wandb", "einops"]
+
+[tool.setuptools.packages.find]
+include = ["dexlearn*"]
+exclude = ["third_party*"]
