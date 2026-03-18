@@ -38,13 +38,21 @@ def task_sample(config: DictConfig):
 
     with torch.no_grad():
         for data in tqdm(test_loader, desc="Sampling grasps (inference)"):
-            robot_pose, log_prob = model.sample(data, config.algo.test_grasp_num)
+            result = model.sample(data, config.algo.test_grasp_num)
+
+            if len(result) == 3:
+                robot_pose, pred_grasp_type, log_prob = result
+            else:
+                robot_pose, log_prob = result
+                pred_grasp_type = None
 
             # select top k predictions with higher log_prob
             topk_indices = torch.topk(log_prob, config.algo.test_topk, dim=1).indices
             batch_indices = torch.arange(robot_pose.size(0)).unsqueeze(1).expand(-1, config.algo.test_topk)
             robot_pose = robot_pose[batch_indices, topk_indices]
             log_prob = log_prob[batch_indices, topk_indices]
+            if pred_grasp_type is not None:
+                pred_grasp_type = pred_grasp_type[batch_indices, topk_indices]
 
             if config.algo.human:
                 save_dict = {
@@ -55,6 +63,8 @@ def task_sample(config: DictConfig):
                 }
                 if "grasp_type_id" in data:
                     save_dict["grasp_type_id"] = data["grasp_type_id"]
+                if pred_grasp_type is not None:
+                    save_dict["pred_grasp_type_id"] = pred_grasp_type
             else:
                 save_dict = {
                     "pregrasp_qpos": robot_pose[..., 0, :],

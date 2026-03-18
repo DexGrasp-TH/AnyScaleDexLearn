@@ -3,11 +3,10 @@ human: True
 dataset_type: HumanMultiDexDataset
 
 num_points: 1024
-grasp_type_lst: ["1_right_two", "2_right_three", "3_right_full", "4_both_three", "5_both_full"]
-grasp_type_cond: True
+grasp_type_lst: ["0_any"]
 pc_centering: True
 
-object_path: /data/dataset/AnyScaleGrasp/GRAB/object
+object_path: ${oc.env:AnyScaleGraspDataset}/GRAB/object
 split_path: valid_split   # relative to object_path
 pc_path: vision_data/complete_pc    # relative to object_path
 test_split: test

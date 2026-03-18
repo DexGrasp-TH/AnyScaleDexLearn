@@ -45,7 +45,7 @@
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=sample", "data=humanMulti", "algo=humanMultiDiffusion", "test_data=humanMulti", "exp_name=debug1"]
+            "args": ["task=sample", "data=humanMulti", "algo=humanMultiDiffusion", "test_data=humanMulti", "exp_name=debug2"]
         },
        
     ]

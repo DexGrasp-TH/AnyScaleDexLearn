@@ -25,5 +25,9 @@ class BaseModel(torch.nn.Module):
         cond_feat = torch.cat([global_feature, self.grasp_type_emb(data, global_feature, True)], dim=-1)
 
         grasp_type = data["grasp_type_id"]
-        robot_pose, log_prob = self.output_head.sample(cond_feat, grasp_type, sample_num)
-        return robot_pose, log_prob
+        result = self.output_head.sample(cond_feat, grasp_type, sample_num)
+
+        if len(result) == 3:
+            return result  # robot_pose, pred_grasp_type, log_prob
+        else:
+            return result  # robot_pose, log_prob

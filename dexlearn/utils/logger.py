@@ -59,10 +59,12 @@ class Logger:
             for j in range(dic[torch_key].shape[1]):
                 save_dict = {}
                 for k, v in dic.items():
-                    if type(v).__module__ == "torch":
-                        save_dict[k] = v[i, j].detach().cpu().numpy()
-                    elif k in ["scene_path", "pc_path"]:
+                    if k in ["scene_path", "pc_path"]:
                         save_dict[k] = v[i]
+                    elif k in ["grasp_type_id"]:
+                        save_dict[k] = v[i].detach().cpu().numpy()
+                    elif type(v).__module__ == "torch":
+                        save_dict[k] = v[i, j].detach().cpu().numpy()
                     else:
                         raise NotImplementedError
                 path_j = path.split(".npy")[0] + f"_{j}.npy"

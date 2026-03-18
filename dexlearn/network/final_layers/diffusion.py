@@ -119,7 +119,7 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
     # inference
     # ------------------------------------------------------------------
 
-    def sample(self, global_feature, sample_num):
+    def sample(self, global_feature, grasp_type, sample_num):
         """Sample grasp type + bimanual wrist poses jointly.
 
         Args:
@@ -143,10 +143,10 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
 
         # ---- Decode type ------------------------------------------------
         type_logits = joint[:, :self.N_TYPE]          # (B*N, 6)
-        grasp_type  = type_logits.argmax(dim=-1)       # (B*N,)  int
+        pred_grasp_type  = type_logits.argmax(dim=-1)       # (B*N,)  int
 
         # ---- Apply type-conditioned mask to clean up inactive hand ------
-        pose_mask = self._get_joint_mask(grasp_type, joint.device)[:, self.N_TYPE:]  # (B*N, 24)
+        pose_mask = self._get_joint_mask(pred_grasp_type, joint.device)[:, self.N_TYPE:]  # (B*N, 24)
         pose_norm = joint[:, self.N_TYPE:] * pose_mask
         pose      = self.RMS.inv(pose_norm)            # (B*N, 24)
 
@@ -160,7 +160,7 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
         l_mask = rearrange(pose_mask[..., 21:22], "(b t) c -> b t c", t=sample_num)
 
         log_prob   = rearrange(log_prob,   "(b t) -> b t", t=sample_num)
-        grasp_type = rearrange(grasp_type, "(b t) -> b t", t=sample_num)
+        pred_grasp_type = rearrange(pred_grasp_type, "(b t) -> b t", t=sample_num)
 
         def process_pose(rot_raw, trans, hand_mask):
             rot_matrix = proper_svd(rot_raw.reshape(-1, 3, 3)).reshape_as(rot_raw)
@@ -174,7 +174,7 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
         left_pose  = process_pose(l_rot_raw, l_trans, l_mask)
         robot_pose = torch.cat([right_pose, left_pose], dim=-1)  # (B, N, 1, 14)
 
-        return robot_pose, grasp_type, log_prob
+        return robot_pose, pred_grasp_type, log_prob
 
 
 

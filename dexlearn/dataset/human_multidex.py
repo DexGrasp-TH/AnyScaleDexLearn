@@ -69,14 +69,10 @@ class HumanMultiDexDataset(Dataset):
                 test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
 
         self.test_cfg_lst = sorted(test_cfg_set)
-        self.data_num = (
-            self.grasp_type_num * len(self.test_cfg_lst)
-            if self.config.grasp_type_cond
-            else len(self.test_cfg_lst)
-        )
+        self.data_num = self.grasp_type_num * len(self.test_cfg_lst)
         print(
-            f"Test split: {split_name}, grasp type number: {self.grasp_type_num}, "
-            f"object cfg num: {len(self.test_cfg_lst)}, grasp_type_cond: {self.config.grasp_type_cond}"
+            f"Test split: {split_name}, grasp type list: {self.grasp_type_lst}, "
+            f"object cfg num: {len(self.test_cfg_lst)}"
         )
 
     def __len__(self):
@@ -210,12 +206,8 @@ class HumanMultiDexDataset(Dataset):
 
     def _load_test_data(self, id, ret_dict):
         """Load test data."""
-        if self.config.grasp_type_cond:
-            grasp_type = self.grasp_type_lst[id // len(self.test_cfg_lst)]
-            scene_path = self.test_cfg_lst[id % len(self.test_cfg_lst)]
-        else:
-            grasp_type = GRASP_TYPES[0]
-            scene_path = self.test_cfg_lst[id]
+        grasp_type = self.grasp_type_lst[id // len(self.test_cfg_lst)]
+        scene_path = self.test_cfg_lst[id % len(self.test_cfg_lst)]
 
         scene_cfg = np.load(scene_path, allow_pickle=True).item()
         obj_name = scene_cfg["object"]["name"]
