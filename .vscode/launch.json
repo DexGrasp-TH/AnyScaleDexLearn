@@ -39,13 +39,13 @@
             "args": ["task=train", "data=humanMulti", "algo=humanMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
         },
         {
-            "name": "sample: humanMulti / humanMultiDiffusion",
+            "name": "sample: humanMulti / humanMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=sample", "data=humanMulti", "algo=humanMultiDiffusion", "test_data=humanMulti", "exp_name=debug2"]
+            "args": ["task=sample", "data=humanMulti", "algo=humanMultiHierar", "test_data=humanMulti", "exp_name=debug1"]
         },
         {
             "name": "visualize_test: humanMulti / humanMultiDiffusion",
@@ -57,13 +57,13 @@
             "args": ["task=visualize_test", "data=humanMulti", "algo=humanMultiDiffusion", "test_data=humanMulti", "exp_name=debug2"]
         },
         {
-            "name": "stat: humanMulti / humanMultiDiffusion",
+            "name": "stat: humanMulti / humanMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=stat", "data=humanMulti", "algo=humanMultiDiffusion", "test_data=humanMulti", "exp_name=debug2"]
+            "args": ["task=stat", "data=humanMulti", "algo=humanMultiHierar", "test_data=humanMulti", "exp_name=debug1"]
         },
        
     ]

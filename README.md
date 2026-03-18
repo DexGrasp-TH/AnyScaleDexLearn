@@ -103,7 +103,7 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=h_diffusion data=
 # bimanual wrist pose, diffusion
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=hbi_diffusion data=humanbi exp_name=<XXX>
 
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiDiffusion data=humanMulti exp_name=<XXX>
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiHierar data=humanMulti exp_name=<XXX>
 ```
 
 Sample (Inference): 
