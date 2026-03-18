@@ -329,11 +329,14 @@ class GaussianDiffusion1DMask(nn.Module):
     def forward(self, *args, **kwargs):
         return self.calculate_loss(*args, **kwargs)
 
-    def calculate_loss(self, x, cond, mask):
+    def calculate_loss(self, x, cond, mask=None):
         """
         x: [Batch, Dim]
-        mask: [Batch, Dim]
+        mask: [Batch, Dim] or None
         """
+        if mask is None:
+            mask = torch.ones_like(x)
+
         t = torch.randint(0, self.timesteps, (x.shape[0],), device=x.device, dtype=torch.long)
         noise = torch.randn_like(x)
         noised_x = self.scheduler.add_noise(x, noise, t)
@@ -362,10 +365,14 @@ class GaussianDiffusion1DMask(nn.Module):
 
         return loss
 
-    def sample(self, cond, mask):
+    def sample(self, cond, mask=None):
         device = cond.device
         batch_size = cond.shape[0]
         x = torch.randn(cond.shape[0], self.model.channels, device=device)
+
+        if mask is None:
+            mask = torch.ones_like(x)
+
         assert x.shape == mask.shape, "Mask shape must match x shape."
 
         # 初始噪声屏蔽：无效手设为 0

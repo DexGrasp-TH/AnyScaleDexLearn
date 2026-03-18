@@ -9,6 +9,10 @@ from dexlearn.utils.util import load_json
 from .grasp_types import GRASP_TYPES
 from scipy.spatial.transform import Rotation as sciR
 
+# Fixed left hand pose for right-only grasps
+FIXED_LEFT_HAND_TRANS = np.array([0.0, 0.0, -0.5])
+FIXED_LEFT_HAND_ROT = np.eye(3)
+
 
 class HumanMultiDexDataset(Dataset):
     """Dataset for human bimanual grasps with multiple grasp types."""
@@ -57,9 +61,7 @@ class HumanMultiDexDataset(Dataset):
             self.obj_id_lst = self.obj_id_lst[:100]
 
         scene_patterns = (
-            [self.config.test_scene_cfg]
-            if isinstance(self.config.test_scene_cfg, str)
-            else self.config.test_scene_cfg
+            [self.config.test_scene_cfg] if isinstance(self.config.test_scene_cfg, str) else self.config.test_scene_cfg
         )
 
         test_cfg_set = set()
@@ -136,16 +138,16 @@ class HumanMultiDexDataset(Dataset):
                         sciR.from_rotvec(grasp_data["hand"][side]["rot"]).as_matrix().reshape(1, 1, 3, 3)
                     )
                 else:
-                    ret_dict[f"{side}_hand_trans"] = np.zeros((1, 1, 3))
-                    ret_dict[f"{side}_hand_rot"] = np.zeros((1, 1, 3, 3))
+                    ret_dict[f"{side}_hand_trans"] = FIXED_LEFT_HAND_TRANS.reshape(1, 1, 3)
+                    ret_dict[f"{side}_hand_rot"] = FIXED_LEFT_HAND_ROT.reshape(1, 1, 3, 3)
         else:
             # Mirror left-only grasp to right hand
             l_trans = np.asarray(grasp_data["hand"]["left"]["trans"])
             l_rot = sciR.from_rotvec(grasp_data["hand"]["left"]["rot"]).as_matrix()
             ret_dict["right_hand_trans"] = (self._MIRROR @ l_trans).reshape(1, 1, 3)
             ret_dict["right_hand_rot"] = (self._MIRROR @ l_rot @ self._MIRROR).reshape(1, 1, 3, 3)
-            ret_dict["left_hand_trans"] = np.zeros((1, 1, 3))
-            ret_dict["left_hand_rot"] = np.zeros((1, 1, 3, 3))
+            ret_dict["left_hand_trans"] = FIXED_LEFT_HAND_TRANS.reshape(1, 1, 3)
+            ret_dict["left_hand_rot"] = FIXED_LEFT_HAND_ROT.reshape(1, 1, 3, 3)
 
         if getattr(self.config, "load_mano_params", False):
             self._extract_mano_params(grasp_data, mirrored, ret_dict)
@@ -236,4 +238,3 @@ class HumanMultiDexDataset(Dataset):
                         ret_dict[f"{side}_hand_trans"] -= pc_centroid[None, :, :]
 
         return pc
-

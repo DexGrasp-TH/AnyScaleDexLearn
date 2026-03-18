@@ -18,9 +18,21 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.logger import Logger
 from dexlearn.utils.util import set_seed
 from dexlearn.network.models import *
+from dexlearn.dataset import GRASP_TYPES
 
 from manopth.manolayer import ManoLayer
 from mr_utils.utils_calc import posQuat2Isometry3d, quatWXYZ2XYZW
+
+
+def resolve_dataset_path(path):
+    """Replace /AnyScaleGrasp/ prefix with AnyScaleGraspDataset env var."""
+    if "/AnyScaleGrasp/" in path:
+        path = path.split("/AnyScaleGrasp/", 1)[1]
+        dataset_root = os.environ.get("AnyScaleGraspDataset")
+        if not dataset_root:
+            raise ValueError("AnyScaleGraspDataset environment variable not set")
+        return os.path.join(dataset_root, path)
+    return path
 
 
 def visualize_with_trimesh(verts, faces, joints=None, color=[200, 200, 250, 255]):
@@ -100,31 +112,36 @@ def task_visualize_test(config: DictConfig) -> None:
     )
     search_pattern = "**/*.npy"  # choose pattern
 
-    if config.test_data.grasp_type_cond:
-        random_sample_files = get_balanced_samples(
-            root_dir=output_dir,
-            search_pattern=search_pattern,
-            include_groups=config.test_data.grasp_type_lst,
-            num_samples=3,
-        )
-    else:
-        all_files = glob(os.path.join(output_dir, search_pattern), recursive=True)
-        random_sample_files = random.sample(all_files, k=min(len(all_files), 20))
+    random_sample_files = get_balanced_samples(
+        root_dir=output_dir,
+        search_pattern=search_pattern,
+        include_groups=config.test_data.grasp_type_lst,
+        num_samples=config.task.num_samples_per_group,
+    )
 
     for sample_file in random_sample_files:
         print(f"Processing {sample_file}")
 
         data = np.load(sample_file, allow_pickle=True).item()
         grasp_pose = data["grasp_pose"]
-        scene_path = data["scene_path"]
+        scene_path = resolve_dataset_path(data["scene_path"])
         scene_cfg = np.load(scene_path, allow_pickle=True).item()
+
+        # Get grasp type info if available
+        grasp_type_str = ""
+        if "pred_grasp_type_id" in data:
+            pred_type_id = int(data["pred_grasp_type_id"])
+            grasp_type_str = f" | Pred: {GRASP_TYPES[pred_type_id]}"
+        if "grasp_type_id" in data:
+            gt_type_id = int(data["grasp_type_id"])
+            grasp_type_str += f" | GT: {GRASP_TYPES[gt_type_id]}"
 
         ########### Process object pointcloud ###########
         if config.test_data.human:
             obj_name = scene_cfg["object"]["name"]
             obj_scale = scene_cfg["object"]["rel_scale"]
             obj_pose = scene_cfg["object"]["pose"]
-            pc_path = data["pc_path"]
+            pc_path = resolve_dataset_path(data["pc_path"])
             raw_pc = np.load(pc_path, allow_pickle=True)
             idx = np.random.choice(raw_pc.shape[0], config.data.num_points, replace=True)
             scaled_pc = raw_pc[idx] * obj_scale  # re-scale the raw mesh (pointcloud) to the actual scale
@@ -201,6 +218,6 @@ def task_visualize_test(config: DictConfig) -> None:
 
         # 显示场景
         scene = trimesh.Scene(scene_elements)
-        scene.show()
+        scene.show(caption=f"{os.path.basename(sample_file)}{grasp_type_str}")
 
     return

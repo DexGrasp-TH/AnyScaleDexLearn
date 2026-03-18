@@ -9,6 +9,67 @@ from pytorch3d import transforms as pttf
 from dexlearn.utils.RMS import Normalization
 from dexlearn.dataset.grasp_types import GRASP_TYPES
 
+class DiffusionBiRT_v2(torch.nn.Module):
+    """Diffusion model for bimanual wrist poses (used in hierarchical model)."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        N_out = 12 * 2
+        policy_mlp_parameters = dict(
+            hidden_layers_dim=[512, 256],
+            output_dim=N_out,
+            act="mish",
+        )
+        self.policy = MLPWrapper(channels=N_out, feature_dim=cfg.in_feat_dim, **policy_mlp_parameters)
+        self.diffusion = GaussianDiffusion1DMask(self.policy, cfg.diffusion)
+        self.RMS = Normalization(N_out)
+
+    def forward(self, data, cond_feat):
+        result_dict = {}
+        batch_num, sample_num, pose_num, _ = data["right_hand_trans"].shape
+        right_hand_trans = rearrange(data["right_hand_trans"], "b t n x -> (b t) n x")
+        right_hand_rot = rearrange(data["right_hand_rot"], "b t n x y -> (b t) n x y")
+        left_hand_trans = rearrange(data["left_hand_trans"], "b t n x -> (b t) n x")
+        left_hand_rot = rearrange(data["left_hand_rot"], "b t n x y -> (b t) n x y")
+
+        grasp_rt = torch.cat([
+            rearrange(right_hand_rot[:, -1], "b x y -> b (x y)"),
+            right_hand_trans[:, -1],
+            rearrange(left_hand_rot[:, -1], "b x y -> b (x y)"),
+            left_hand_trans[:, -1],
+        ], dim=-1)
+        grasp_rt_norm = self.RMS(grasp_rt)
+
+        result_dict["loss_diffusion"] = self.diffusion(grasp_rt_norm, cond_feat)
+        return result_dict
+
+    def sample(self, cond_feat, grasp_type, sample_num):
+        cond_feat = repeat(cond_feat, "b c -> (b n) c", n=sample_num)
+
+        grasp_rt, log_prob = self.diffusion.sample(cond=cond_feat)
+        log_prob = rearrange(log_prob, "(b t) -> b t", t=sample_num)
+        grasp_rt = self.RMS.inv(grasp_rt)
+
+        r_rot_raw = rearrange(grasp_rt[..., 0:9], "(b t) (x y) -> b t x y", t=sample_num, x=3, y=3)
+        r_trans = rearrange(grasp_rt[..., 9:12], "(b t) c -> b t c", t=sample_num)
+
+        l_rot_raw = rearrange(grasp_rt[..., 12:21], "(b t) (x y) -> b t x y", t=sample_num, x=3, y=3)
+        l_trans = rearrange(grasp_rt[..., 21:24], "(b t) c -> b t c", t=sample_num)
+
+        r_rot_matrix = proper_svd(r_rot_raw.reshape(-1, 3, 3)).reshape_as(r_rot_raw)
+        r_quat = pttf.matrix_to_quaternion(r_rot_matrix)
+        right_pose = torch.cat([r_trans.unsqueeze(-2), r_quat.unsqueeze(-2)], dim=-1)
+
+        l_rot_matrix = proper_svd(l_rot_raw.reshape(-1, 3, 3)).reshape_as(l_rot_raw)
+        l_quat = pttf.matrix_to_quaternion(l_rot_matrix)
+        left_pose = torch.cat([l_trans.unsqueeze(-2), l_quat.unsqueeze(-2)], dim=-1)
+
+        robot_pose = torch.cat([right_pose, left_pose], dim=-1)
+        return robot_pose, log_prob
+
+
+
 
 class DiffusionTypeAndBiRT(torch.nn.Module):
     """Joint diffusion model that generates grasp type + bimanual wrist poses from a
@@ -56,11 +117,11 @@ class DiffusionTypeAndBiRT(torch.nn.Module):
 
         Type dims  [0 : 6]  → always 1  (always predict the type).
         Right dims [6 :18]  → always 1  (right hand active in all types except 0_any).
-        Left  dims [18:30]  → 1 for types 4,5 (both hands); 0 for types 0,1,2,3.
+        Left  dims [18:30]  → 1 for types 4,5 (both hands); 0 for types 1,2,3.
         """
         B = grasp_type_id.shape[0]
         mask = torch.ones(B, self.N_OUT, device=device)
-        right_only = grasp_type_id < 4  # types 0, 1, 2, 3
+        right_only = (grasp_type_id >= 1) & (grasp_type_id <= 3)  # types 1, 2, 3
         mask[right_only, self.N_TYPE + 12:] = 0.0
         return mask
 
