@@ -14,7 +14,8 @@ from dexlearn.utils.logger import Logger
 from dexlearn.utils.util import set_seed
 from dexlearn.network.models import *
 
-from dexlearn.dataset import create_dataset, minkowski_collate_fn, InfLoader, GRASP_TYPES
+from dexlearn.dataset import create_dataset, minkowski_collate_fn, InfLoader
+from dexlearn.dataset.grasp_types import GRASP_TYPES
 from manopth.manolayer import ManoLayer
 
 
@@ -38,7 +39,6 @@ def visualize_with_trimesh(verts, faces, joints=None, color=(200, 200, 250, 255)
             scene_contents.append(sphere)
 
     return scene_contents
-
 
 
 @hydra.main(config_path="../config", config_name="base", version_base=None)
@@ -114,8 +114,8 @@ def main(config: DictConfig) -> None:
                 ############# MANO ##############
                 hand_rot_aa = matrix_to_axis_angle(hand_rot_mat.unsqueeze(0))
                 if f"{side}_mano_pose" in data:
-                    mano_pose = data[f"{side}_mano_pose"][i].unsqueeze(0).to(config.device)   # (1, 24)
-                    mano_betas = data[f"{side}_mano_betas"][i].unsqueeze(0).to(config.device) # (1, 10)
+                    mano_pose = data[f"{side}_mano_pose"][i].unsqueeze(0).to(config.device)  # (1, 24)
+                    mano_betas = data[f"{side}_mano_betas"][i].unsqueeze(0).to(config.device)  # (1, 10)
                 else:
                     mano_pose = torch.zeros((1, 24), device=config.device)
                     mano_betas = torch.zeros((1, 10), device=config.device)

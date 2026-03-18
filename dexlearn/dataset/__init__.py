@@ -15,15 +15,6 @@ from .human_bidex import HumanBiDexDataset
 from .human_multidex import HumanMultiDexDataset
 
 
-GRASP_TYPES = [
-    "0_right_two",    # right hand only, 2 fingers
-    "1_right_three",  # right hand only, 3 fingers
-    "2_right_full",   # right hand only, 4-5 fingers
-    "3_both_three",   # both hands, each ≤ 3 fingers
-    "4_both_full",    # both hands, at least one hand has 4-5 fingers
-]
-
-
 def create_dataset(config, mode):
     sp_voxel_size = config.algo.model.backbone.voxel_size if "MinkUNet" in config.algo.model.backbone.name else None
 
