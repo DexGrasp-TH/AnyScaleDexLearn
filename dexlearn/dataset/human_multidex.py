@@ -26,6 +26,7 @@ class HumanMultiDexDataset(Dataset):
         self.grasp_path_dict = {}
         self.pc_path_dict = {}
         self.object_pc_folder = pjoin(config.object_path, config.pc_path)
+        self.mano_pose_dim = 24 if "GRAB" in config.grasp_path else 45
 
         if mode == "test":
             self.grasp_type_lst = (
@@ -160,15 +161,15 @@ class HumanMultiDexDataset(Dataset):
         if not mirrored:
             for side, is_active in grasp_data["hand"].items():
                 if is_active:
-                    ret_dict[f"{side}_mano_pose"] = np.asarray(grasp_data["hand"][side]["mano_pose"]).flatten()[:24]
-                    ret_dict[f"{side}_mano_betas"] = np.asarray(grasp_data["hand"][side]["mano_betas"]).flatten()[:10]
+                    ret_dict[f"{side}_mano_pose"] = np.asarray(grasp_data["hand"][side]["mano_pose"]).flatten()
+                    ret_dict[f"{side}_mano_betas"] = np.asarray(grasp_data["hand"][side]["mano_betas"]).flatten()
                 else:
-                    ret_dict[f"{side}_mano_pose"] = np.zeros(24, dtype=np.float32)
+                    ret_dict[f"{side}_mano_pose"] = np.zeros(self.mano_pose_dim, dtype=np.float32)
                     ret_dict[f"{side}_mano_betas"] = np.zeros(10, dtype=np.float32)
         else:
-            ret_dict["right_mano_pose"] = np.asarray(grasp_data["hand"]["left"]["mano_pose"]).flatten()[:24]
-            ret_dict["right_mano_betas"] = np.asarray(grasp_data["hand"]["left"]["mano_betas"]).flatten()[:10]
-            ret_dict["left_mano_pose"] = np.zeros(24, dtype=np.float32)
+            ret_dict["right_mano_pose"] = np.asarray(grasp_data["hand"]["left"]["mano_pose"]).flatten()
+            ret_dict["right_mano_betas"] = np.asarray(grasp_data["hand"]["left"]["mano_betas"]).flatten()
+            ret_dict["left_mano_pose"] = np.zeros(self.mano_pose_dim, dtype=np.float32)
             ret_dict["left_mano_betas"] = np.zeros(10, dtype=np.float32)
 
     def _load_pointcloud(self, obj_name, obj_scale, obj_pose, mirrored=False):

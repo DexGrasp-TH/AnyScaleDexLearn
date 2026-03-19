@@ -19,6 +19,28 @@ from dexlearn.dataset.grasp_types import GRASP_TYPES
 from manopth.manolayer import ManoLayer
 
 
+class ManoConfig:
+    def __init__(self, dataset_name):
+        if dataset_name == "ContactPose":
+            use_pca = True
+            flat_hand_mean = False
+            ncomps = 15
+        elif dataset_name == "HOGraspNet":
+            use_pca = False
+            flat_hand_mean = True
+            ncomps = 45
+        elif dataset_name == "GRAB":
+            use_pca = True
+            flat_hand_mean = True
+            ncomps = 24
+        else:
+            raise NotImplementedError()
+
+        self.use_pca = use_pca
+        self.flat_hand_mean = flat_hand_mean
+        self.ncomps = ncomps
+
+
 def visualize_with_trimesh(verts, faces, joints=None, color=(200, 200, 250, 255)):
     """
     verts: (778, 3) numpy array
@@ -46,14 +68,19 @@ def main(config: DictConfig) -> None:
     set_seed(config.seed)
     logger = Logger(config)
 
+    dataset_name = next(
+        (name for name in ["ContactPose", "HOGraspNet", "GRAB"] if name in config.data.grasp_path), "GRAB"
+    )
+    mano_cfg = ManoConfig(dataset_name)
+
     mano_layers = {
         side: ManoLayer(
             center_idx=0,
             mano_root="third_party/manopth/mano/models",
             side=side,
-            use_pca=True,
-            flat_hand_mean=True,
-            ncomps=24,
+            use_pca=mano_cfg.use_pca,
+            flat_hand_mean=mano_cfg.flat_hand_mean,
+            ncomps=mano_cfg.ncomps,
             root_rot_mode="axisang",
             joint_rot_mode="axisang",
         ).to(config.device)
