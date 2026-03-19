@@ -129,12 +129,12 @@ def task_visualize_test(config: DictConfig) -> None:
 
         # Get grasp type info if available
         grasp_type_str = ""
-        if "pred_grasp_type_id" in data:
-            pred_type_id = int(data["pred_grasp_type_id"])
-            grasp_type_str = f" | Pred: {GRASP_TYPES[pred_type_id]}"
         if "grasp_type_id" in data:
             gt_type_id = int(data["grasp_type_id"])
-            grasp_type_str += f" | GT: {GRASP_TYPES[gt_type_id]}"
+            grasp_type_str += f" | Given: {GRASP_TYPES[gt_type_id]}"
+        if "pred_grasp_type_id" in data:
+            pred_type_id = int(data["pred_grasp_type_id"])
+            grasp_type_str += f" | Pred: {GRASP_TYPES[pred_type_id]}"
 
         ########### Process object pointcloud ###########
         if config.test_data.human:

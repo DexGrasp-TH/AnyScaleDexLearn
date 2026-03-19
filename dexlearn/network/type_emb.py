@@ -21,13 +21,8 @@ class LearnableTypeCond(torch.nn.Module):
         self.grasp_type_feat = torch.nn.Embedding(num_embeddings=len(GRASP_TYPES), embedding_dim=cfg.out_feat_dim)
         return
 
-    def forward(self, data, global_feature=None, predicted=False):
-        # if self.cfg.use_predictor and predicted:
-        #     predicted_grasp_prob = self.predictor(global_feature)
-        #     # select the max value
-        #     predicted_grasp_type = torch.argmax(predicted_grasp_prob, dim=1)
-        #     grasp_type_id = predicted_grasp_type
+    def forward(self, grasp_type_id, global_feature=None, predicted=False):
         if self.cfg.disabled:
-            return self.grasp_type_feat(data["grasp_type_id"] * 0)
+            return self.grasp_type_feat(grasp_type_id * 0)
         else:
-            return self.grasp_type_feat(data["grasp_type_id"])
+            return self.grasp_type_feat(grasp_type_id)

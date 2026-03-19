@@ -93,6 +93,9 @@ class HumanMultiDexDataset(Dataset):
         if self.config.pc_centering:
             pc = self._apply_pc_centering(pc, ret_dict, mirrored, grasp_data)
 
+        if self.mode == "train" and getattr(self.config, "rotation_aug", False):
+            pc = self._apply_rotation_aug(pc, ret_dict)
+
         ret_dict["point_clouds"] = pc
         ret_dict["grasp_type_id"] = int(rand_grasp_type.split("_")[0])
         if self.sc_voxel_size is not None:
@@ -236,5 +239,26 @@ class HumanMultiDexDataset(Dataset):
                 for side, is_active in grasp_data["hand"].items():
                     if is_active:
                         ret_dict[f"{side}_hand_trans"] -= pc_centroid[None, :, :]
+
+        return pc
+
+    def _apply_rotation_aug(self, pc, ret_dict):
+        """Apply random rotation around Z axis."""
+        angle = np.random.uniform(-np.pi, np.pi)
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        rot_z = np.array([[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]])
+
+        pc = pc @ rot_z.T
+
+        for side in ["right", "left"]:
+            if f"{side}_hand_trans" in ret_dict:
+                # Skip rotating fixed left hand pose
+                if side == "left" and np.allclose(
+                    ret_dict[f"{side}_hand_trans"], FIXED_LEFT_HAND_TRANS.reshape(1, 1, 3)
+                ):
+                    continue
+                # in-place change
+                ret_dict[f"{side}_hand_trans"] = ret_dict[f"{side}_hand_trans"] @ rot_z.T
+                ret_dict[f"{side}_hand_rot"] = rot_z @ ret_dict[f"{side}_hand_rot"]
 
         return pc

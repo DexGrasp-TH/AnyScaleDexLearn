@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from einops import repeat
+from einops import repeat, rearrange
 
 from ..backbones import *
 from ..type_emb import *
@@ -38,11 +38,16 @@ class HierarchicalModel(torch.nn.Module):
         assert sample_num == 1
         type_logits_expanded = repeat(type_logits, "b c -> (b t) c", t=sample_num)
         gt_type = repeat(data["grasp_type_id"], "b -> (b t)", t=sample_num)
+
+        # Exclude type 0 from loss calculation
+        if (gt_type == 0).any():
+            raise ValueError("Training data contains grasp_type_id = 0, which should not be used for training")
         result_dict["loss_type"] = F.cross_entropy(type_logits_expanded, gt_type)
 
         # Generate wrist poses conditioned on object feature and GT grasp type
         global_feature_expanded = repeat(global_feature, "b c -> (b t) c", t=sample_num)
-        cond_feat = torch.cat([global_feature_expanded, self.grasp_type_emb(data, global_feature)], dim=-1)
+        grasp_type_id = repeat(data["grasp_type_id"], "b -> (b t)", t=sample_num)
+        cond_feat = torch.cat([global_feature_expanded, self.grasp_type_emb(grasp_type_id)], dim=-1)
         diffusion_dict = self.output_head.forward(data, cond_feat)
         result_dict.update(diffusion_dict)
 
@@ -52,12 +57,26 @@ class HierarchicalModel(torch.nn.Module):
         # Encode object pointcloud
         global_feature, local_feature = self.backbone(data)
 
-        # Sample grasp type from predicted distribution
+        # Determine grasp type: use sampled type if input is 0, otherwise use input
+        input_type = data["grasp_type_id"]
         type_logits = self.type_classifier(global_feature)
         type_probs = F.softmax(type_logits, dim=-1)
-        sampled_type = torch.multinomial(type_probs, num_samples=1).squeeze(-1)
-        data["grasp_type_id"] = sampled_type
+        sampled_types = torch.multinomial(type_probs, num_samples=sample_num, replacement=True)
 
-        # Generate wrist poses conditioned on sampled grasp type
-        cond_feat = torch.cat([global_feature, self.grasp_type_emb(data, global_feature, True)], dim=-1)
-        return self.output_head.sample(cond_feat, sampled_type, sample_num)
+        # Use sampled type where input is 0, otherwise use input type
+        grasp_type_ids = torch.where(input_type.unsqueeze(1) == 0, sampled_types, input_type.unsqueeze(1))
+
+        # Flatten batch and sample dimensions
+        batch_size = global_feature.shape[0]
+        global_feature_expanded = repeat(global_feature, "b c -> (b s) c", s=sample_num)
+        grasp_type_ids_flat = rearrange(grasp_type_ids, "b s -> (b s)")
+
+        # Generate robot poses for all samples at once
+        cond_feat = torch.cat([global_feature_expanded, self.grasp_type_emb(grasp_type_ids_flat)], dim=-1)
+        robot_pose, log_prob = self.output_head.sample(cond_feat, grasp_type_ids_flat, 1)
+
+        # Reshape back to (batch, sample_num, ...)
+        robot_pose = rearrange(robot_pose, "(b s) t ... -> b (s t) ...", b=batch_size, s=sample_num)
+        log_prob = rearrange(log_prob, "(b s) t -> b (s t)", b=batch_size, s=sample_num)
+
+        return robot_pose, grasp_type_ids, log_prob

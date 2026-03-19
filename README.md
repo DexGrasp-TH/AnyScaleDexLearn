@@ -115,6 +115,8 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=human algo=h_dif
 
 # bimanual wrist pose, test on DGN_grasp_type, diffusion
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanbi algo=hbi_diffusion test_data=DGN_grasp_type ckpt=050000 exp_name=<XXX>
+
+CUDA_VISIBLE_DEVICES=0  python dexlearn/main.py task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<XXX>
 ```
 
 Visualize test results:

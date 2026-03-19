@@ -48,13 +48,13 @@
             "args": ["task=sample", "data=humanMulti", "algo=humanMultiHierar", "test_data=humanMulti", "exp_name=debug1"]
         },
         {
-            "name": "visualize_test: humanMulti / humanMultiDiffusion",
+            "name": "visualize_test: humanMulti / humanMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=visualize_test", "data=humanMulti", "algo=humanMultiDiffusion", "test_data=humanMulti", "exp_name=debug2"]
+            "args": ["task=visualize_test", "data=humanMulti", "algo=humanMultiHierar", "test_data=humanMulti", "exp_name=debug1"]
         },
         {
             "name": "stat: humanMulti / humanMultiHierar",
