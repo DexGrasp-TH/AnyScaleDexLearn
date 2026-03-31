@@ -7,3 +7,9 @@
 [submodule "third_party/diffusers"]
 	path = third_party/diffusers
 	url = https://github.com/huggingface/diffusers.git
+[submodule "third_party/manopth"]
+	path = third_party/manopth
+	url = git@github.com:DexGrasp-TH/manopth.git
+[submodule "third_party/utils_python"]
+	path = third_party/utils_python
+	url = git@github.com:Mingrui-Yu/utils_python.git

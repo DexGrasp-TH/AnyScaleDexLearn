@@ -1,0 +1,15 @@
+num_workers: 8
+dataset_type: RobotMultiDexDataset
+human: False
+
+num_points: 1024
+traj_length: 3
+joint_num: 44 # bimanual shadow hands
+
+pc_centering: True
+rotation_aug: True
+
+grasp_path: ${oc.env:AnyScaleGraspDataset}/BimanBODex/shadow
+object_path: ${oc.env:AnyScaleGraspDataset}/object/DGN_2k
+split_path: valid_split   # relative to object_path
+pc_path: vision_data/azure_kinect_dk    # relative to object_path

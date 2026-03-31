@@ -9,52 +9,76 @@ Learning-based grasp synthesis baselines (e.g., diffusion model and normalizing 
 - [x] Release grasp type classifier for Dexonomy
 
 ## Installation
-```bash
-git submodule update --init --recursive --progress
 
+### 1. Clone the repository with submodules
+```bash
+git clone --recursive <repository-url>
+cd AnyScaleDexLearn
+# Or if already cloned:
+git submodule update --init --recursive --progress
+```
+
+### 2. Create conda environment
+```bash
 conda create -n dexlearn python=3.10 
 conda activate dexlearn
+```
 
-# pytorch
-conda install pytorch==2.2.2 pytorch-cuda=12.1 -c pytorch -c nvidia 
+### 3. Install PyTorch
+```bash
+conda install pytorch==2.2.2 pytorch-cuda=12.1 -c pytorch -c nvidia
+```
 
-# pytorch3d (TO CHECK)
+### 4. Install PyTorch3D
+```bash
 wget https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch3d/linux-64/pytorch3d-0.7.8-py310_cu121_pyt222.tar.bz2
-conda install -y --use-local ./pytorch3d-0.7.8-py310_cu12_pyt210.tar.bz2
+conda install -y --use-local ./pytorch3d-0.7.8-py310_cu121_pyt222.tar.bz2
+```
 
-# Diffusers 
+### 5. Install third-party dependencies
+
+**Diffusers:**
+```bash
 cd third_party/diffusers
-pip install -e .
-cd ../..
-
-# manopth
-cd third_part/manopth
 pip install -e .
 cd ../..
 ```
 
-Finish the steps in [detailed steps](https://github.com/NVIDIA/MinkowskiEngine/issues/543#issuecomment-2566883469) and [NVTX_DISABLE](https://github.com/NVIDIA/MinkowskiEngine/issues/543#issuecomment-2886016764) before the installation of MinkowskiEngine.
+**manopth:**
 ```bash
-# MinkowskiEngine
+cd third_party/manopth
+pip install -e .
+cd ../..
+```
+
+**MinkowskiEngine:**
+
+Before installation, complete the steps in [detailed steps](https://github.com/NVIDIA/MinkowskiEngine/issues/543#issuecomment-2566883469) and [NVTX_DISABLE](https://github.com/NVIDIA/MinkowskiEngine/issues/543#issuecomment-2886016764).
+
+```bash
 cd third_party/MinkowskiEngine
 sudo apt install libopenblas-dev
-export CUDA_HOME=/usr/local/cuda-12.4
+export CUDA_HOME=/usr/local/cuda-12.4  # Adjust to your CUDA version
 python setup.py install --blas=openblas
 cd ../..
 ```
 
+**nflows:**
 ```bash
-# nflows
 cd third_party/nflows
 pip install -e .
 cd ../..
+```
 
-# dexlearn
+### 6. Install DexLearn
+```bash
 pip install -e .
-pip install numpy==1.23.5
+pip install numpy==1.26.4
 pip install hydra-core
 ```
-you may need to run the following command to avoid potential errors related to MKL such as `undefined symbol: iJIT_NotifyEvent`
+
+### 7. Fix potential MKL errors (if needed)
+If you encounter errors like `undefined symbol: iJIT_NotifyEvent`:
 ```bash
 conda install -c conda-forge mkl=2020.2 -y
 ```

@@ -13,6 +13,7 @@ from .base_dex import DexDataset
 from .human_dex import HumanDexDataset
 from .human_bidex import HumanBiDexDataset
 from .human_multidex import HumanMultiDexDataset
+from .robot_multidex import RobotMultiDexDataset
 
 
 def create_dataset(config, mode):
