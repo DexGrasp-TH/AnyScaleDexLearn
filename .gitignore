@@ -8,3 +8,4 @@ debug*
 output*
 *.tar.bz2
 assets/
+temp/

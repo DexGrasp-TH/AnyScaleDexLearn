@@ -160,6 +160,9 @@ class RobotMultiDexDataset(Dataset):
             ret_dict["left_hand_rot"] = np.tile(FIXED_LEFT_HAND_ROT, (1, 3, 1, 1))
             ret_dict["left_hand_joint"] = np.zeros((1, 3, joint_num), dtype=np.float32)
 
+        ret_dict["path"] = grasp_path
+        ret_dict["rand_pose_id"] = rand_pose_id
+
         return grasp_type, pc, grasp_data
 
     def _load_test_data(self, id, ret_dict):

@@ -5,9 +5,11 @@ human: False
 num_points: 1024
 traj_length: 3
 joint_num: 44 # bimanual shadow hands
+joint_names:
+wrist_link_names:
 
-pc_centering: True
-rotation_aug: True
+pc_centering: False
+rotation_aug: False
 
 grasp_path: ${oc.env:AnyScaleGraspDataset}/BimanBODex/shadow
 object_path: ${oc.env:AnyScaleGraspDataset}/object/DGN_2k

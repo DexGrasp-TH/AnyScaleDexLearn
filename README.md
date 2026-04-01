@@ -70,6 +70,13 @@ pip install -e .
 cd ../..
 ```
 
+**pytorch_kinematics:**
+```bash
+cd third_party/pytorch_kinematics
+pip install -e .
+cd ../..
+```
+
 ### 6. Install DexLearn
 ```bash
 pip install -e .
