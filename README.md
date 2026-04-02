@@ -1,13 +1,5 @@
 # DexLearn
 
-Learning-based grasp synthesis baselines (e.g., diffusion model and normalizing flow) for dexterous hands, used in [BODex (ICRA 2025)](https://pku-epic.github.io/BODex/) and [Dexonomy (RSS 2025)](https://pku-epic.github.io/Dexonomy/)
-
-
-## TODO list
-
-- [x] Support BODex and Dexonomy datasets
-- [x] Release grasp type classifier for Dexonomy
-
 ## Installation
 
 ### 1. Clone the repository with submodules
@@ -20,13 +12,14 @@ git submodule update --init --recursive --progress
 
 ### 2. Create conda environment
 ```bash
-conda create -n dexlearn python=3.10 
-conda activate dexlearn
+conda create -n anyscalelearn python=3.10 
+conda activate anyscalelearn
 ```
 
 ### 3. Install PyTorch
 ```bash
-conda install pytorch==2.2.2 pytorch-cuda=12.1 -c pytorch -c nvidia
+conda install pytorch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 pytorch-cuda=12.1 -c pytorch -c nvidia
+pip install mkl==2024.0.0 # Fix potential MKL errors (if needed)
 ```
 
 ### 4. Install PyTorch3D
@@ -37,18 +30,12 @@ conda install -y --use-local ./pytorch3d-0.7.8-py310_cu121_pyt222.tar.bz2
 
 ### 5. Install third-party dependencies
 
-**Diffusers:**
 ```bash
-cd third_party/diffusers
-pip install -e .
-cd ../..
-```
-
-**manopth:**
-```bash
-cd third_party/manopth
-pip install -e .
-cd ../..
+pip install -e ./third_party/diffusers
+pip install -e ./third_party/manopth
+pip install -e ./third_party/nflows
+pip install -e ./third_party/pytorch_kinematics
+pip install -e ./third_party/utils_python
 ```
 
 **MinkowskiEngine:**
@@ -63,46 +50,30 @@ python setup.py install --blas=openblas
 cd ../..
 ```
 
-**nflows:**
-```bash
-cd third_party/nflows
-pip install -e .
-cd ../..
-```
-
-**pytorch_kinematics:**
-```bash
-cd third_party/pytorch_kinematics
-pip install -e .
-cd ../..
-```
-
 ### 6. Install DexLearn
 ```bash
 pip install -e .
-pip install numpy==1.26.4
+
 pip install hydra-core
-```
-
-### 7. Fix potential MKL errors (if needed)
-If you encounter errors like `undefined symbol: iJIT_NotifyEvent`:
-```bash
-conda install -c conda-forge mkl=2020.2 -y
-```
-
-## Mingrui
-
-### Installation
-```bash
 pip install trimesh
 pip install 'pyglet<2'
-pip install chumpy
+pip install chumpy --no-build-isolation
 pip install opencv-python
-pip install 'numpy<1.24'
-
-cd third_party/manopth
-pip install -e .
+pip install numpy==1.26.4
 ```
+## Usage
+
+1. Export the dataset path:
+    ```bash
+    # on local
+    export AnyScaleGraspDataset=/data/dataset/AnyScaleGrasp
+    # on server
+    export AnyScaleGraspDataset=/data/mingrui/dataset/AnyScaleGrasp
+    ```
+1. Create the object symbolic link in `./assets`:
+    ```bash
+    ln -s ${AnyScaleGraspDataset}/object ./assets/object
+    ```
 
 ### Previous
 ```bash
@@ -115,14 +86,6 @@ CUDA_VISIBLE_DEVICES=x python -m dexlearn.sample -e bodex_tabletop_xxx_nflow_deb
 ```
 
 ### Human Grasp
-
-Export the dataset path:
-```bash
-# on local
-export AnyScaleGraspDataset=/data/dataset/AnyScaleGrasp
-# on server
-export AnyScaleGraspDataset=/data/mingrui/dataset/AnyScaleGrasp
-```
 
 Train:
 ```bash

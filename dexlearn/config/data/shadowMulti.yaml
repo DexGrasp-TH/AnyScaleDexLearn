@@ -1,4 +1,4 @@
-num_workers: 8
+num_workers: 10
 dataset_type: RobotMultiDexDataset
 human: False
 

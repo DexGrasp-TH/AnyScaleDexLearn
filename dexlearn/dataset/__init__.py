@@ -38,12 +38,15 @@ def create_dataset(config, mode):
 def create_train_dataloader(config: DictConfig, train_shuffle=True):
     train_dataset = create_dataset(config, mode="train")
     val_dataset = create_dataset(config, mode="eval")
+    batch_size = config.algo.batch_size
+    train_drop_last = len(train_dataset) >= batch_size
+    val_drop_last = len(val_dataset) >= batch_size
 
     train_loader = InfLoader(
         DataLoader(
             train_dataset,
-            batch_size=config.algo.batch_size,
-            drop_last=True,
+            batch_size=batch_size,
+            drop_last=train_drop_last,
             num_workers=config.num_workers,
             shuffle=train_shuffle,
             collate_fn=minkowski_collate_fn,
@@ -53,8 +56,8 @@ def create_train_dataloader(config: DictConfig, train_shuffle=True):
     val_loader = InfLoader(
         DataLoader(
             val_dataset,
-            batch_size=config.algo.batch_size,
-            drop_last=True,
+            batch_size=batch_size,
+            drop_last=val_drop_last,
             num_workers=config.num_workers,
             shuffle=False,
             collate_fn=minkowski_collate_fn,
@@ -86,14 +89,15 @@ class InfLoader:
         self.loader = loader
         self.iter_loader = iter(self.loader)
         self.device = device
+        self._end = object()
 
     def get(self):
-        try:
-            data = next(self.iter_loader)
-        except StopIteration:
-            # reset to the init when reaching the dataset end
+        data = next(self.iter_loader, self._end)
+        if data is self._end:
             self.iter_loader = iter(self.loader)
-            data = next(self.iter_loader)
+            data = next(self.iter_loader, self._end)
+            if data is self._end:
+                raise RuntimeError("DataLoader is empty. Check dataset size and batch_size/drop_last.")
 
         for k, v in data.items():
             if type(v).__module__ == "torch":

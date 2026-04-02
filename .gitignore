@@ -7,5 +7,7 @@ __pycache__/
 debug*
 output*
 *.tar.bz2
-assets/
+pytorch3d-*.tar.bz2
+assets/*
+!assets/.gitkeep
 temp/

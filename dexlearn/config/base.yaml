@@ -40,6 +40,9 @@ wandb:
   project: DexGraspLearn
   resume: ${resume}
 
+timing:
+  enabled: true
+  cuda_sync: true
 
 
 

@@ -92,7 +92,8 @@
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=train", "data=shadowMulti", "algo=robotMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
+            "args": ["task=train", "data=shadowMulti", "algo=robotMultiHierar", "algo.batch_size=16", "data.num_workers=0", 
+                     "exp_name=debug0"]
         },
     ]
 }

@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -14,10 +15,26 @@ from dexlearn.dataset import create_train_dataloader
 from dexlearn.network.models import *
 
 
+def _maybe_cuda_sync(device: str, enabled: bool):
+    if enabled and isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
 def task_train(config: DictConfig):
     set_seed(config.seed)
     logger = Logger(config)
     train_loader, val_loader = create_train_dataloader(config)
+    timing_cfg = config.timing
+    timing_enabled = timing_cfg.enabled
+    timing_sync_cuda = timing_enabled and timing_cfg.cuda_sync
+    timing_buffer = {
+        "data_time": 0.0,
+        "forward_time": 0.0,
+        "backward_time": 0.0,
+        "optim_time": 0.0,
+        "iter_time": 0.0,
+        "count": 0,
+    }
 
     model = eval(config.algo.model.name)(config.algo.model)
 
@@ -42,15 +59,35 @@ def task_train(config: DictConfig):
     model.train()
 
     for it in trange(cur_iter, config.algo.max_iter):
+        if timing_enabled:
+            _maybe_cuda_sync(config.device, timing_sync_cuda)
+            iter_start = time.perf_counter()
         optimizer.zero_grad()
+
+        if timing_enabled:
+            _maybe_cuda_sync(config.device, timing_sync_cuda)
+            data_start = time.perf_counter()
         data = train_loader.get()
+
+        if timing_enabled:
+            _maybe_cuda_sync(config.device, timing_sync_cuda)
+            timing_buffer["data_time"] += time.perf_counter() - data_start
+            forward_start = time.perf_counter()
         result_dict = model(data)
+
+        if timing_enabled:
+            _maybe_cuda_sync(config.device, timing_sync_cuda)
+            timing_buffer["forward_time"] += time.perf_counter() - forward_start
         loss = 0
         for k, v in result_dict.items():
             if k in config.algo.loss_weight:
                 loss += config.algo.loss_weight[k] * v
             elif "loss" in k:
                 print(f"{k} is not used in loss!")
+
+        if timing_enabled:
+            _maybe_cuda_sync(config.device, timing_sync_cuda)
+            backward_start = time.perf_counter()
         loss.backward()
         debug_flag = False
         for p in model.parameters():
@@ -68,14 +105,44 @@ def task_train(config: DictConfig):
         if debug_flag:
             print("grad is nan!")
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.algo.grad_clip)
+
+        if timing_enabled:
+            _maybe_cuda_sync(config.device, timing_sync_cuda)
+            timing_buffer["backward_time"] += time.perf_counter() - backward_start
         if it == 0:
+            if timing_enabled:
+                for key in timing_buffer:
+                    timing_buffer[key] = 0.0 if key != "count" else 0
             continue
+
+        if timing_enabled:
+            _maybe_cuda_sync(config.device, timing_sync_cuda)
+            optim_start = time.perf_counter()
         optimizer.step()
         scheduler.step()
 
+        if timing_enabled:
+            _maybe_cuda_sync(config.device, timing_sync_cuda)
+            timing_buffer["optim_time"] += time.perf_counter() - optim_start
+            timing_buffer["iter_time"] += time.perf_counter() - iter_start
+            timing_buffer["count"] += 1
+
         result_dict["lr"] = torch.tensor(scheduler.get_last_lr())
+        if timing_enabled and (it + 1) % config.algo.log_every == 0 and timing_buffer["count"] > 0:
+            result_dict.update(
+                {
+                    "time_data": torch.tensor(timing_buffer["data_time"] / timing_buffer["count"]),
+                    "time_forward": torch.tensor(timing_buffer["forward_time"] / timing_buffer["count"]),
+                    "time_backward": torch.tensor(timing_buffer["backward_time"] / timing_buffer["count"]),
+                    "time_optim": torch.tensor(timing_buffer["optim_time"] / timing_buffer["count"]),
+                    "time_iter": torch.tensor(timing_buffer["iter_time"] / timing_buffer["count"]),
+                }
+            )
         if (it + 1) % config.algo.log_every == 0:
             logger.log({k: v.mean().item() for k, v in result_dict.items()}, "train", it)
+            if timing_enabled:
+                for key in timing_buffer:
+                    timing_buffer[key] = 0.0 if key != "count" else 0
 
         if (it + 1) % config.algo.save_every == 0:
             logger.save(
