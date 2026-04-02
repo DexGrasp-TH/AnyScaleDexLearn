@@ -2,10 +2,11 @@ import os
 from os.path import join as pjoin
 from glob import glob
 import random
+import time
 import numpy as np
 from torch.utils.data import Dataset
 
-from dexlearn.utils.util import load_json, load_scene_cfg
+from dexlearn.utils.util import load_json
 from dexlearn.utils.rot import numpy_quaternion_to_matrix
 from .grasp_types import GRASP_TYPES
 
@@ -22,6 +23,7 @@ class RobotMultiDexDataset(Dataset):
         self.sc_voxel_size = sc_voxel_size
         self.mode = mode
         self.grasp_path_dict = {}
+        self.grasp_scene_id_dict = {}
         self.pc_path_dict = {}
         self.object_pc_folder = pjoin(config.object_path, config.pc_path)
 
@@ -44,11 +46,18 @@ class RobotMultiDexDataset(Dataset):
 
         print(f"Pre-indexing {mode} data paths...")
         self.obj_id_lst = []
+        scene_ids = set()
         for obj_id in obj_id_lst:
             found_paths = glob(pjoin(self.config.grasp_path, "*", obj_id, "**/**.npy"), recursive=True)
             if found_paths:
-                self.grasp_path_dict[obj_id] = sorted(found_paths)
+                sorted_paths = sorted(found_paths)
+                self.grasp_path_dict[obj_id] = sorted_paths
+                for grasp_path in sorted_paths:
+                    scene_id = self._scene_id_from_grasp_path(grasp_path, obj_id)
+                    self.grasp_scene_id_dict[grasp_path] = scene_id
+                    scene_ids.add(scene_id)
                 self.obj_id_lst.append(obj_id)
+        self._index_point_cloud_paths(scene_ids)
 
         self.data_num = sum(len(paths) for paths in self.grasp_path_dict.values())
         print(f"mode: {mode}, grasp data num: {self.data_num}")
@@ -76,6 +85,30 @@ class RobotMultiDexDataset(Dataset):
             f"Test split: {split_name}, grasp type list: {self.grasp_type_lst}, "
             f"object cfg num: {len(self.test_cfg_lst)}"
         )
+
+    def _scene_id_from_grasp_path(self, grasp_path, obj_id):
+        relative_path = os.path.relpath(grasp_path, self.config.grasp_path)
+        path_parts = relative_path.split(os.sep)
+        obj_idx = path_parts.index(obj_id)
+        return os.path.splitext(os.path.join(*path_parts[obj_idx:]))[0]
+
+    def _index_point_cloud_paths(self, scene_ids):
+        print("------------------------------------------------")
+        print(f"Pre-indexing point cloud paths from {self.object_pc_folder} for {len(scene_ids)} scenes...")
+        t_start = time.perf_counter()
+        pc_file_count = 0
+        for scene_id in sorted(scene_ids):
+            pc_paths = sorted(glob(pjoin(self.object_pc_folder, scene_id, "partial_pc**.npy")))
+            if pc_paths:
+                self.pc_path_dict[scene_id] = pc_paths
+                pc_file_count += len(pc_paths)
+        elapsed = time.perf_counter() - t_start
+        print(
+            f"Finished pre-indexing point cloud paths: "
+            f"{len(self.pc_path_dict)} scenes, {pc_file_count} point cloud files "
+            f"in {elapsed:.3f}s"
+        )
+        print("------------------------------------------------")
 
     def __len__(self):
         return self.data_num
@@ -132,13 +165,13 @@ class RobotMultiDexDataset(Dataset):
         else:
             raise NotImplementedError
 
-        scene_cfg = load_scene_cfg(grasp_data["scene_path"])
+        scene_id = self.grasp_scene_id_dict[grasp_path]
         raw_grasp_type = str(grasp_data["grasp_type"][0])
         grasp_type = next((gt for gt in GRASP_TYPES if gt.endswith(raw_grasp_type)), GRASP_TYPES[0])
 
         # read point cloud
-        pc_path_lst = glob(pjoin(self.object_pc_folder, scene_cfg["scene_id"], "partial_pc**.npy"))
-        pc_path = random.choice(sorted(pc_path_lst))
+        pc_path_lst = self.pc_path_dict[scene_id]
+        pc_path = random.choice(pc_path_lst)
         raw_pc = np.load(pc_path, allow_pickle=True)
         idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
         pc = raw_pc[idx]
