@@ -95,5 +95,14 @@
             "args": ["task=train", "data=shadowMulti", "algo=robotMultiHierar", "algo.batch_size=16", "num_workers=0", 
                      "exp_name=debug0"]
         },
+        {
+            "name": "sample: shadowMulti / robotMultiHierar",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=sample", "data=shadowMulti", "algo=robotMultiHierar", "test_data=shadowMulti", "exp_name=server_0"]
+        },
     ]
 }

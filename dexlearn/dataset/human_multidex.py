@@ -72,7 +72,7 @@ class HumanMultiDexDataset(Dataset):
                 test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
 
         self.test_cfg_lst = sorted(test_cfg_set)
-        self.data_num = self.grasp_type_num * len(self.test_cfg_lst)
+        self.data_num = self.grasp_type_num * len(self.test_cfg_lst) # TO BE CHECKED
         print(
             f"Test split: {split_name}, grasp type list: {self.grasp_type_lst}, "
             f"object cfg num: {len(self.test_cfg_lst)}"

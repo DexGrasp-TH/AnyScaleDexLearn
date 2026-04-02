@@ -8,7 +8,7 @@ seed: 0
 device: 'cuda:0'
 num_workers: 10
 persistent_workers: true
-prefetch_factor: 4
+prefetch_factor: 2
 
 ##########################
 # other config yamls
@@ -43,7 +43,7 @@ wandb:
   resume: ${resume}
 
 timing:
-  enabled: true
+  enabled: false
   cuda_sync: true
 
 

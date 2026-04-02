@@ -64,35 +64,44 @@ class RobotMultiDexDataset(Dataset):
         self.data_num = sum(len(paths) for paths in self.grasp_path_dict.values())
         print(f"mode: {mode}, grasp data num: {self.data_num}")
 
-    # def _init_test(self):
-    #     split_name = self.config.test_split
-    #     self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
+    def _init_test(self):
+        split_name = self.config.test_split
+        self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
 
-    #     if self.config.mini_test:
-    #         self.obj_id_lst = self.obj_id_lst[:100]
+        if self.config.mini_test:
+            self.obj_id_lst = self.obj_id_lst[:100]
 
-    #     scene_patterns = (
-    #         [self.config.test_scene_cfg] if isinstance(self.config.test_scene_cfg, str) else self.config.test_scene_cfg
-    #     )
+        scene_patterns = (
+            [self.config.test_scene_cfg] if isinstance(self.config.test_scene_cfg, str) else self.config.test_scene_cfg
+        )
 
-    #     test_cfg_set = set()
-    #     for obj_id in self.obj_id_lst:
-    #         base_dir = pjoin(self.config.object_path, "scene_cfg", obj_id)
-    #         for pattern in scene_patterns:
-    #             test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
+        test_cfg_set = set()
+        for obj_id in self.obj_id_lst:
+            base_dir = pjoin(self.config.object_path, "scene_cfg", obj_id)
+            for pattern in scene_patterns:
+                test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
 
-    #     self.test_cfg_lst = sorted(test_cfg_set)
-    #     self.data_num = self.grasp_type_num * len(self.test_cfg_lst)
-    #     print(
-    #         f"Test split: {split_name}, grasp type list: {self.grasp_type_lst}, "
-    #         f"object cfg num: {len(self.test_cfg_lst)}"
-    #     )
+        self.test_cfg_lst = sorted(test_cfg_set)
+        self.data_num = self.grasp_type_num * len(self.test_cfg_lst) # TO BE CHECKED
+        print(
+            f"Test split: {split_name}, grasp type list: {self.grasp_type_lst}, "
+            f"object cfg num: {len(self.test_cfg_lst)}"
+        )
 
     def _scene_id_from_grasp_path(self, grasp_path, obj_id):
         relative_path = os.path.relpath(grasp_path, self.config.grasp_path)
         path_parts = relative_path.split(os.sep)
         obj_idx = path_parts.index(obj_id)
         return os.path.splitext(os.path.join(*path_parts[obj_idx:]))[0]
+
+    def _scene_id_from_scene_cfg(self, scene_cfg, scene_path):
+        scene_id = scene_cfg.get("scene_id")
+        if scene_id is None and "scene" in scene_cfg:
+            scene = scene_cfg["scene"]
+            scene_id = scene.get("id", scene.get("scene_id"))
+        if scene_id is None:
+            raise KeyError(f"Could not find scene id in scene config: {scene_path}")
+        return scene_id
 
     def _index_point_cloud_paths(self, scene_ids):
         print("------------------------------------------------")
@@ -214,31 +223,32 @@ class RobotMultiDexDataset(Dataset):
 
         return grasp_type, pc, grasp_data
 
-    # def _load_test_data(self, id, ret_dict):
-    #     """Load test data."""
-    #     grasp_type = self.grasp_type_lst[id // len(self.test_cfg_lst)]
-    #     scene_path = self.test_cfg_lst[id % len(self.test_cfg_lst)]
+    def _load_test_data(self, id, ret_dict):
+        """Load test data."""
+        grasp_type = self.grasp_type_lst[id // len(self.test_cfg_lst)]
+        scene_path = self.test_cfg_lst[id % len(self.test_cfg_lst)]
+        scene_cfg = np.load(scene_path, allow_pickle=True).item()
+        scene_id = self._scene_id_from_scene_cfg(scene_cfg, scene_path)
 
-    #     scene_cfg = np.load(scene_path, allow_pickle=True).item()
-    #     obj_name = scene_cfg["object"]["name"]
-    #     obj_scale = scene_cfg["object"]["rel_scale"]
-    #     obj_pose = scene_cfg["object"]["pose"]
+        if scene_id not in self.pc_path_dict:
+            self.pc_path_dict[scene_id] = sorted(glob(pjoin(self.object_pc_folder, scene_id, "partial_pc**.npy")))
+            if self.preload_point_clouds:
+                for pc_path in self.pc_path_dict[scene_id]:
+                    self.pc_data_dict[pc_path] = np.load(pc_path, allow_pickle=True)
+        pc_path = random.choice(self.pc_path_dict[scene_id])
 
-    #     if obj_name not in self.pc_path_dict:
-    #         self.pc_path_dict[obj_name] = sorted(glob(pjoin(self.object_pc_folder, obj_name, "**.npy")))
-    #     pc_path = random.choice(self.pc_path_dict[obj_name])
+        if self.preload_point_clouds:
+            raw_pc = self.pc_data_dict[pc_path]
+        else:
+            raw_pc = np.load(pc_path, allow_pickle=True)
+        idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
+        pc = np.asarray(raw_pc[idx], dtype=np.float32)
 
-    #     raw_pc = np.load(pc_path, allow_pickle=True)
-    #     idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
-    #     scaled_pc = raw_pc[idx] * obj_scale
-    #     R, t = obj_pose[:3, :3], obj_pose[:3, 3]
-    #     pc = np.matmul(scaled_pc, R.T) + t
+        ret_dict["save_path"] = pjoin(self.config.name, grasp_type, scene_id, os.path.basename(pc_path))
+        ret_dict["scene_path"] = scene_path
+        ret_dict["pc_path"] = pc_path
 
-    #     ret_dict["save_path"] = pjoin(self.config.name, grasp_type, scene_cfg["scene_id"], os.path.basename(pc_path))
-    #     ret_dict["scene_path"] = scene_path
-    #     ret_dict["pc_path"] = pc_path
-
-    #     return grasp_type, pc
+        return grasp_type, pc
 
     def _apply_pc_centering(self, pc, ret_dict, grasp_data):
         """Center point cloud and adjust hand poses accordingly."""
