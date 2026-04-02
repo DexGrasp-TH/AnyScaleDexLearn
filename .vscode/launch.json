@@ -82,7 +82,7 @@
             "program": "${workspaceFolder}/dexlearn/scripts/check_robot_dataloader.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=train", "data=shadowMulti", "algo=humanMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
+            "args": ["task=train", "data=shadowMulti", "algo=robotMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
         },
 
         {

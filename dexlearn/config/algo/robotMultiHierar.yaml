@@ -7,7 +7,7 @@ lr_min: 0.0001
 log_every: 10
 val_every: 1000
 val_num: 10
-save_every: 50 # 5000
+save_every: 5000
 grad_clip: 10.0
 
 test_grasp_num: 100

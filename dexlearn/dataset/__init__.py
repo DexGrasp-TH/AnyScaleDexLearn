@@ -41,6 +41,8 @@ def create_train_dataloader(config: DictConfig, train_shuffle=True):
     batch_size = config.algo.batch_size
     train_drop_last = len(train_dataset) >= batch_size
     val_drop_last = len(val_dataset) >= batch_size
+    persistent_workers = bool(getattr(config, "persistent_workers", False)) and config.num_workers > 0
+    prefetch_factor = getattr(config, "prefetch_factor", 2)
 
     train_loader = InfLoader(
         DataLoader(
@@ -48,6 +50,8 @@ def create_train_dataloader(config: DictConfig, train_shuffle=True):
             batch_size=batch_size,
             drop_last=train_drop_last,
             num_workers=config.num_workers,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor if config.num_workers > 0 else None,
             shuffle=train_shuffle,
             collate_fn=minkowski_collate_fn,
         ),
@@ -59,6 +63,8 @@ def create_train_dataloader(config: DictConfig, train_shuffle=True):
             batch_size=batch_size,
             drop_last=val_drop_last,
             num_workers=config.num_workers,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor if config.num_workers > 0 else None,
             shuffle=False,
             collate_fn=minkowski_collate_fn,
         ),
@@ -69,12 +75,16 @@ def create_train_dataloader(config: DictConfig, train_shuffle=True):
 
 def create_test_dataloader(config: DictConfig, mode="test"):
     test_dataset = create_dataset(config, mode=mode)
+    persistent_workers = bool(getattr(config, "persistent_workers", False)) and config.num_workers > 0
+    prefetch_factor = getattr(config, "prefetch_factor", 2)
     test_loader = FiniteLoader(
         DataLoader(
             test_dataset,
             batch_size=config.algo.batch_size,
             drop_last=False,
             num_workers=config.num_workers,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor if config.num_workers > 0 else None,
             shuffle=False,
             collate_fn=minkowski_collate_fn,
         ),

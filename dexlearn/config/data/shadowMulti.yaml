@@ -6,6 +6,8 @@ num_points: 1024
 traj_length: 3
 joint_num: 44 # bimanual shadow hands
 
+preload_point_clouds: True
+
 pc_centering: True
 rotation_aug: True
 
