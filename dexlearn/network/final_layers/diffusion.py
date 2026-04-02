@@ -29,7 +29,7 @@ class DiffusionBiRT_MLPRTJ(torch.nn.Module):
         self.RMS = Normalization(self.wrist_dim)
 
         hand_out_dim = (self.hand_joint_num + 12) * cfg.traj_length - 12
-        self.right_joint_mlp = BasicMLP(cfg.in_feat_dim + 12, hand_out_dim)  # TODO: run in parallel?
+        self.right_joint_mlp = BasicMLP(cfg.in_feat_dim + 12, hand_out_dim)
         self.left_joint_mlp = BasicMLP(cfg.in_feat_dim + 12, hand_out_dim)
         self.joint_loss = torch.nn.SmoothL1Loss(reduction="none")
 

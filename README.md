@@ -163,3 +163,9 @@ python dexlearn/main.py task=visualize_test data=human algo=h_diffusion test_dat
 # bimanual wrist pose, test on DGN_grasp_type, diffusion
 python dexlearn/main.py task=visualize_test data=humanbi algo=hbi_diffusion test_data=DGN_grasp_type ckpt=050000 exp_name=<XXX>
 ```
+
+### Robot Grasp
+Train:
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=robotMultiHierar data=shadowMulti exp_name=<XXX>
+```
