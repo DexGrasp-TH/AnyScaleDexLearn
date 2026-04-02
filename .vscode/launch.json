@@ -86,13 +86,13 @@
         },
 
         {
-            "name": "train: bodex_tabletop_leap_tac3d",
+            "name": "train: shadowMulti / robotMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=train", "data=bodex_tabletop_leap_tac3d", "algo=nflow", "algo.batch_size=16", "exp_name=debug0"]
+            "args": ["task=train", "data=shadowMulti", "algo=robotMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
         },
     ]
 }

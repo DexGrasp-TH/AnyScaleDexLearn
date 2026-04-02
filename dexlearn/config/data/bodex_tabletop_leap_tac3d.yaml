@@ -1,4 +1,5 @@
 num_workers: 16
+dataset_type: DexDataset
 
 num_points: 1024
 traj_length: 3
