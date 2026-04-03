@@ -2,11 +2,11 @@ output_folder: output
 data_folder: assets
 exp_name: debug
 ckpt:       # ckpt path to load, only need the number
-resume: true
+resume: True
 
 seed: 0
 device: 'cuda:0'
-num_workers: 10
+num_workers: 8
 persistent_workers: true
 prefetch_factor: 2
 

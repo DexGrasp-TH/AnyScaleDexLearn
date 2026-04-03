@@ -1,0 +1,8 @@
+num_samples_per_group: 20
+include_groups:
+camera_distance: 1.0
+show_ik_status: true
+
+robot_urdf_path: ../BimanBODex/src/curobo/content/assets/robot/shadow_hand/dual_dummy_arm_shadow.urdf
+robot_mesh_dir_path: ../BimanBODex/src/curobo/content/assets/robot/shadow_hand
+metadata_group: both_full

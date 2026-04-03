@@ -40,7 +40,10 @@ def task_sample(config: DictConfig):
         for data in tqdm(test_loader, desc="Sampling grasps (inference)"):
             result = model.sample(data, config.algo.test_grasp_num)
 
-            if len(result) == 3:
+            pred_grasp_type_prob = None
+            if len(result) == 4:
+                robot_pose, pred_grasp_type, pred_grasp_type_prob, log_prob = result
+            elif len(result) == 3:
                 robot_pose, pred_grasp_type, log_prob = result
             else:
                 robot_pose, log_prob = result
@@ -53,6 +56,8 @@ def task_sample(config: DictConfig):
             log_prob = log_prob[batch_indices, topk_indices]
             if pred_grasp_type is not None:
                 pred_grasp_type = pred_grasp_type[batch_indices, topk_indices]
+            if pred_grasp_type_prob is not None:
+                pred_grasp_type_prob = pred_grasp_type_prob[batch_indices, topk_indices]
 
             if config.algo.human:
                 save_dict = {
@@ -61,10 +66,6 @@ def task_sample(config: DictConfig):
                     "scene_path": data["scene_path"],
                     "pc_path": data["pc_path"],
                 }
-                if "grasp_type_id" in data:
-                    save_dict["grasp_type_id"] = data["grasp_type_id"]
-                if pred_grasp_type is not None:
-                    save_dict["pred_grasp_type_id"] = pred_grasp_type
             else:
                 save_dict = {
                     "pregrasp_qpos": robot_pose[..., 0, :],
@@ -73,6 +74,13 @@ def task_sample(config: DictConfig):
                     "grasp_error": -log_prob,
                     "scene_path": data["scene_path"],
                 }
+
+            if "grasp_type_id" in data:
+                save_dict["grasp_type_id"] = data["grasp_type_id"]
+            if pred_grasp_type is not None:
+                save_dict["pred_grasp_type_id"] = pred_grasp_type
+            if pred_grasp_type_prob is not None:
+                save_dict["pred_grasp_type_prob"] = pred_grasp_type_prob
 
             logger.save_samples(save_dict, ckpt_iter, data["save_path"])
 

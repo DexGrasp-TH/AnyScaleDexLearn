@@ -132,3 +132,8 @@ Train:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=robotMultiHierar data=shadowMulti num_workers=24 prefetch_factor=2 exp_name=<XXX>
 ```
+
+Sample:
+```bash 
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample algo=robotMultiHierar data=shadowMulti test_data=shadowMulti exp_name=<XXX>
+```

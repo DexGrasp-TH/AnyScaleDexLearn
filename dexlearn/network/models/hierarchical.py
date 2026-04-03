@@ -78,5 +78,6 @@ class HierarchicalModel(torch.nn.Module):
         # Reshape back to (batch, sample_num, ...)
         robot_pose = rearrange(robot_pose, "(b s) t ... -> b (s t) ...", b=batch_size, s=sample_num)
         log_prob = rearrange(log_prob, "(b s) t -> b (s t)", b=batch_size, s=sample_num)
+        type_probs = repeat(type_probs, "b c -> b s c", s=sample_num)
 
-        return robot_pose, grasp_type_ids, log_prob
+        return robot_pose, grasp_type_ids, type_probs, log_prob
