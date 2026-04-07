@@ -1,4 +1,4 @@
-num_workers: 10
+name: ${test_data_name}
 dataset_type: RobotMultiDexDataset
 human: False
 
@@ -7,13 +7,17 @@ traj_length: 3
 joint_num: 32 # bimanual shadow hands
 
 preload_point_clouds: True
+grasp_type_lst: ["0_any"]
 pc_centering: True
-rotation_aug: True
 
-grasp_path: ${oc.env:AnyScaleGraspDataset}/BimanBODex_1k/leap
+grasp_path: ${oc.env:AnyScaleGraspDataset}/BimanBODex_1k/shadow
 object_path: ${oc.env:AnyScaleGraspDataset}/object/DGN_2k
 split_path: valid_split   # relative to object_path
 pc_path: vision_data/azure_kinect_dk    # relative to object_path
+
+test_split: test
+test_scene_cfg: tabletop_ur10e/**.npy
+mini_test: False
 
 # only for visualization
 robot_urdf_path: ../BimanBODex/src/curobo/content/assets/robot/leap_hand/dual_dummy_arm_leap.urdf
