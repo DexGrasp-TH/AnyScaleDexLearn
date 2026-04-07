@@ -69,7 +69,7 @@ class RobotMultiDexDataset(Dataset):
         self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
 
         if self.config.mini_test:
-            self.obj_id_lst = self.obj_id_lst[:100]
+            self.obj_id_lst = self.obj_id_lst[:10]
 
         scene_patterns = (
             [self.config.test_scene_cfg] if isinstance(self.config.test_scene_cfg, str) else self.config.test_scene_cfg
@@ -82,7 +82,7 @@ class RobotMultiDexDataset(Dataset):
                 test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
 
         self.test_cfg_lst = sorted(test_cfg_set)
-        self.data_num = self.grasp_type_num * len(self.test_cfg_lst) # TO BE CHECKED
+        self.data_num = self.grasp_type_num * len(self.test_cfg_lst)  # TO BE CHECKED
         print(
             f"Test split: {split_name}, grasp type list: {self.grasp_type_lst}, "
             f"object cfg num: {len(self.test_cfg_lst)}"
@@ -126,10 +126,7 @@ class RobotMultiDexDataset(Dataset):
                 for pc_path in pc_paths:
                     self.pc_data_dict[pc_path] = np.load(pc_path, allow_pickle=True)
             preload_elapsed = time.perf_counter() - preload_start
-            print(
-                f"Finished pre-loading {len(self.pc_data_dict)} point cloud files "
-                f"in {preload_elapsed:.3f}s"
-            )
+            print(f"Finished pre-loading {len(self.pc_data_dict)} point cloud files in {preload_elapsed:.3f}s")
         print("------------------------------------------------")
 
     def __len__(self):
@@ -213,10 +210,12 @@ class RobotMultiDexDataset(Dataset):
             ret_dict["left_hand_trans"] = robot_global_pose[:, :, 7:10]
             ret_dict["left_hand_rot"] = numpy_quaternion_to_matrix(robot_global_pose[:, :, 10:14])
             ret_dict["left_hand_joint"] = robot_joint_pos[:, :, joint_num:]
+            ret_dict["left_hand_fixed"] = False
         else:
             ret_dict["left_hand_trans"] = np.tile(FIXED_LEFT_HAND_TRANS, (1, 3, 1))
             ret_dict["left_hand_rot"] = np.tile(FIXED_LEFT_HAND_ROT, (1, 3, 1, 1))
             ret_dict["left_hand_joint"] = np.zeros((1, 3, joint_num), dtype=np.float32)
+            ret_dict["left_hand_fixed"] = True
 
         ret_dict["path"] = grasp_path
         ret_dict["rand_pose_id"] = rand_pose_id
@@ -258,7 +257,7 @@ class RobotMultiDexDataset(Dataset):
         if self.mode != "test":
             if "right_hand_trans" in ret_dict:
                 ret_dict["right_hand_trans"] -= pc_centroid[None, :, :]
-            if "left_hand_trans" in ret_dict:
+            if "left_hand_trans" in ret_dict and not ret_dict.get("left_hand_fixed", False):
                 ret_dict["left_hand_trans"] -= pc_centroid[None, :, :]
 
         return pc
@@ -273,10 +272,8 @@ class RobotMultiDexDataset(Dataset):
 
         for side in ["right", "left"]:
             if f"{side}_hand_trans" in ret_dict:
-                # Skip rotating fixed left hand pose
-                if side == "left" and np.allclose(
-                    ret_dict[f"{side}_hand_trans"], FIXED_LEFT_HAND_TRANS.reshape(1, 1, 3)
-                ):
+                # Skip rotating the synthetic fixed left hand pose used by single-hand grasps.
+                if side == "left" and ret_dict.get("left_hand_fixed", False):
                     continue
                 ret_dict[f"{side}_hand_trans"] = ret_dict[f"{side}_hand_trans"] @ rot_z.T
                 ret_dict[f"{side}_hand_rot"] = rot_z @ ret_dict[f"{side}_hand_rot"]

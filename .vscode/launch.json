@@ -76,23 +76,23 @@
         },
        
         {
-            "name": "check_dataloader: shadowMulti",
+            "name": "check_dataloader: robotMulti",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/scripts/check_robot_dataloader.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=train", "data=shadowMulti", "algo=robotMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
+            "args": ["task=train", "data=leapMulti", "algo=robotMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
         },
 
         {
-            "name": "train: shadowMulti / robotMultiHierar",
+            "name": "train: robotMulti / robotMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=train", "data=shadowMulti", "algo=robotMultiHierar", "algo.batch_size=16", "num_workers=0", 
+            "args": ["task=train", "data=leapMulti", "algo=robotMultiHierar", "algo.batch_size=16", "num_workers=0", 
                      "exp_name=debug0"]
         },
         {

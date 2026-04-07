@@ -44,9 +44,9 @@ def main(config: DictConfig) -> None:
         config.device,
     )
 
-    # Load URDF
-    urdf_path = "../BimanBODex/src/curobo/content/assets/robot/shadow_hand/dual_dummy_arm_shadow.urdf"
-    mesh_dir_path = "../BimanBODex/src/curobo/content/assets/robot/shadow_hand"
+    # Load robot assets from the data config.
+    urdf_path = config.data.robot_urdf_path
+    mesh_dir_path = config.data.robot_mesh_dir_path
 
     # Create robot model
     chain = pk.build_chain_from_urdf(open(urdf_path).read()).to(device=config.device)
@@ -57,7 +57,7 @@ def main(config: DictConfig) -> None:
     )
     robot_visualizer = Visualizer(urdf_path, mesh_dir_path, device=config.device)
 
-    metadata = os.path.join(config.data.grasp_path, "both_full/metadata.json")
+    metadata = os.path.join(config.data.grasp_path, f"{config.data.metadata_group}/metadata.json")
     if not os.path.exists(metadata):
         raise FileNotFoundError(f"Joint metadata file not found: {metadata}")
     with open(metadata, "r") as f:
