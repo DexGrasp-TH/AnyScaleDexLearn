@@ -69,6 +69,33 @@ def get_balanced_samples(root_dir: str, include_groups, num_samples_per_group: i
     return sample_files
 
 
+def reorder_samples_by_pred_grasp_type(sample_files, target_grasp_type_ids):
+    grouped_files = {grasp_type_id: [] for grasp_type_id in target_grasp_type_ids}
+    remaining_files = []
+
+    for sample_file in sample_files:
+        data = np.load(sample_file, allow_pickle=True).item()
+        grasp_type_id = data.get("pred_grasp_type_id")
+        if grasp_type_id is None:
+            remaining_files.append(sample_file)
+            continue
+        grasp_type_id = int(grasp_type_id)
+        if grasp_type_id in grouped_files:
+            grouped_files[grasp_type_id].append(sample_file)
+        else:
+            remaining_files.append(sample_file)
+
+    ordered_files = []
+    while all(grouped_files[grasp_type_id] for grasp_type_id in target_grasp_type_ids):
+        for grasp_type_id in target_grasp_type_ids:
+            ordered_files.append(grouped_files[grasp_type_id].pop(0))
+
+    for grasp_type_id in target_grasp_type_ids:
+        ordered_files.extend(grouped_files[grasp_type_id])
+    ordered_files.extend(remaining_files)
+    return ordered_files
+
+
 def build_robot_components(config: DictConfig):
     urdf_path = config.test_data.robot_urdf_path
     mesh_dir_path = config.test_data.robot_mesh_dir_path
@@ -180,6 +207,9 @@ def task_visualize_robot(config: DictConfig) -> None:
     sample_files = get_balanced_samples(output_dir, include_groups, config.task.num_samples_per_group)
     if len(sample_files) == 0:
         raise RuntimeError(f"No saved grasp files found in {output_dir}")
+    # Reorder saved grasps so visualization cycles through a fixed grasp-type sequence
+    # such as 1, 2, 3, 4, 5 whenever those grasp types are available.
+    sample_files = reorder_samples_by_pred_grasp_type(sample_files, [1, 2, 3, 4, 5])
 
     robot_assets = build_robot_components(config)
     stage_names = ["grasp_qpos"]
@@ -205,7 +235,7 @@ def task_visualize_robot(config: DictConfig) -> None:
             robot_pose, right_ok, left_ok = solve_stage_pose(data[stage_name], robot_assets, config.device)
             robot_assets["robot_visualizer"].set_robot_parameters(robot_pose, joint_names=robot_assets["joint_names"])
             scene_elements.append(robot_assets["robot_visualizer"].get_robot_trimesh_data(i=0, color=color))
-            ik_status.append(f"{stage_name}: R={int(right_ok)} L={int(left_ok)}")
+            ik_status.append(f"{stage_name} IK: R={int(right_ok)} L={int(left_ok)}")
 
         caption = f"{os.path.basename(sample_file)} | err={float(data['grasp_error']):.4f}"
         if "grasp_type_id" in data:

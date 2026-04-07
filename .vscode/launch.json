@@ -96,7 +96,7 @@
                      "exp_name=debug0"]
         },
         {
-            "name": "sample: shadowMulti / robotMultiHierar",
+            "name": "sample: robotMulti / robotMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
@@ -105,14 +105,14 @@
             "args": ["task=sample", "data=shadowMulti", "algo=robotMultiHierar", "test_data=shadowMulti", "exp_name=server_0"]
         },
         {
-            "name": "visualize_robot: shadowMulti / robotMultiHierar",
+            "name": "visualize_robot: robotMulti / robotMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=visualize_robot", "data=shadowMulti", "algo=robotMultiHierar", "test_data=shadowMulti", 
-                     "test_data.mini_test=True", "exp_name=server_0"]
+            "args": ["task=visualize_robot", "data=leapMulti", "algo=robotMultiHierar", "test_data=leapMulti", 
+                     "exp_name=server_0"]
         },
     ]
 }

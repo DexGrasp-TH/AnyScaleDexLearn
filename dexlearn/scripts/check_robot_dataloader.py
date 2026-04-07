@@ -29,6 +29,9 @@ def main(config: DictConfig) -> None:
     set_seed(config.seed)
     logger = Logger(config)
 
+    target_grasp_type_ids = [1, 2, 3, 4, 5]
+    pending_samples = {}
+
     train_dataset = create_dataset(config, mode="train")
 
     config.algo.batch_size = 4
@@ -87,9 +90,47 @@ def main(config: DictConfig) -> None:
         robot_helper.create_serial_chain(wrist_link_name)
         robot_helper.create_ik_solver(wrist_link_name, **ik_solver_kwargs)
 
+    def _store_sample(batch_data, sample_idx):
+        sample = {}
+        for key, value in batch_data.items():
+            if torch.is_tensor(value):
+                sample[key] = value[sample_idx : sample_idx + 1].clone()
+            elif isinstance(value, list):
+                sample[key] = [value[sample_idx]]
+            else:
+                sample[key] = value
+        return sample
+
+    def _merge_samples(samples):
+        merged = {}
+        for key in samples[0]:
+            first_value = samples[0][key]
+            if torch.is_tensor(first_value):
+                merged[key] = torch.cat([sample[key] for sample in samples], dim=0)
+            elif isinstance(first_value, list):
+                merged[key] = [sample[key][0] for sample in samples]
+            else:
+                merged[key] = [sample[key] for sample in samples]
+        return merged
+
     for it in trange(0, config.algo.max_iter):
         data = train_loader.get()
         batch_size = data["grasp_type_id"].shape[0]
+
+        # Buffer one sample for each target grasp type so visualization follows a fixed
+        # repeating order such as 1, 2, 3, 4, 5 instead of the dataset's random sampling order.
+        for i in range(batch_size):
+            grasp_type_id = int(data["grasp_type_id"][i])
+            if grasp_type_id in target_grasp_type_ids and grasp_type_id not in pending_samples:
+                pending_samples[grasp_type_id] = _store_sample(data, i)
+
+        if any(grasp_type_id not in pending_samples for grasp_type_id in target_grasp_type_ids):
+            continue
+
+        ordered_samples = [pending_samples[grasp_type_id] for grasp_type_id in target_grasp_type_ids]
+        data = _merge_samples(ordered_samples)
+        pending_samples = {}
+        batch_size = len(target_grasp_type_ids)
 
         # Extract hand poses for the whole batch.
         right_trans = data["right_hand_trans"][:, 0, 1, ...]  # 1 refers to 'grasp_pose'
