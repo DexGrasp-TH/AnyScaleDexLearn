@@ -232,6 +232,7 @@ class HumanMultiDexDataset(Dataset):
         """Center point cloud and adjust hand poses accordingly."""
         pc_centroid = np.mean(pc, axis=-2, keepdims=True)
         pc = pc - pc_centroid
+        ret_dict["pc_centroid"] = pc_centroid.astype(np.float32)
 
         if self.mode != "test":
             if mirrored:

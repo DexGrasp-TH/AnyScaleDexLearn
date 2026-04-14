@@ -150,6 +150,7 @@ class DexDataset(Dataset):
         if self.config.pc_centering:
             pc_centroid = np.mean(pc, axis=-2, keepdims=True)
             pc = pc - pc_centroid  # normalization
+            ret_dict["pc_centroid"] = pc_centroid.astype(np.float32)
             if self.mode != "test":
                 ret_dict["hand_trans"] = ret_dict["hand_trans"] - pc_centroid[None, :, :]
 

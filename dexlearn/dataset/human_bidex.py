@@ -204,6 +204,7 @@ class HumanBiDexDataset(Dataset):
         if self.config.pc_centering:
             pc_centroid = np.mean(pc, axis=-2, keepdims=True)
             pc = pc - pc_centroid  # normalization
+            ret_dict["pc_centroid"] = pc_centroid.astype(np.float32)
             if self.mode != "test":
                 for side, is_active in grasp_data["hand"].items():
                     if is_active:
