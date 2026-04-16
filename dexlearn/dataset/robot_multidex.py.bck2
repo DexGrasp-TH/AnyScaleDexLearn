@@ -26,13 +26,8 @@ class RobotMultiDexDataset(Dataset):
         self.grasp_scene_id_dict = {}
         self.pc_path_dict = {}
         self.pc_data_dict = {}
-        self.scene_cfg_dict = {}
         self.object_pc_folder = pjoin(config.object_path, config.pc_path)
-        self.complete_pc_folder = pjoin(config.object_path, "processed_data")
         self.preload_point_clouds = getattr(config, "preload_point_clouds", False)
-        self.pc_source = str(getattr(config, "pc_source", "partial")).lower()
-        if self.pc_source not in {"partial", "complete"}:
-            raise ValueError(f"Unsupported pc_source={self.pc_source}. Expected one of ['partial', 'complete'].")
 
         if mode == "test":
             self.grasp_type_lst = (
@@ -110,15 +105,11 @@ class RobotMultiDexDataset(Dataset):
 
     def _index_point_cloud_paths(self, scene_ids):
         print("------------------------------------------------")
-        source_folder = self.object_pc_folder if self.pc_source == "partial" else self.complete_pc_folder
-        print(
-            f"Pre-indexing {self.pc_source} point cloud paths from {source_folder} "
-            f"for {len(scene_ids)} scenes..."
-        )
+        print(f"Pre-indexing point cloud paths from {self.object_pc_folder} for {len(scene_ids)} scenes...")
         t_start = time.perf_counter()
         pc_file_count = 0
         for scene_id in sorted(scene_ids):
-            pc_paths = self._list_scene_pc_paths(scene_id)
+            pc_paths = sorted(glob(pjoin(self.object_pc_folder, scene_id, "partial_pc**.npy")))
             if pc_paths:
                 self.pc_path_dict[scene_id] = pc_paths
                 pc_file_count += len(pc_paths)
@@ -131,101 +122,12 @@ class RobotMultiDexDataset(Dataset):
         if self.preload_point_clouds:
             preload_start = time.perf_counter()
             print("Pre-loading point clouds into memory...")
-            for pc_path in sorted({path for pc_paths in self.pc_path_dict.values() for path in pc_paths}):
-                self.pc_data_dict[pc_path] = np.load(pc_path, allow_pickle=True)
+            for pc_paths in self.pc_path_dict.values():
+                for pc_path in pc_paths:
+                    self.pc_data_dict[pc_path] = np.load(pc_path, allow_pickle=True)
             preload_elapsed = time.perf_counter() - preload_start
             print(f"Finished pre-loading {len(self.pc_data_dict)} point cloud files in {preload_elapsed:.3f}s")
         print("------------------------------------------------")
-
-    def _list_scene_pc_paths(self, scene_id):
-        """List candidate point-cloud files for a scene id under the configured source type."""
-        if self.pc_source == "partial":
-            return sorted(glob(pjoin(self.object_pc_folder, scene_id, "partial_pc**.npy")))
-
-        obj_name = scene_id.split("/")[0]
-        complete_pc_path = pjoin(self.complete_pc_folder, obj_name, "complete_point_cloud.npy")
-        return [complete_pc_path] if os.path.exists(complete_pc_path) else []
-
-    def _sample_point_cloud(self, raw_pc):
-        idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
-        return np.asarray(raw_pc[idx], dtype=np.float32)
-
-    def _normalize_object_scale(self, obj_scale, scene_path):
-        scale = np.asarray(obj_scale, dtype=np.float32).reshape(-1)
-        if scale.size == 1:
-            return np.repeat(scale, 3)
-        if scale.size == 3:
-            return scale
-        raise ValueError(f"Unsupported object scale shape {scale.shape} in scene config: {scene_path}")
-
-    def _object_pose_to_rt(self, obj_pose, scene_path):
-        pose = np.asarray(obj_pose, dtype=np.float32)
-        if pose.shape == (4, 4):
-            return pose[:3, :3], pose[:3, 3]
-
-        pose = pose.reshape(-1)
-        if pose.size == 7:
-            # DGN stores pose as [x, y, z, qw, qx, qy, qz].
-            rot = numpy_quaternion_to_matrix(pose[3:7].reshape(1, 4))[0].astype(np.float32)
-            return rot, pose[:3]
-
-        raise ValueError(f"Unsupported object pose shape {pose.shape} in scene config: {scene_path}")
-
-    def _extract_object_meta(self, scene_cfg, scene_path):
-        """Extract object name, scale and pose transform from different scene_cfg layouts."""
-        if "object" in scene_cfg:
-            obj_data = scene_cfg["object"]
-            obj_name = obj_data.get("name")
-            obj_scale = obj_data.get("rel_scale", obj_data.get("scale"))
-            obj_pose = obj_data.get("pose")
-        else:
-            scene = scene_cfg.get("scene")
-            if scene is None:
-                raise KeyError(f"Could not find 'scene' in scene config: {scene_path}")
-
-            obj_name = scene_cfg.get("task", {}).get("obj_name")
-            if obj_name is None:
-                candidates = [
-                    name
-                    for name, entry in scene.items()
-                    if isinstance(entry, dict) and "scale" in entry and "pose" in entry and name != "table"
-                ]
-                if not candidates:
-                    raise KeyError(f"Could not infer object name from scene config: {scene_path}")
-                obj_name = candidates[0]
-
-            if obj_name not in scene:
-                raise KeyError(f"Object '{obj_name}' not found in scene config: {scene_path}")
-            obj_data = scene[obj_name]
-            obj_scale = obj_data.get("scale")
-            obj_pose = obj_data.get("pose")
-
-        if obj_name is None:
-            raise KeyError(f"Could not find object name in scene config: {scene_path}")
-        if obj_scale is None:
-            raise KeyError(f"Could not find object scale for '{obj_name}' in scene config: {scene_path}")
-        if obj_pose is None:
-            raise KeyError(f"Could not find object pose for '{obj_name}' in scene config: {scene_path}")
-
-        obj_scale_xyz = self._normalize_object_scale(obj_scale, scene_path)
-        obj_rot, obj_trans = self._object_pose_to_rt(obj_pose, scene_path)
-        return obj_name, obj_scale_xyz, obj_rot, obj_trans
-
-    def _transform_complete_pc(self, pc, obj_scale_xyz, obj_rot, obj_trans):
-        # complete_point_cloud.npy is normalized and must be transformed to world coordinates.
-        scaled_pc = pc * obj_scale_xyz[None, :]
-        return np.matmul(scaled_pc, obj_rot.T) + obj_trans[None, :]
-
-    def _scene_cfg_path_from_scene_id(self, scene_id):
-        return pjoin(self.config.object_path, "scene_cfg", f"{scene_id}.npy")
-
-    def _load_scene_cfg_by_scene_id(self, scene_id):
-        if scene_id not in self.scene_cfg_dict:
-            scene_path = self._scene_cfg_path_from_scene_id(scene_id)
-            if not os.path.exists(scene_path):
-                raise FileNotFoundError(f"Could not find scene config for scene_id '{scene_id}': {scene_path}")
-            self.scene_cfg_dict[scene_id] = np.load(scene_path, allow_pickle=True).item()
-        return self.scene_cfg_dict[scene_id]
 
     def __len__(self):
         return self.data_num
@@ -293,14 +195,10 @@ class RobotMultiDexDataset(Dataset):
             raw_pc = self.pc_data_dict[pc_path]
         else:
             raw_pc = np.load(pc_path, allow_pickle=True)
-        pc = self._sample_point_cloud(raw_pc)
-        if self.pc_source == "partial" and "scene_scale" in grasp_data:
+        idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
+        pc = np.asarray(raw_pc[idx], dtype=np.float32)
+        if "scene_scale" in grasp_data:
             pc *= grasp_data["scene_scale"][rand_pose_id]
-        elif self.pc_source == "complete":
-            scene_cfg = self._load_scene_cfg_by_scene_id(scene_id)
-            scene_path = self._scene_cfg_path_from_scene_id(scene_id)
-            _, obj_scale_xyz, obj_rot, obj_trans = self._extract_object_meta(scene_cfg, scene_path)
-            pc = self._transform_complete_pc(pc, obj_scale_xyz, obj_rot, obj_trans)
 
         joint_num = robot_joint_pos.shape[-1] // 2 if "both" in grasp_type else robot_joint_pos.shape[-1]
 
@@ -332,26 +230,18 @@ class RobotMultiDexDataset(Dataset):
         scene_id = self._scene_id_from_scene_cfg(scene_cfg, scene_path)
 
         if scene_id not in self.pc_path_dict:
-            self.pc_path_dict[scene_id] = self._list_scene_pc_paths(scene_id)
-            if not self.pc_path_dict[scene_id]:
-                raise FileNotFoundError(
-                    f"Could not find {self.pc_source} point cloud file(s) for scene_id '{scene_id}'. "
-                    f"Expected under: {self.object_pc_folder if self.pc_source == 'partial' else self.complete_pc_folder}"
-                )
+            self.pc_path_dict[scene_id] = sorted(glob(pjoin(self.object_pc_folder, scene_id, "partial_pc**.npy")))
             if self.preload_point_clouds:
                 for pc_path in self.pc_path_dict[scene_id]:
-                    if pc_path not in self.pc_data_dict:
-                        self.pc_data_dict[pc_path] = np.load(pc_path, allow_pickle=True)
+                    self.pc_data_dict[pc_path] = np.load(pc_path, allow_pickle=True)
         pc_path = random.choice(self.pc_path_dict[scene_id])
 
         if self.preload_point_clouds:
             raw_pc = self.pc_data_dict[pc_path]
         else:
             raw_pc = np.load(pc_path, allow_pickle=True)
-        pc = self._sample_point_cloud(raw_pc)
-        if self.pc_source == "complete":
-            _, obj_scale_xyz, obj_rot, obj_trans = self._extract_object_meta(scene_cfg, scene_path)
-            pc = self._transform_complete_pc(pc, obj_scale_xyz, obj_rot, obj_trans)
+        idx = np.random.choice(raw_pc.shape[0], self.config.num_points, replace=True)
+        pc = np.asarray(raw_pc[idx], dtype=np.float32)
 
         ret_dict["save_path"] = pjoin(self.config.name, grasp_type, scene_id, os.path.basename(pc_path))
         ret_dict["scene_path"] = scene_path

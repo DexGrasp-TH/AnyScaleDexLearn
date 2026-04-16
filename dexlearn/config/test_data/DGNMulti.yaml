@@ -1,0 +1,19 @@
+name: ${test_data_name}
+dataset_type: RobotMultiDexDataset
+human: False
+
+num_points: 1024
+
+preload_point_clouds: True
+grasp_type_lst: ["0_any"]
+pc_centering: True
+
+object_path: ${data_folder}/object/DGN_2k
+split_path: valid_split   # relative to object_path
+
+pc_source: complete   # 'partial' for partial_pc**.npy, 'complete' for processed_data/<obj>/complete_point_cloud.npy
+pc_path: vision_data/azure_kinect_dk    # relative to object_path, now used for 'partial' pc
+
+test_split: test
+test_scene_cfg: tabletop_ur10e/**.npy
+mini_test: False

@@ -1,0 +1,54 @@
+# Sample on DGB for BODex Optimization
+
+## Overall Task
+
+I have an generative model trained on collected human grasp dataset. 
+
+I want to use this generative model to sample human-inspired grasp wrist poses on the DGN object assets (or other assets). An example sample process is `python dexlearn/main.py task=sample data=humanMulti algo=humanMultiHierar test_data=DGNMulti exp_name=debug1`.
+
+I want to use the sampled wrist poses as the initial values for optimization by BimanBODex.
+
+## General Requests
+
+* Write concise and necessary comments to your generated code for better user understanding.
+
+## Plan for supporting complete object pointcloud
+
+1. Add a point-cloud source switch in `dexlearn/dataset/robot_multidex.py`:
+   - Use a config flag `pc_source` with options:
+     - `partial` (default): keep current `partial_pc**.npy` pipeline.
+     - `complete`: load normalized full object cloud from `processed_data/<obj_name>/complete_point_cloud.npy`.
+
+2. In test/sampling data loading (`_load_test_data`), parse object metadata from `scene_cfg`:
+   - `obj_name` from `scene_cfg["task"]["obj_name"]`.
+   - `obj_scale` and `obj_pose` from `scene_cfg["scene"][obj_name]`.
+
+3. For `pc_source == "complete"`, build NN input with full geometric transform:
+   - Sample points from `complete_point_cloud.npy`.
+   - Apply object scale to normalized cloud.
+   - Apply object pose to place points into scene/world frame:
+     - rotation + translation from pose.
+   - This ensures complete cloud input is consistent with scene placement.
+
+4. Keep backward compatibility:
+   - No behavior change when `pc_source` is absent or set to `partial`.
+   - Preserve existing `save_path/scene_path/pc_path` outputs.
+
+5. Add robust checks:
+   - Raise clear errors for missing complete cloud files or malformed scene config entries.
+   - Keep preloading logic compatible with both partial and complete paths.
+
+## Run Log
+
+Record what you have done here after every job.
+
+- 2026-04-16: Added implementation plan in the "Plan for supporting complete object pointcloud" section, updated to explicitly include object pose transformation (scale + rotation + translation) for complete pointcloud sampling.
+- 2026-04-16: Implemented the plan in `dexlearn/dataset/robot_multidex.py` by adding `pc_source` switch (`partial`/`complete`), complete-cloud loading from `processed_data/<obj_name>/complete_point_cloud.npy`, and scale+pose transformation to world frame. Added robust scene/object parsing and error checks. Updated `dexlearn/config/test_data/DGNMulti.yaml` to use `pc_source: complete` by default. Ran smoke test for both `pc_source=partial` and `pc_source=complete`, and both paths loaded successfully.
+
+
+## What I want you to do next
+
+Execute your plan now.
+
+
+## TODO (in the future)
