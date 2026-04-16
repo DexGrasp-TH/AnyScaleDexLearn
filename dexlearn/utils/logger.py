@@ -4,6 +4,7 @@ import torch
 import os
 import glob
 import numpy as np
+import numbers
 
 
 class Logger:
@@ -65,6 +66,10 @@ class Logger:
                         save_dict[k] = v[i].detach().cpu().numpy()
                     elif type(v).__module__ == "torch":
                         save_dict[k] = v[i, j].detach().cpu().numpy()
+                    elif isinstance(v, (str, bytes, numbers.Number, np.generic)):
+                        save_dict[k] = v
+                    elif isinstance(v, np.ndarray):
+                        save_dict[k] = v
                     else:
                         raise NotImplementedError
                 path_j = path.split(".npy")[0] + f"_{j}.npy"

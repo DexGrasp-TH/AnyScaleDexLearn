@@ -140,6 +140,8 @@ Visualize sampled robot grasps. Saved results are reordered by predicted grasp t
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize_robot algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
+
+# e.g., python dexlearn/main.py task=visualize_robot algo=robotMultiHierar data=leapMulti test_data=leapMulti exp_name=dataset_full_1
 ```
 
 ### Stat
@@ -151,6 +153,26 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=stat algo=robotMultiHierar d
 ```
 
 ## Human Workflow
+
+### Preprocess
+
+Compute and save `index_mcp_pos` into the source human grasp files before training with index-MCP positions.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=human_preprocess data=humanMulti exp_name=<EXP_NAME>
+
+# e.g., CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=human_preprocess data=humanMulti exp_name=debug1
+```
+
+### Check Dataloader
+
+Inspect human dataloader samples after preprocessing and before training. This visualization follows the configured `hand_pos_source` in `dexlearn/config/data/humanMulti.yaml`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/scripts/check_human_dataloader.py data=humanMulti data.hand_pos_source=<wrist/index_mcp> exp_name=<EXP_NAME> 
+
+# e.g.: CUDA_VISIBLE_DEVICES=0 python dexlearn/scripts/check_human_dataloader.py data=humanMulti data.hand_pos_source=index_mcp exp_name=debug1
+```
 
 ### Train
 
@@ -190,14 +212,14 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanMulti algo=
 
 ```bash
 # test on DGN, normalizing flow
-python dexlearn/main.py task=visualize_test data=human algo=h_nflow test_data=DGN exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize_human data=human algo=h_nflow test_data=DGN exp_name=<EXP_NAME>
 
 # single wrist pose, test on human_obj
-python dexlearn/main.py task=visualize_test data=human algo=h_diffusion test_data=human_obj exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize_human data=human algo=h_diffusion test_data=human_obj exp_name=<EXP_NAME>
 
 # single wrist pose, test on DGN
-python dexlearn/main.py task=visualize_test data=human algo=h_diffusion test_data=DGN exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize_human data=human algo=h_diffusion test_data=DGN exp_name=<EXP_NAME>
 
 # bimanual wrist pose, test on DGN_grasp_type
-python dexlearn/main.py task=visualize_test data=humanbi algo=hbi_diffusion test_data=DGN_grasp_type ckpt=050000 exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize_human data=humanbi algo=hbi_diffusion test_data=DGN_grasp_type ckpt=050000 exp_name=<EXP_NAME>
 ```

@@ -17,33 +17,14 @@ from dexlearn.network.models import *
 
 from dexlearn.dataset import create_dataset, minkowski_collate_fn, InfLoader
 from dexlearn.dataset.grasp_types import GRASP_TYPES
+from dexlearn.utils.human_hand import (
+    MANO_INDEX_MCP_IDX,
+    normalize_hand_pos_source,
+    get_wrist_translation_from_target,
+    infer_dataset_name_from_grasp_path,
+    ManoConfig,
+)
 from manopth.manolayer import ManoLayer
-
-
-class ManoConfig:
-    def __init__(self, dataset_name):
-        if dataset_name == "ContactPose":
-            use_pca = True
-            flat_hand_mean = False
-            ncomps = 15
-        elif dataset_name == "HOGraspNet":
-            use_pca = False
-            flat_hand_mean = True
-            ncomps = 45
-        elif dataset_name == "GRAB":
-            use_pca = True
-            flat_hand_mean = True
-            ncomps = 24
-        elif dataset_name == "OurHumanGraspFormat":
-            use_pca = False
-            flat_hand_mean = True
-            ncomps = 45
-        else:
-            raise NotImplementedError()
-
-        self.use_pca = use_pca
-        self.flat_hand_mean = flat_hand_mean
-        self.ncomps = ncomps
 
 
 def visualize_with_trimesh(verts, faces, joints=None, color=(200, 200, 250, 255)):
@@ -74,14 +55,9 @@ def main(config: DictConfig) -> None:
     logger = Logger(config)
 
     grasp_path = os.path.normpath(str(config.data.grasp_path))
-    path_parts = grasp_path.split(os.sep)
-    if "grasp" not in path_parts:
-        raise ValueError(f"Invalid grasp_path (missing 'grasp' folder): {grasp_path}")
-    grasp_idx = path_parts.index("grasp")
-    if grasp_idx == 0:
-        raise ValueError(f"Invalid grasp_path (cannot infer dataset name): {grasp_path}")
-    dataset_name = path_parts[grasp_idx - 1]
+    dataset_name = infer_dataset_name_from_grasp_path(grasp_path)
     mano_cfg = ManoConfig(dataset_name)
+    hand_pos_source = normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist"))
 
     mano_layers = {
         side: ManoLayer(
@@ -129,17 +105,33 @@ def main(config: DictConfig) -> None:
             scene_elements = []
 
             for side in ["right", "left"]:
-                hand_trans = data[f"{side}_hand_trans"][i, 0, 0, :]  # (3,)
+                hand_target_pos = data[f"{side}_hand_trans"][i, 0, 0, :]  # (3,)
                 hand_rot_mat = data[f"{side}_hand_rot"][i, 0, 0, ...]  # (3, 3)
 
-                # Skip inactive hands (all-zero pose)
+                if side == "left" and "left_hand_fixed" in data and bool(data["left_hand_fixed"][i]):
+                    continue
                 if not hand_rot_mat.any():
                     continue
+
+                ############# MANO ##############
+                hand_rot_aa = matrix_to_axis_angle(hand_rot_mat.unsqueeze(0))
+                if f"{side}_mano_pose" in data:
+                    mano_pose = data[f"{side}_mano_pose"][i].unsqueeze(0).to(config.device)  # (1, 24)
+                    mano_betas = data[f"{side}_mano_betas"][i].unsqueeze(0).to(config.device)  # (1, 10)
+                else:
+                    mano_pose = torch.zeros((1, mano_cfg.ncomps), device=config.device)
+                    mano_betas = torch.zeros((1, 10), device=config.device)
+                mano_params = torch.cat([hand_rot_aa, mano_pose], dim=-1)  # (1, 27)
+
+                verts, joints = mano_layers[side](mano_params, th_betas=mano_betas)
+                wrist_trans = get_wrist_translation_from_target(hand_target_pos, joints[0], hand_pos_source)
+                verts = (verts / 1000.0) + wrist_trans.unsqueeze(0)
+                joints = (joints / 1000.0) + wrist_trans.unsqueeze(0)
 
                 ############# Hand base pose axis ##############
                 hand_pose = torch.eye(4)
                 hand_pose[:3, :3] = hand_rot_mat
-                hand_pose[:3, 3] = hand_trans
+                hand_pose[:3, 3] = wrist_trans
                 axis = trimesh.creation.axis(
                     transform=hand_pose.cpu().numpy(),
                     origin_size=0.01,
@@ -148,25 +140,24 @@ def main(config: DictConfig) -> None:
                 )
                 scene_elements.append(axis)
 
-                ############# MANO ##############
-                hand_rot_aa = matrix_to_axis_angle(hand_rot_mat.unsqueeze(0))
-                if f"{side}_mano_pose" in data:
-                    mano_pose = data[f"{side}_mano_pose"][i].unsqueeze(0).to(config.device)  # (1, 24)
-                    mano_betas = data[f"{side}_mano_betas"][i].unsqueeze(0).to(config.device)  # (1, 10)
-                else:
-                    mano_pose = torch.zeros((1, 24), device=config.device)
-                    mano_betas = torch.zeros((1, 10), device=config.device)
-                mano_params = torch.cat([hand_rot_aa, mano_pose], dim=-1)  # (1, 27)
-
-                verts, joints = mano_layers[side](mano_params, th_betas=mano_betas)
-                verts = (verts / 1000.0) + hand_trans.unsqueeze(0)
-                joints = (joints / 1000.0) + hand_trans.unsqueeze(0)
-
                 v_np = verts[0].cpu().detach().numpy()
                 j_np = joints[0].cpu().detach().numpy()
                 f_np = mano_layers[side].th_faces.cpu().numpy()
 
                 scene_elements.extend(visualize_with_trimesh(v_np, f_np, j_np, color=hand_colors[side]))
+
+                if hand_pos_source == "index_mcp":
+                    # Visualize the loaded MCP target frame directly to verify dataloader output.
+                    mcp_pose = torch.eye(4)
+                    mcp_pose[:3, :3] = hand_rot_mat
+                    mcp_pose[:3, 3] = hand_target_pos
+                    mcp_axis = trimesh.creation.axis(
+                        transform=mcp_pose.cpu().numpy(),
+                        origin_size=0.008,
+                        axis_radius=0.003,
+                        axis_length=0.08,
+                    )
+                    scene_elements.append(mcp_axis)
 
             ############# Object pointcloud ##############
             pc_np = data["point_clouds"][i, ...].cpu().numpy()

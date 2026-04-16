@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.logger import Logger
+from dexlearn.utils.human_hand import normalize_hand_pos_source
 from dexlearn.utils.util import set_seed
 from dexlearn.dataset import create_test_dataloader
 from dexlearn.network.models import *
@@ -33,16 +34,26 @@ def _expand_centroid(pc_centroid: torch.Tensor, target: torch.Tensor) -> torch.T
     return centroid.reshape(*view_shape)
 
 
-def _decenter_human_pose(robot_pose: torch.Tensor, pc_centroid: torch.Tensor) -> torch.Tensor:
+def _decenter_human_pose(
+    robot_pose: torch.Tensor, pc_centroid: torch.Tensor, grasp_type_id: torch.Tensor = None
+) -> torch.Tensor:
     # robot_pose: (B, K, P, D), D is 7*n_hands (pos3 + quat4 per hand)
     if robot_pose.shape[-1] < 3:
         return robot_pose
     out = robot_pose.clone()
     centroid = _expand_centroid(pc_centroid, out)
-    for start in range(0, out.shape[-1], 7):
-        if start + 7 > out.shape[-1]:
-            break
-        out[..., start : start + 3] = out[..., start : start + 3] + centroid
+    out[..., :3] = out[..., :3] + centroid
+
+    # Add centroid to left-hand translation only for bimanual grasp types (ids 4,5).
+    if grasp_type_id is None or out.shape[-1] < 14:
+        return out
+
+    both_mask = grasp_type_id >= 4
+    if not torch.any(both_mask):
+        return out
+
+    both_mask = both_mask[..., None, None]
+    out[..., 7:10] = out[..., 7:10] + centroid * both_mask.to(dtype=out.dtype)
     return out
 
 
@@ -130,16 +141,18 @@ def task_sample(config: DictConfig):
                 if grasp_type_for_decenter.ndim == 1:
                     grasp_type_for_decenter = grasp_type_for_decenter.unsqueeze(1).expand(-1, robot_pose.shape[1])
                 if config.algo.human:
-                    robot_pose = _decenter_human_pose(robot_pose, data["pc_centroid"])
+                    robot_pose = _decenter_human_pose(robot_pose, data["pc_centroid"], grasp_type_for_decenter)
                 else:
                     robot_pose = _decenter_robot_pose(robot_pose, data["pc_centroid"], grasp_type_for_decenter)
 
             if config.algo.human:
+                grasp_pos_source = normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist"))
                 save_dict = {
                     "grasp_pose": robot_pose[..., 0, :],
                     "grasp_error": -log_prob,
                     "scene_path": data["scene_path"],
                     "pc_path": data["pc_path"],
+                    "grasp_pos_source": grasp_pos_source,
                 }
             else:
                 save_dict = {

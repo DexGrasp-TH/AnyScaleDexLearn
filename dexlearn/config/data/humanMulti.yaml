@@ -8,6 +8,7 @@ joint_num: 16 # unused?
 
 pc_centering: True
 rotation_aug: True
+hand_pos_source: index_mcp # "wrist" or "index_mcp"
 
 grasp_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/grasp
 object_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/object

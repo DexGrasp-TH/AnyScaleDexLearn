@@ -20,13 +20,13 @@
             "args": ["task=sample", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "algo.batch_size=64", "exp_name=debug3"]
         },
         {
-            "name": "visualize_test: humanbi / humanBiDiffusion",
+            "name": "visualize_human: humanbi / humanBiDiffusion",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=visualize_test", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "exp_name=debug3"]
+            "args": ["task=visualize_human", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "exp_name=debug3"]
         },
 
         {
@@ -49,22 +49,32 @@
             "args": ["task=train", "data=humanMulti", "algo=humanMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
         },
         {
+            "name": "check_test_dataloader",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dexlearn/scripts/check_test_dataloader.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": ["task=sample", "data=humanMulti", "test_data=DGNMulti", "algo=humanMultiHierar", "algo.batch_size=16", 
+                     "exp_name=debug1"]
+        },
+        {
             "name": "sample: humanMulti / humanMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=sample", "data=humanMulti", "algo=humanMultiHierar", "test_data=humanMulti", "exp_name=debug1"]
+            "args": ["task=sample", "data=humanMulti", "algo=humanMultiHierar", "test_data=DGNMulti", "exp_name=debug1"]
         },
         {
-            "name": "visualize_test: humanMulti / humanMultiHierar",
+            "name": "visualize_human: humanMulti / humanMultiHierar",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/dexlearn/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=visualize_test", "data=humanMulti", "algo=humanMultiHierar", "test_data=humanMulti", "exp_name=debug1"]
+            "args": ["task=visualize_human", "data=humanMulti", "algo=humanMultiHierar", "test_data=humanMulti", "exp_name=debug1"]
         },
         {
             "name": "stat: humanMulti / humanMultiHierar",
@@ -113,7 +123,7 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "args": ["task=visualize_robot", "data=leapMulti", "algo=robotMultiHierar", "test_data=leapMulti", 
-                     "exp_name=server_0", "ckpt=035000"]
+                     "exp_name=server_0"]
         },
     ]
 }

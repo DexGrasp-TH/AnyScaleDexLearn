@@ -6,6 +6,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from dexlearn.utils.util import load_json
+from dexlearn.utils.human_hand import normalize_hand_pos_source
 from .grasp_types import GRASP_TYPES
 from scipy.spatial.transform import Rotation as sciR
 
@@ -27,7 +28,7 @@ class HumanMultiDexDataset(Dataset):
         self.grasp_path_dict = {}
         self.pc_path_dict = {}
         self.object_pc_folder = pjoin(config.object_path, config.pc_path)
-        self.mano_pose_dim = 24 if "GRAB" in config.grasp_path else 45
+        self.hand_pos_source = normalize_hand_pos_source(getattr(config, "hand_pos_source", "wrist"))
 
         if mode == "test":
             self.grasp_type_lst = (
@@ -43,7 +44,9 @@ class HumanMultiDexDataset(Dataset):
             self._init_test()
 
     def _init_train_eval(self, mode):
+
         split_name = "test" if mode == "eval" else "train"
+        self.mano_pose_dim = 24 if "GRAB" in self.config.grasp_path else 45
         self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
 
         print(f"Pre-indexing {mode} data paths...")
@@ -73,7 +76,7 @@ class HumanMultiDexDataset(Dataset):
                 test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
 
         self.test_cfg_lst = sorted(test_cfg_set)
-        self.data_num = self.grasp_type_num * len(self.test_cfg_lst) # TO BE CHECKED
+        self.data_num = self.grasp_type_num * len(self.test_cfg_lst)  # TO BE CHECKED
         print(
             f"Test split: {split_name}, grasp type list: {self.grasp_type_lst}, "
             f"object cfg num: {len(self.test_cfg_lst)}"
@@ -138,24 +141,40 @@ class HumanMultiDexDataset(Dataset):
         if not mirrored:
             for side, is_active in grasp_data["hand"].items():
                 if is_active:
-                    ret_dict[f"{side}_hand_trans"] = np.asarray(grasp_data["hand"][side]["trans"]).reshape(1, 1, 3)
+                    ret_dict[f"{side}_hand_trans"] = self._get_hand_translation(grasp_data["hand"][side]).reshape(1, 1, 3)
                     ret_dict[f"{side}_hand_rot"] = (
                         sciR.from_rotvec(grasp_data["hand"][side]["rot"]).as_matrix().reshape(1, 1, 3, 3)
                     )
                 else:
                     ret_dict[f"{side}_hand_trans"] = FIXED_LEFT_HAND_TRANS.reshape(1, 1, 3)
                     ret_dict[f"{side}_hand_rot"] = FIXED_LEFT_HAND_ROT.reshape(1, 1, 3, 3)
+                    if side == "left":
+                        ret_dict["left_hand_fixed"] = True
         else:
             # Mirror left-only grasp to right hand
-            l_trans = np.asarray(grasp_data["hand"]["left"]["trans"])
+            l_trans = self._get_hand_translation(grasp_data["hand"]["left"])
             l_rot = sciR.from_rotvec(grasp_data["hand"]["left"]["rot"]).as_matrix()
             ret_dict["right_hand_trans"] = (self._MIRROR @ l_trans).reshape(1, 1, 3)
             ret_dict["right_hand_rot"] = (self._MIRROR @ l_rot @ self._MIRROR).reshape(1, 1, 3, 3)
             ret_dict["left_hand_trans"] = FIXED_LEFT_HAND_TRANS.reshape(1, 1, 3)
             ret_dict["left_hand_rot"] = FIXED_LEFT_HAND_ROT.reshape(1, 1, 3, 3)
+            ret_dict["left_hand_fixed"] = True
+
+        ret_dict.setdefault("left_hand_fixed", False)
 
         if getattr(self.config, "load_mano_params", False):
             self._extract_mano_params(grasp_data, mirrored, ret_dict)
+
+    def _get_hand_translation(self, hand_data):
+        if self.hand_pos_source == "wrist":
+            return np.asarray(hand_data["trans"], dtype=np.float32)
+
+        if "index_mcp_pos" not in hand_data:
+            raise KeyError(
+                "Missing hand['index_mcp_pos'] while hand_pos_source='index_mcp'. "
+                "Run the human_preprocess task first."
+            )
+        return np.asarray(hand_data["index_mcp_pos"], dtype=np.float32)
 
     def _extract_mano_params(self, grasp_data, mirrored, ret_dict):
         """Extract MANO parameters for visualization."""
@@ -247,12 +266,10 @@ class HumanMultiDexDataset(Dataset):
         ret_dict["pc_centroid"] = pc_centroid.astype(np.float32)
 
         if self.mode != "test":
-            if mirrored:
+            if "right_hand_trans" in ret_dict:
                 ret_dict["right_hand_trans"] -= pc_centroid[None, :, :]
-            else:
-                for side, is_active in grasp_data["hand"].items():
-                    if is_active:
-                        ret_dict[f"{side}_hand_trans"] -= pc_centroid[None, :, :]
+            if "left_hand_trans" in ret_dict and not ret_dict.get("left_hand_fixed", False):
+                ret_dict["left_hand_trans"] -= pc_centroid[None, :, :]
 
         return pc
 
@@ -266,10 +283,8 @@ class HumanMultiDexDataset(Dataset):
 
         for side in ["right", "left"]:
             if f"{side}_hand_trans" in ret_dict:
-                # Skip rotating fixed left hand pose
-                if side == "left" and np.allclose(
-                    ret_dict[f"{side}_hand_trans"], FIXED_LEFT_HAND_TRANS.reshape(1, 1, 3)
-                ):
+                # Keep the placeholder left hand unchanged for right-only grasps.
+                if side == "left" and ret_dict.get("left_hand_fixed", False):
                     continue
                 # in-place change
                 ret_dict[f"{side}_hand_trans"] = ret_dict[f"{side}_hand_trans"] @ rot_z.T
