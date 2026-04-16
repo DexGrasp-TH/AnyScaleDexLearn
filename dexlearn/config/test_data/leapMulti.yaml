@@ -4,13 +4,13 @@ human: False
 
 num_points: 1024
 traj_length: 3
-joint_num: 32 # bimanual shadow hands
+joint_num: 32 # bimanual leap hands
 
 preload_point_clouds: True
 grasp_type_lst: ["0_any"]
 pc_centering: True
 
-grasp_path: ${oc.env:AnyScaleGraspDataset}/BimanBODex_1k/shadow
+grasp_path: ${oc.env:AnyScaleGraspDataset}/BimanBODex_1k/leap
 object_path: ${oc.env:AnyScaleGraspDataset}/object/DGN_2k
 split_path: valid_split   # relative to object_path
 pc_path: vision_data/azure_kinect_dk    # relative to object_path

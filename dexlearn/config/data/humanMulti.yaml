@@ -9,8 +9,8 @@ joint_num: 16 # unused?
 pc_centering: True
 rotation_aug: True
 
-grasp_path: ${oc.env:AnyScaleGraspDataset}/GRAB/grasp
-object_path: ${oc.env:AnyScaleGraspDataset}/GRAB/object
+grasp_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/grasp
+object_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/object
 split_path: valid_split   # relative to object_path
 pc_path: vision_data/complete_pc    # relative to object_path
 load_mano_params: False

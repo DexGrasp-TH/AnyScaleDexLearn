@@ -36,7 +36,8 @@
             "program": "${workspaceFolder}/dexlearn/scripts/check_human_dataloader.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "args": ["task=train", "data=humanMulti", "algo=humanMultiHierar", "algo.batch_size=16", "exp_name=debug0"]
+            "args": ["task=train", "data=humanMulti", "algo=humanMultiHierar", "algo.batch_size=16", 
+                     "data.load_mano_params=True", "exp_name=debug0"]
         },
         {
             "name": "train: humanMulti / humanMultiHierar",
@@ -112,7 +113,7 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "args": ["task=visualize_robot", "data=leapMulti", "algo=robotMultiHierar", "test_data=leapMulti", 
-                     "exp_name=server_0"]
+                     "exp_name=server_0", "ckpt=035000"]
         },
     ]
 }

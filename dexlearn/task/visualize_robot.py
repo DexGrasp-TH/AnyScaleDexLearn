@@ -108,7 +108,7 @@ def build_robot_components(config: DictConfig):
     )
     robot_visualizer = Visualizer(urdf_path, mesh_dir_path, device=config.device)
 
-    metadata_path = os.path.join(config.data.grasp_path, config.test_data.metadata_group, "metadata.json")
+    metadata_path = os.path.join(config.test_data.grasp_path, config.test_data.metadata_group, "metadata.json")
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Joint metadata file not found: {metadata_path}")
 
@@ -160,8 +160,8 @@ def load_visualization_pc(sample_file: str, scene_cfg: dict, config: DictConfig)
     raw_pc = np.load(pc_path, allow_pickle=True)
     idx = np.random.choice(raw_pc.shape[0], config.test_data.num_points, replace=True)
     pc = raw_pc[idx]
-    if config.test_data.pc_centering:
-        pc = pc - np.mean(pc, axis=-2, keepdims=True)
+    # if config.test_data.pc_centering: # the saved results have already been decentered.
+    #     pc = pc - np.mean(pc, axis=-2, keepdims=True)
     return pc
 
 

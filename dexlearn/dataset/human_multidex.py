@@ -18,6 +18,7 @@ class HumanMultiDexDataset(Dataset):
     """Dataset for human bimanual grasps with multiple grasp types."""
 
     _MIRROR = np.diag([-1.0, 1.0, 1.0])  # YZ-plane reflection matrix
+    _MIRRORED_ROTVEC_SIGN = np.array([1.0, -1.0, -1.0], dtype=np.float32)
 
     def __init__(self, config: dict, mode: str, sc_voxel_size: float = None):
         self.config = config
@@ -167,10 +168,21 @@ class HumanMultiDexDataset(Dataset):
                     ret_dict[f"{side}_mano_pose"] = np.zeros(self.mano_pose_dim, dtype=np.float32)
                     ret_dict[f"{side}_mano_betas"] = np.zeros(10, dtype=np.float32)
         else:
-            ret_dict["right_mano_pose"] = np.asarray(grasp_data["hand"]["left"]["mano_pose"]).flatten()
+            left_mano_pose = np.asarray(grasp_data["hand"]["left"]["mano_pose"]).flatten().astype(np.float32)
+            ret_dict["right_mano_pose"] = self._mirror_mano_pose(left_mano_pose)
             ret_dict["right_mano_betas"] = np.asarray(grasp_data["hand"]["left"]["mano_betas"]).flatten()
             ret_dict["left_mano_pose"] = np.zeros(self.mano_pose_dim, dtype=np.float32)
             ret_dict["left_mano_betas"] = np.zeros(10, dtype=np.float32)
+
+    def _mirror_mano_pose(self, mano_pose):
+        """
+        Mirror MANO axis-angle joints from left hand to right hand across the YZ plane.
+        For reflection S=diag(-1,1,1), mirrored rotvec is det(S)*S*w = [1,-1,-1]*w.
+        """
+        pose = np.asarray(mano_pose).flatten().astype(np.float32)
+        if pose.size == 45:
+            return (pose.reshape(-1, 3) * self._MIRRORED_ROTVEC_SIGN[None, :]).reshape(-1)
+        return pose
 
     def _load_pointcloud(self, obj_name, obj_scale, obj_pose, mirrored=False):
         """Load and transform object point cloud."""

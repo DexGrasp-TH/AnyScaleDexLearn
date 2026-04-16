@@ -4,7 +4,7 @@ human: False
 
 num_points: 1024
 traj_length: 3
-joint_num: 32 # bimanual shadow hands
+joint_num: 32 # bimanual leap hands
 
 preload_point_clouds: True
 pc_centering: True

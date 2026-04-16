@@ -1,6 +1,7 @@
 import sys
 import os
 
+import numpy as np
 import torch
 import hydra
 from omegaconf import DictConfig
@@ -33,6 +34,10 @@ class ManoConfig:
             use_pca = True
             flat_hand_mean = True
             ncomps = 24
+        elif dataset_name == "OurHumanGraspFormat":
+            use_pca = False
+            flat_hand_mean = True
+            ncomps = 45
         else:
             raise NotImplementedError()
 
@@ -68,9 +73,14 @@ def main(config: DictConfig) -> None:
     set_seed(config.seed)
     logger = Logger(config)
 
-    dataset_name = next(
-        (name for name in ["ContactPose", "HOGraspNet", "GRAB"] if name in config.data.grasp_path), "GRAB"
-    )
+    grasp_path = os.path.normpath(str(config.data.grasp_path))
+    path_parts = grasp_path.split(os.sep)
+    if "grasp" not in path_parts:
+        raise ValueError(f"Invalid grasp_path (missing 'grasp' folder): {grasp_path}")
+    grasp_idx = path_parts.index("grasp")
+    if grasp_idx == 0:
+        raise ValueError(f"Invalid grasp_path (cannot infer dataset name): {grasp_path}")
+    dataset_name = path_parts[grasp_idx - 1]
     mano_cfg = ManoConfig(dataset_name)
 
     mano_layers = {
@@ -114,7 +124,7 @@ def main(config: DictConfig) -> None:
         for i in range(config.algo.batch_size):
             grasp_type_id = int(data["grasp_type_id"][i])
             grasp_type_name = GRASP_TYPES[grasp_type_id]
-            print(f"path: {data['path'][i]}  |  grasp_type: {grasp_type_name}")
+            scene_caption = f"path: {data['path'][i]}  |  grasp_type: {grasp_type_name}"
 
             scene_elements = []
 
@@ -167,7 +177,13 @@ def main(config: DictConfig) -> None:
             scene_elements.append(world_axis)
 
             scene = trimesh.Scene(scene_elements)
-            scene.show(caption=grasp_type_name)
+            # Start from a Z-up friendly oblique view for tabletop grasp inspection.
+            scene.set_camera(
+                angles=(np.deg2rad(80.0), 0.0, np.deg2rad(45.0)),
+                distance=0.8,
+                center=scene.centroid,
+            )
+            scene.show(caption=scene_caption)
 
     return
 
