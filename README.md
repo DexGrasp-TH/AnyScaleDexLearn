@@ -51,6 +51,7 @@ DexLearn trains and evaluates grasp generation models for human-hand and robot-h
    pip install -e ./third_party/pytorch_kinematics
    pip install -e ./third_party/utils_python
    ```
+   Place mano models in `./third_party/manopath/mano/models`.
 
 6. Install `MinkowskiEngine`.
    Follow the setup notes in [detailed steps](https://github.com/NVIDIA/MinkowskiEngine/issues/543#issuecomment-2566883469) and [NVTX_DISABLE](https://github.com/NVIDIA/MinkowskiEngine/issues/543#issuecomment-2886016764).
@@ -188,6 +189,8 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=hbi_diffusion dat
 
 # multi-hand hierarchical model
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME>
+
+# e.g.: CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME>
 ```
 
 ### Sample
