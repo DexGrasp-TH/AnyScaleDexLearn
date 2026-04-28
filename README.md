@@ -178,16 +178,6 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/scripts/check_human_dataloader.py data=hu
 ### Train
 
 ```bash
-# single wrist pose, normalizing flow
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=h_nflow data=human exp_name=<EXP_NAME>
-
-# single wrist pose, diffusion
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=h_diffusion data=human exp_name=<EXP_NAME>
-
-# bimanual wrist pose, diffusion
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=hbi_diffusion data=humanbi exp_name=<EXP_NAME>
-
-# multi-hand hierarchical model
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME>
 
 # e.g.: CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME>
@@ -196,33 +186,16 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiHierar 
 ### Sample
 
 ```bash
-# single wrist pose, test on human_obj
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=human algo=h_diffusion test_data=human_obj exp_name=<EXP_NAME>
-
-# single wrist pose, test on DGN
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=human algo=h_diffusion test_data=DGN exp_name=<EXP_NAME>
-
-# bimanual wrist pose, test on DGN_grasp_type
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanbi algo=hbi_diffusion test_data=DGN_grasp_type ckpt=050000 exp_name=<EXP_NAME>
-
-# multi-hand hierarchical model
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<EXP_NAME>
 
 # e.g,: CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanMulti algo=humanMultiHierar test_data=DGNMulti exp_name=<EXP_NAME>
+# e.g,: CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<EXP_NAME>
 ```
 
 ### Visualize
 
 ```bash
-# test on DGN, normalizing flow
-python dexlearn/main.py task=visualize_human data=human algo=h_nflow test_data=DGN exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize_human task=visualize_human data=humanMulti algo=humanMultiHierar test_data=<TEST_DATA> exp_name=<EXP_NAME>
 
-# single wrist pose, test on human_obj
-python dexlearn/main.py task=visualize_human data=human algo=h_diffusion test_data=human_obj exp_name=<EXP_NAME>
-
-# single wrist pose, test on DGN
-python dexlearn/main.py task=visualize_human data=human algo=h_diffusion test_data=DGN exp_name=<EXP_NAME>
-
-# bimanual wrist pose, test on DGN_grasp_type
-python dexlearn/main.py task=visualize_human data=humanbi algo=hbi_diffusion test_data=DGN_grasp_type ckpt=050000 exp_name=<EXP_NAME>
+# e.g, python dexlearn/main.py task=visualize_human task=visualize_human data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<EXP_NAME>
 ```

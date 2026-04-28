@@ -6,7 +6,7 @@ num_points: 1024
 grasp_type_lst: ["0_any"]
 pc_centering: True
 
-object_path: ${oc.env:AnyScaleGraspDataset}/GRAB/object
+object_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/object
 split_path: valid_split   # relative to object_path
 pc_path: vision_data/complete_pc    # relative to object_path
 
