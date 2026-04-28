@@ -123,7 +123,7 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "args": ["task=visualize_robot", "data=leapMulti", "algo=robotMultiHierar", "test_data=leapMulti", 
-                     "exp_name=server_0"]
+                     "exp_name=dataset_full_1"]
         },
     ]
 }

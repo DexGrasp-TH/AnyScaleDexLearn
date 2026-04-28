@@ -3,8 +3,8 @@ dataset_type: HumanMultiDexDataset
 num_workers: 10
 
 num_points: 1024
-traj_length: 3 # unused? 
-joint_num: 16 # unused?
+traj_length: 3
+joint_num: 16
 
 pc_centering: True
 rotation_aug: True
