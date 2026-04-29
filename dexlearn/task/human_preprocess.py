@@ -11,6 +11,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.util import set_seed
 from dexlearn.utils.human_hand import HAND_SIDES, ManoConfig, infer_dataset_name_from_grasp_path
+from dexlearn.utils.config import flatten_multidex_data_config
 
 from manopth.manolayer import ManoLayer
 
@@ -55,6 +56,7 @@ def compute_index_mcp_pos(hand_data: dict, mano_layer: ManoLayer, device: str):
 
 def task_human_preprocess(config: DictConfig) -> None:
     set_seed(config.seed)
+    flatten_multidex_data_config(config.data)
 
     grasp_root = os.path.normpath(str(config.data.grasp_path))
     if not os.path.isdir(grasp_root):

@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 
 from dexlearn.utils.util import load_json
 from dexlearn.utils.human_hand import normalize_hand_pos_source
+from dexlearn.utils.config import flatten_multidex_data_config
 from .grasp_types import GRASP_TYPES
 from scipy.spatial.transform import Rotation as sciR
 
@@ -22,6 +23,7 @@ class HumanMultiDexDataset(Dataset):
     _MIRRORED_ROTVEC_SIGN = np.array([1.0, -1.0, -1.0], dtype=np.float32)
 
     def __init__(self, config: dict, mode: str, sc_voxel_size: float = None):
+        flatten_multidex_data_config(config)
         self.config = config
         self.sc_voxel_size = sc_voxel_size
         self.mode = mode
@@ -50,10 +52,13 @@ class HumanMultiDexDataset(Dataset):
         self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
 
         print(f"Pre-indexing {mode} data paths...")
+        indexed_obj_ids = []
         for obj_id in self.obj_id_lst:
             found_paths = glob(pjoin(self.config.grasp_path, obj_id, "**/**.npy"), recursive=True)
             if found_paths:
                 self.grasp_path_dict[obj_id] = sorted(found_paths)
+                indexed_obj_ids.append(obj_id)
+        self.obj_id_lst = indexed_obj_ids
 
         self.data_num = sum(len(paths) for paths in self.grasp_path_dict.values())
         print(f"mode: {mode}, grasp data num: {self.data_num}")
@@ -98,8 +103,11 @@ class HumanMultiDexDataset(Dataset):
         if self.config.pc_centering:
             pc = self._apply_pc_centering(pc, ret_dict, mirrored, grasp_data)
 
-        if self.mode == "train" and getattr(self.config, "rotation_aug", False):
-            pc = self._apply_rotation_aug(pc, ret_dict)
+        if self.mode == "train":
+            pc = self._apply_geometric_aug(pc, ret_dict)
+
+        if self.mode == "train" and getattr(self.config, "pc_noise_aug", False):
+            pc = self._apply_pc_noise_aug(pc)
 
         ret_dict["point_clouds"] = pc
         ret_dict["grasp_type_id"] = int(rand_grasp_type.split("_")[0])
@@ -207,6 +215,11 @@ class HumanMultiDexDataset(Dataset):
         """Load and transform object point cloud."""
         if obj_name not in self.pc_path_dict:
             self.pc_path_dict[obj_name] = sorted(glob(pjoin(self.object_pc_folder, obj_name, "**.npy")))
+        if not self.pc_path_dict[obj_name]:
+            raise FileNotFoundError(
+                f"No point-cloud files found for object '{obj_name}' under "
+                f"{pjoin(self.object_pc_folder, obj_name)}"
+            )
         pc_path = random.choice(self.pc_path_dict[obj_name])
 
         raw_pc = np.load(pc_path, allow_pickle=True)
@@ -273,21 +286,59 @@ class HumanMultiDexDataset(Dataset):
 
         return pc
 
-    def _apply_rotation_aug(self, pc, ret_dict):
-        """Apply random rotation around Z axis."""
-        angle = np.random.uniform(-np.pi, np.pi)
-        cos_a, sin_a = np.cos(angle), np.sin(angle)
-        rot_z = np.array([[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]])
+    def _apply_geometric_aug(self, pc, ret_dict):
+        """Apply train-time rotation and translation after point-cloud centering."""
+        rot = self._sample_rotation_aug()
+        trans = self._sample_translation_aug()
 
-        pc = pc @ rot_z.T
+        if rot is not None:
+            pc = pc @ rot.T
+            for side in ["right", "left"]:
+                if f"{side}_hand_trans" in ret_dict:
+                    if side == "left" and ret_dict.get("left_hand_fixed", False):
+                        continue
+                    ret_dict[f"{side}_hand_trans"] = ret_dict[f"{side}_hand_trans"] @ rot.T
+                    ret_dict[f"{side}_hand_rot"] = rot @ ret_dict[f"{side}_hand_rot"]
 
-        for side in ["right", "left"]:
-            if f"{side}_hand_trans" in ret_dict:
-                # Keep the placeholder left hand unchanged for right-only grasps.
-                if side == "left" and ret_dict.get("left_hand_fixed", False):
-                    continue
-                # in-place change
-                ret_dict[f"{side}_hand_trans"] = ret_dict[f"{side}_hand_trans"] @ rot_z.T
-                ret_dict[f"{side}_hand_rot"] = rot_z @ ret_dict[f"{side}_hand_rot"]
+        if trans is not None:
+            pc = pc + trans.reshape(1, 3)
+            for side in ["right", "left"]:
+                if f"{side}_hand_trans" in ret_dict:
+                    if side == "left" and ret_dict.get("left_hand_fixed", False):
+                        continue
+                    ret_dict[f"{side}_hand_trans"] = ret_dict[f"{side}_hand_trans"] + trans.reshape(1, 1, 3)
 
         return pc
+
+    def _sample_rotation_aug(self):
+        z_rotation_enabled = bool(
+            getattr(self.config, "z_rotation_aug", getattr(self.config, "rotation_aug", False))
+        )
+        xy_rotation_enabled = bool(getattr(self.config, "xy_rotation_aug", False))
+        if not z_rotation_enabled and not xy_rotation_enabled:
+            return None
+
+        z_angle = np.random.uniform(-np.pi, np.pi) if z_rotation_enabled else 0.0
+        xy_angle_limit = np.deg2rad(float(getattr(self.config, "xy_rotation_max_angle_deg", 0.0)))
+        x_angle, y_angle = (
+            np.random.uniform(-xy_angle_limit, xy_angle_limit, size=2) if xy_rotation_enabled else (0.0, 0.0)
+        )
+
+        # Compose all enabled axis rotations into one matrix so point clouds and hands share one rigid transform.
+        return sciR.from_euler("xyz", [x_angle, y_angle, z_angle]).as_matrix().astype(np.float32)
+
+    def _sample_translation_aug(self):
+        if not bool(getattr(self.config, "translation_aug", False)):
+            return None
+        translation_range = float(getattr(self.config, "translation_range", 0.0))
+        if translation_range <= 0.0:
+            return None
+        return np.random.uniform(-translation_range, translation_range, size=3).astype(np.float32)
+
+    def _apply_pc_noise_aug(self, pc):
+        """Add zero-mean Gaussian noise to object points during training."""
+        noise_scale = float(getattr(self.config, "pc_noise_scale", 0.0))
+        if noise_scale <= 0.0:
+            return pc.astype(np.float32, copy=False)
+        noise = np.random.normal(loc=0.0, scale=noise_scale, size=pc.shape).astype(np.float32)
+        return pc.astype(np.float32, copy=False) + noise

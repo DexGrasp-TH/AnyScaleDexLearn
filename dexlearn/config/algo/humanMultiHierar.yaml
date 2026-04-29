@@ -10,8 +10,8 @@ val_num: 10
 save_every: 5000
 grad_clip: 10.0
 
-test_grasp_num: 100
-test_topk: 10
+test_grasp_num: 20
+test_topk: 20
 
 model:
   name: HierarchicalModel
@@ -28,8 +28,6 @@ model:
   head:
     name: DiffusionBiRT_v2
     in_feat_dim:
-    joint_num:  ${....data.joint_num}
-    traj_length: ${....data.traj_length}
     diffusion:
       ode: 1
       scheduler_type: DDIMScheduler

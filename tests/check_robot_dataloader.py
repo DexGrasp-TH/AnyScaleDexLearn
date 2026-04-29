@@ -1,40 +1,72 @@
-import sys
-import os
 import json
+import os
+import sys
+from pathlib import Path
 
+import hydra
 import numpy as np
 import torch
-import hydra
-from omegaconf import DictConfig
-from tqdm import trange
-from torch.utils.data import DataLoader
 import trimesh
-from pytorch3d.transforms import matrix_to_axis_angle, matrix_to_quaternion
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
 import pytorch_kinematics as pk
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from dexlearn.dataset import InfLoader, create_dataset, minkowski_collate_fn
+from dexlearn.dataset.grasp_types import GRASP_TYPES
+from dexlearn.network.models import *  # noqa: F401,F403
+from dexlearn.task.visualize import show_scenes_with_viser
+from dexlearn.utils.config import flatten_multidex_data_config
 from dexlearn.utils.logger import Logger
 from dexlearn.utils.util import set_seed
-from dexlearn.network.models import *
-
-from dexlearn.dataset import create_dataset, minkowski_collate_fn, InfLoader
-from dexlearn.dataset.grasp_types import GRASP_TYPES
-from manopth.manolayer import ManoLayer
 from mr_utils.robot.pk_helper import PytorchKinematicsHelper
 from mr_utils.robot.pk_visualizer import Visualizer
 
 
-@hydra.main(config_path="../config", config_name="base", version_base=None)
+def cfg_select(config: DictConfig, key: str, default):
+    value = OmegaConf.select(config, key)
+    return default if value is None else value
+
+
+def store_sample(batch_data, sample_idx):
+    sample = {}
+    for key, value in batch_data.items():
+        if torch.is_tensor(value):
+            sample[key] = value[sample_idx : sample_idx + 1].clone()
+        elif isinstance(value, list):
+            sample[key] = [value[sample_idx]]
+        else:
+            sample[key] = value
+    return sample
+
+
+def merge_samples(samples):
+    merged = {}
+    for key in samples[0]:
+        first_value = samples[0][key]
+        if torch.is_tensor(first_value):
+            merged[key] = torch.cat([sample[key] for sample in samples], dim=0)
+        elif isinstance(first_value, list):
+            merged[key] = [sample[key][0] for sample in samples]
+        else:
+            merged[key] = [sample[key] for sample in samples]
+    return merged
+
+
+@hydra.main(config_path="../dexlearn/config", config_name="base", version_base=None)
 def main(config: DictConfig) -> None:
     set_seed(config.seed)
-    logger = Logger(config)
+    Logger(config)
+    flatten_multidex_data_config(config.data)
 
     target_grasp_type_ids = [1, 2, 3, 4, 5]
     pending_samples = {}
-
     train_dataset = create_dataset(config, mode="train")
 
-    config.algo.batch_size = 4
+    config.algo.batch_size = int(cfg_select(config, "check_batch_size", 4))
     train_loader = InfLoader(
         DataLoader(
             train_dataset,
@@ -47,11 +79,8 @@ def main(config: DictConfig) -> None:
         config.device,
     )
 
-    # Load robot assets from the data config.
     urdf_path = config.data.robot_urdf_path
     mesh_dir_path = config.data.robot_mesh_dir_path
-
-    # Create robot model
     chain = pk.build_chain_from_urdf(open(urdf_path).read()).to(device=config.device)
     robot_helper = PytorchKinematicsHelper(
         chain,
@@ -85,57 +114,30 @@ def main(config: DictConfig) -> None:
         regularlization=1e-3,
     )
 
-    # Create serial chains and IK solvers for each wrist.
     for wrist_link_name in wrist_link_names:
         robot_helper.create_serial_chain(wrist_link_name)
         robot_helper.create_ik_solver(wrist_link_name, **ik_solver_kwargs)
 
-    def _store_sample(batch_data, sample_idx):
-        sample = {}
-        for key, value in batch_data.items():
-            if torch.is_tensor(value):
-                sample[key] = value[sample_idx : sample_idx + 1].clone()
-            elif isinstance(value, list):
-                sample[key] = [value[sample_idx]]
-            else:
-                sample[key] = value
-        return sample
-
-    def _merge_samples(samples):
-        merged = {}
-        for key in samples[0]:
-            first_value = samples[0][key]
-            if torch.is_tensor(first_value):
-                merged[key] = torch.cat([sample[key] for sample in samples], dim=0)
-            elif isinstance(first_value, list):
-                merged[key] = [sample[key][0] for sample in samples]
-            else:
-                merged[key] = [sample[key] for sample in samples]
-        return merged
-
-    for it in trange(0, config.algo.max_iter):
+    max_iter = int(cfg_select(config, "check_max_iter", config.algo.max_iter))
+    for _ in range(max_iter):
         data = train_loader.get()
         batch_size = data["grasp_type_id"].shape[0]
 
-        # Buffer one sample for each target grasp type so visualization follows a fixed
-        # repeating order such as 1, 2, 3, 4, 5 instead of the dataset's random sampling order.
         for i in range(batch_size):
             grasp_type_id = int(data["grasp_type_id"][i])
             if grasp_type_id in target_grasp_type_ids and grasp_type_id not in pending_samples:
-                pending_samples[grasp_type_id] = _store_sample(data, i)
+                pending_samples[grasp_type_id] = store_sample(data, i)
 
         if any(grasp_type_id not in pending_samples for grasp_type_id in target_grasp_type_ids):
             continue
 
         ordered_samples = [pending_samples[grasp_type_id] for grasp_type_id in target_grasp_type_ids]
-        data = _merge_samples(ordered_samples)
-        pending_samples = {}
+        data = merge_samples(ordered_samples)
         batch_size = len(target_grasp_type_ids)
 
-        # Extract hand poses for the whole batch.
-        right_trans = data["right_hand_trans"][:, 0, 1, ...]  # 1 refers to 'grasp_pose'
+        right_trans = data["right_hand_trans"][:, 0, 1, :]
         right_rot = data["right_hand_rot"][:, 0, 1, ...]
-        left_trans = data["left_hand_trans"][:, 0, 1, ...]
+        left_trans = data["left_hand_trans"][:, 0, 1, :]
         left_rot = data["left_hand_rot"][:, 0, 1, ...]
         right_joint = data["right_hand_joint"][:, 0, 1, ...]
         left_joint = data["left_hand_joint"][:, 0, 1, ...]
@@ -149,7 +151,6 @@ def main(config: DictConfig) -> None:
                 f"Left hand joint dim mismatch: expected {len(left_hand_indices)}, got {left_joint.shape[-1]}"
             )
 
-        # Build batched 4x4 transformation matrices.
         right_matrix = torch.eye(4, device=config.device, dtype=right_rot.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
         right_matrix[:, :3, :3] = right_rot
         right_matrix[:, :3, 3] = right_trans
@@ -158,7 +159,6 @@ def main(config: DictConfig) -> None:
         left_matrix[:, :3, :3] = left_rot
         left_matrix[:, :3, 3] = left_trans
 
-        # Solve IK for the whole batch.
         right_sol = robot_helper.solve_ik_batch(wrist_link_names[0], right_matrix)
         left_sol = robot_helper.solve_ik_batch(wrist_link_names[1], left_matrix)
 
@@ -173,34 +173,34 @@ def main(config: DictConfig) -> None:
         robot_pose[:, 7:] = combined_q.to(dtype=torch.float32)
         robot_visualizer.set_robot_parameters(robot_pose, joint_names=joint_names)
 
+        scene_records = []
         for i in range(batch_size):
             grasp_type_id = int(data["grasp_type_id"][i])
             grasp_type_name = GRASP_TYPES[grasp_type_id]
-            print(f"path: {data['path'][i]}  |  grasp_type: {grasp_type_name}")
-            print(f"Right IK converged: {right_sol['success'][i]}, Left IK converged: {left_sol['success'][i]}")
-
-            scene_elements = []
-            scene_elements.append(robot_visualizer.get_robot_trimesh_data(i=i, color=(180, 180, 220, 255)))
-
-            ############# Object pointcloud ##############
-            pc_np = data["point_clouds"][i, ...].cpu().numpy()
-            points = trimesh.points.PointCloud(pc_np, colors=[255, 165, 0, 255])  # Orange
-            scene_elements.append(points)
-
-            world_axis = trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3)
-            scene_elements.append(world_axis)
-
-            scene = trimesh.Scene(geometry=scene_elements)
-            scene.set_camera(
-                angles=(np.deg2rad(60.0), 0.0, np.deg2rad(45.0)),
-                distance=1.0,
-                center=scene.centroid,
+            caption = (
+                f"{i} | path: {data['path'][i]} | grasp_type: {grasp_type_name} | "
+                f"Right IK: {int(right_sol['success'][i])} | Left IK: {int(left_sol['success'][i])}"
             )
-            scene.show(caption=grasp_type_name)
+            print(caption)
 
-            a = 1
+            scene_elements = [
+                robot_visualizer.get_robot_trimesh_data(i=i, color=(180, 180, 220, 255)),
+                trimesh.points.PointCloud(data["point_clouds"][i, ...].cpu().numpy(), colors=[255, 165, 0, 255]),
+                trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3),
+            ]
+            scene_records.append({"elements": scene_elements, "caption": caption, "smooth": False})
 
-    return
+        show_scenes_with_viser(
+            scene_records,
+            port=int(cfg_select(config, "viser_port", 8080)),
+            scene_spacing=float(cfg_select(config, "viser_scene_spacing", 1.0)),
+            display_mode=str(cfg_select(config, "viser_display_mode", "all")),
+            scene_id=int(cfg_select(config, "viser_scene_id", 0)),
+            log_prefix="check_robot_dataloader",
+        )
+        return
+
+    raise RuntimeError(f"Could not collect all target grasp types {target_grasp_type_ids} within {max_iter} iterations.")
 
 
 if __name__ == "__main__":
