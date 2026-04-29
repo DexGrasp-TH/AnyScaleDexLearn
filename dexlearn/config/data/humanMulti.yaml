@@ -1,21 +1,40 @@
-human: True
+human: true
 dataset_type: HumanMultiDexDataset
-num_workers: 10
 
-num_points: 1024
-traj_length: 3
-joint_num: 16
+runtime:
+  num_workers: 10
 
-pc_centering: True
-rotation_aug: True
-hand_pos_source: index_mcp # "wrist" or "index_mcp"
+paths:
+  grasp_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/grasp
+  object_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/object
+  split_path: valid_split
+  pc_path: vision_data/complete_pc
 
-grasp_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/grasp
-object_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/object
-split_path: valid_split   # relative to object_path
-pc_path: vision_data/complete_pc    # relative to object_path
-load_mano_params: False
+point_cloud:
+  num_points: 1024
 
-test_split: test
-test_scene_cfg: ["**/*.npy", "*.npy"]
-mini_test: False
+augmentation:
+  pc_centering: true
+  z_rotation: true
+  xy_rotation:
+    enabled: true
+    max_angle_deg: 10.0
+  translation:
+    enabled: true
+    range: 0.02
+  pc_noise:
+    enabled: true
+    scale: 0.003
+
+human_hand:
+  position_source: index_mcp # wrist or index_mcp
+  load_mano_params: false
+
+# Compatibility aliases for command-line overrides and older call sites.
+hand_pos_source: ${.human_hand.position_source}
+load_mano_params: ${.human_hand.load_mano_params}
+
+test:
+  split: test
+  scene_cfg: ["**/*.npy", "*.npy"]
+  mini: false

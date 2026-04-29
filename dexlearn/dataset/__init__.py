@@ -14,16 +14,19 @@ from .human_dex import HumanDexDataset
 from .human_bidex import HumanBiDexDataset
 from .human_multidex import HumanMultiDexDataset
 from .robot_multidex import RobotMultiDexDataset
+from dexlearn.utils.config import cfg_get, flatten_multidex_data_config
 
 
 def create_dataset(config, mode):
     sp_voxel_size = config.algo.model.backbone.voxel_size if "MinkUNet" in config.algo.model.backbone.name else None
 
     data_config = config.data if mode != "test" else config.test_data
+    flatten_multidex_data_config(data_config)
 
-    if isinstance(data_config.object_path, ListConfig):
+    object_path = cfg_get(data_config, "object_path", "paths.object_path")
+    if isinstance(object_path, ListConfig):
         dataset_lst = []
-        for p in data_config.object_path:
+        for p in object_path:
             new_data_config = deepcopy(data_config)
             new_data_config.object_path = p
             single_dataset = eval(data_config.dataset_type)(new_data_config, mode, sp_voxel_size)

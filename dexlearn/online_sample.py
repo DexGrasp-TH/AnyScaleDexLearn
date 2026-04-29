@@ -13,12 +13,14 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.logger import Logger
 from dexlearn.utils.util import set_seed
+from dexlearn.utils.config import flatten_multidex_data_config
 from dexlearn.dataset import create_test_dataloader
 from dexlearn.dataset import minkowski_collate_fn
 from dexlearn.network.models import *
 
 def main_func(config: DictConfig) -> None:
     set_seed(config.seed)
+    flatten_multidex_data_config(config.data)
     config.wandb.mode = "disabled"
     logger = Logger(config)
 

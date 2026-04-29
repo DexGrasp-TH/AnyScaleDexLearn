@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 
 from dexlearn.utils.util import load_json
 from dexlearn.utils.rot import numpy_quaternion_to_matrix
+from dexlearn.utils.config import flatten_multidex_data_config
 from .grasp_types import GRASP_TYPES
 
 # Fixed left hand pose for right-only grasps
@@ -19,6 +20,7 @@ class RobotMultiDexDataset(Dataset):
     """Dataset for robot bimanual grasps with multiple grasp types."""
 
     def __init__(self, config: dict, mode: str, sc_voxel_size: float = None):
+        flatten_multidex_data_config(config)
         self.config = config
         self.sc_voxel_size = sc_voxel_size
         self.mode = mode
@@ -245,6 +247,9 @@ class RobotMultiDexDataset(Dataset):
         if self.mode == "train" and getattr(self.config, "rotation_aug", False):
             pc = self._apply_rotation_aug(pc, ret_dict)
 
+        if self.mode == "train" and getattr(self.config, "pc_noise_aug", False):
+            pc = self._apply_pc_noise_aug(pc)
+
         ret_dict["point_clouds"] = pc
         ret_dict["grasp_type_id"] = int(rand_grasp_type.split("_")[0])
         if self.sc_voxel_size is not None:
@@ -390,3 +395,11 @@ class RobotMultiDexDataset(Dataset):
                 ret_dict[f"{side}_hand_rot"] = rot_z @ ret_dict[f"{side}_hand_rot"]
 
         return pc
+
+    def _apply_pc_noise_aug(self, pc):
+        """Add zero-mean Gaussian noise to object points during training."""
+        noise_scale = float(getattr(self.config, "pc_noise_scale", 0.0))
+        if noise_scale <= 0.0:
+            return pc.astype(np.float32, copy=False)
+        noise = np.random.normal(loc=0.0, scale=noise_scale, size=pc.shape).astype(np.float32)
+        return pc.astype(np.float32, copy=False) + noise

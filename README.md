@@ -68,6 +68,7 @@ DexLearn trains and evaluates grasp generation models for human-hand and robot-h
    pip install -e .
    pip install hydra-core
    pip install trimesh
+   pip install viser
    pip install 'pyglet<2'
    pip install chumpy --no-build-isolation
    pip install opencv-python
@@ -107,7 +108,7 @@ Availabel configs for robot workflow:
 
 - Training checkpoints are saved under `output/<data>_<algo>_<exp_name>/ckpts/`
 - Sampled results are saved under `output/<data>_<algo>_<exp_name>/tests/step_<ckpt>/`
-- `visualize_robot` reads sampled robot grasps from the corresponding `tests` directory
+- `visualize` reads sampled grasps from the corresponding `tests` directory
 
 ## Robot Workflow
 
@@ -116,7 +117,7 @@ Availabel configs for robot workflow:
 Inspect robot dataloader samples before training or debugging. The script buffers samples so visualization follows a fixed grasp-type order such as `1 2 3 4 5`, then `1 2 3 4 5` again when available.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python dexlearn/scripts/check_robot_dataloader.py data=<DATA_NAME> exp_name=<EXP_NAME>
+CUDA_VISIBLE_DEVICES=0 python tests/check_robot_dataloader.py data=<DATA_NAME> exp_name=<EXP_NAME>
 ```
 
 ### Train
@@ -137,12 +138,20 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample algo=robotMultiHierar
 
 ### Visualize
 
-Visualize sampled robot grasps. Saved results are reordered by predicted grasp type so the viewer shows one grasp from each type in sequence, for example `1 2 3 4 5`, then `1 2 3 4 5` again when available.
+Visualize sampled robot grasps. The current visualization sampler is controlled by `task.visualize_mode`; the old group-balanced grasp-type cycling behavior is deprecated.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize_robot algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
 
-# e.g., python dexlearn/main.py task=visualize_robot algo=robotMultiHierar data=leapMulti test_data=leapMulti exp_name=dataset_full_1
+# e.g., python dexlearn/main.py task=visualize algo=robotMultiHierar data=leapMulti test_data=leapMulti exp_name=dataset_full_1
+
+# Web visualizer. The browser UI can switch views and apply object or grasp-type selections.
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize task.visualizer=viser algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
+
+# New sample selection modes.
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize task.visualize_mode=random_object task.max_grasps=20 algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize task.visualize_mode=one_object task.object_id=<OBJECT_ID> task.max_grasps=20 algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize task.visualize_mode=grasp_type task.target_grasp_type_id=<1-5> task.max_grasps=20 algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
 ```
 
 ### Stat
@@ -170,9 +179,9 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=human_preprocess data=humanM
 Inspect human dataloader samples after preprocessing and before training. This visualization follows the configured `hand_pos_source` in `dexlearn/config/data/humanMulti.yaml`.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python dexlearn/scripts/check_human_dataloader.py data=humanMulti data.hand_pos_source=<wrist/index_mcp> exp_name=<EXP_NAME> 
+CUDA_VISIBLE_DEVICES=0 python tests/check_human_dataloader.py data=humanMulti data.hand_pos_source=<wrist/index_mcp> exp_name=<EXP_NAME> 
 
-# e.g.: CUDA_VISIBLE_DEVICES=0 python dexlearn/scripts/check_human_dataloader.py data=humanMulti data.hand_pos_source=index_mcp exp_name=debug1
+# e.g.: CUDA_VISIBLE_DEVICES=0 python tests/check_human_dataloader.py data=humanMulti data.hand_pos_source=index_mcp exp_name=debug1
 ```
 
 ### Train
@@ -195,7 +204,24 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanMulti algo=
 ### Visualize
 
 ```bash
-python dexlearn/main.py task=visualize_human task=visualize_human data=humanMulti algo=humanMultiHierar test_data=<TEST_DATA> exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize data=humanMulti algo=humanMultiHierar test_data=<TEST_DATA> exp_name=<EXP_NAME>
 
-# e.g, python dexlearn/main.py task=visualize_human task=visualize_human data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<EXP_NAME>
+# e.g, python dexlearn/main.py task=visualize data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<EXP_NAME>
+
+# Web visualizer with multi-scene layout and runtime object or grasp-type selection.
+python dexlearn/main.py task=visualize task.visualizer=viser task.viser_port=8080 task.viser_display_mode=single task.viser_scene_id=0 data=humanMulti algo=humanMultiHierar test_data=<TEST_DATA> exp_name=<EXP_NAME>
+
+# New sample selection modes.
+python dexlearn/main.py task=visualize task.visualize_mode=random_object task.max_grasps=20 data=humanMulti algo=humanMultiHierar test_data=<TEST_DATA> exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize task.visualize_mode=one_object task.object_id=<OBJECT_ID> task.max_grasps=20 data=humanMulti algo=humanMultiHierar test_data=<TEST_DATA> exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize task.visualizer=viser task.visualize_mode=one_object_multi_seq task.object_id=obj_0_seq_0 task.max_grasps=20 data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<EXP_NAME>
+python dexlearn/main.py task=visualize task.visualize_mode=grasp_type task.target_grasp_type_id=<1-5> task.max_grasps=20 data=humanMulti algo=humanMultiHierar test_data=<TEST_DATA> exp_name=<EXP_NAME>
+```
+
+### Stat
+
+Compute summary statistics for sampled human grasps.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=stat algo=humanMultiHierar data=humanMulti test_data=humanMulti exp_name=<EXP_NAME>
 ```

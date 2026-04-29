@@ -1,0 +1,18 @@
+# Nearest-neighbor overfit diagnostic for human sampled grasps.
+
+# Normalize translation and rotation before combining them into the NN score.
+trans_ref_m: 0.02
+rot_ref_deg: 10.0
+
+# Rows under both thresholds are counted as near-copies in the printed summary.
+near_copy_trans_m: 0.01
+near_copy_rot_deg: 5.0
+
+# Printed grouping key from the output rows.
+group_by: sample_canonical_object_id
+
+# Set >0 for a quick partial run.
+max_sample_files: 0
+
+# Empty means write to <sample_output_dir>/overfit_nearest_train_grasp.csv.
+output_csv:
