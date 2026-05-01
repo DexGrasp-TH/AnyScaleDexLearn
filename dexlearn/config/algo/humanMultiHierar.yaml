@@ -1,7 +1,7 @@
 human: True
 
 batch_size: 256
-max_iter: 50000
+max_iter: 20000
 lr: 0.001
 lr_min: 0.0001
 log_every: 10

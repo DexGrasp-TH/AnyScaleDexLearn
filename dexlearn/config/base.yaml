@@ -46,5 +46,9 @@ timing:
   enabled: false
   cuda_sync: true
 
-
+model_registry:
+  enabled: true
+  path: docs/trained_models.md
+  # Optional short note supplied by CLI override, e.g. model_registry.key_features="debug7 + scale aug".
+  key_features:
 

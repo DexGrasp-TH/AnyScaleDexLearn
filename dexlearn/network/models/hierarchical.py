@@ -22,6 +22,12 @@ class HierarchicalModel(torch.nn.Module):
         # Grasp type embedding for diffusion conditioning
         self.grasp_type_emb = eval(cfg.grasp_type_emb.name)(cfg.grasp_type_emb)
 
+        type_loss_weights = getattr(cfg, "type_loss_weights", None)
+        if type_loss_weights is not None:
+            self.register_buffer("type_loss_weights", torch.tensor(type_loss_weights, dtype=torch.float32), persistent=False)
+        else:
+            self.type_loss_weights = None
+
         # Diffusion head
         cfg.head.in_feat_dim = cfg.backbone.out_feat_dim + cfg.grasp_type_emb.out_feat_dim
         self.output_head = eval(cfg.head.name)(cfg.head)
@@ -42,9 +48,9 @@ class HierarchicalModel(torch.nn.Module):
         # Exclude type 0 from loss calculation
         if (gt_type == 0).any():
             raise ValueError("Training data contains grasp_type_id = 0, which should not be used for training")
-        result_dict["loss_type"] = F.cross_entropy(type_logits_expanded, gt_type)
+        result_dict["loss_type"] = F.cross_entropy(type_logits_expanded, gt_type, weight=self.type_loss_weights)
 
-        # Generate wrist poses conditioned on object feature and GT grasp type
+        # Generate wrist poses conditioned on object feature and GT grasp type.
         global_feature_expanded = repeat(global_feature, "b c -> (b t) c", t=sample_num)
         grasp_type_id = repeat(data["grasp_type_id"], "b -> (b t)", t=sample_num)
         cond_feat = torch.cat([global_feature_expanded, self.grasp_type_emb(grasp_type_id)], dim=-1)

@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import re
+from collections import Counter
 from copy import deepcopy
 from glob import glob
 
@@ -56,6 +57,7 @@ MIRROR = np.diag([-1.0, 1.0, 1.0]).astype(np.float32)
 FIXED_LEFT_HAND_TRANS = np.array([0.0, 0.0, -0.5], dtype=np.float32)
 FIXED_LEFT_HAND_ROT = np.eye(3, dtype=np.float32)
 VALID_HAND_POS_SOURCES = {"wrist", "index_mcp"}
+TARGET_GRASP_TYPE_IDS = (1, 2, 3, 4, 5)
 
 
 def load_json(path: str):
@@ -151,12 +153,18 @@ def canonical_object_id(object_name: str) -> str:
     """Infer a stable object id by removing common sequence suffixes.
 
     Args:
-        object_name: Object or sequence name such as ``obj_0_seq_3``.
+        object_name: Object or sequence name such as ``obj_0_seq_3`` or
+            ``obj_0/seq_3``.
 
     Returns:
         Canonical object id, for example ``obj_0`` for ``obj_0_seq_3``.
     """
-    base_name = os.path.basename(str(object_name))
+    normalized_name = str(object_name).strip().replace("\\", "/").strip("/")
+    parts = [part for part in normalized_name.split("/") if part]
+    if len(parts) >= 2 and re.match(r"^seq[_-]?\d+.*$", parts[-1]):
+        base_name = parts[-2]
+    else:
+        base_name = os.path.basename(normalized_name)
     return re.sub(r"([_-]seq[_-]?\d+.*)$", "", base_name)
 
 
@@ -366,6 +374,22 @@ def sample_pose_records(sample_path: str) -> list:
     ]
 
 
+def load_sample_records(sample_files: list) -> list:
+    """Load all comparable sampled pose records from saved sample files.
+
+    Args:
+        sample_files: List of saved sample ``.npy`` paths.
+
+    Returns:
+        List of comparable sampled pose records. Files without ``grasp_pose`` are
+        skipped because this task is specific to human sampled grasps.
+    """
+    records = []
+    for sample_file in sample_files:
+        records.extend(sample_pose_records(sample_file))
+    return records
+
+
 def active_sides(grasp_type_id: int) -> tuple:
     """Return sides that should contribute to pose distance.
 
@@ -537,41 +561,35 @@ def write_csv(rows: list, csv_path: str) -> None:
     print(f"\n[overfit_nn] Wrote nearest-neighbor rows to {csv_path}")
 
 
-def task_overfit_nn(config) -> None:
-    """Hydra task entry point for sampled-to-training nearest-neighbor analysis.
+def run_nearest_neighbor_analysis(
+    train_records: list,
+    sample_records: list,
+    task_cfg,
+    sample_dir: str,
+) -> list:
+    """Run sampled-to-training nearest-neighbor pose overfit analysis.
 
     Args:
-        config: Full Hydra config for the current AnyScaleDexLearn run.
+        train_records: Comparable training pose records.
+        sample_records: Comparable sampled pose records.
+        task_cfg: Hydra task config containing thresholds and output settings.
+        sample_dir: Directory containing saved sample results.
 
     Returns:
-        None.
+        Per-sample nearest-neighbor result rows.
     """
-    flatten_multidex_data_config(config.data)
-    flatten_multidex_data_config(config.test_data)
-    task_cfg = config.task
     trans_ref_m = float(getattr(task_cfg, "trans_ref_m", 0.02))
     rot_ref_deg = float(getattr(task_cfg, "rot_ref_deg", 10.0))
-    max_sample_files = int(getattr(task_cfg, "max_sample_files", 0))
     group_key = str(getattr(task_cfg, "group_by", "sample_canonical_object_id"))
-
-    train_records = load_training_records(config)
     train_by_object = grouped_candidates(train_records, "object_name")
     train_by_canonical = grouped_candidates(train_records, "canonical_object_id")
 
-    sample_dir = get_sample_output_dir(config)
-    sample_files = sorted(glob(os.path.join(sample_dir, "**/*.npy"), recursive=True))
-    if max_sample_files > 0:
-        sample_files = sample_files[:max_sample_files]
-    print(f"[overfit_nn] Loaded {len(train_records)} training records.")
-    print(f"[overfit_nn] Found {len(sample_files)} sampled result files in {sample_dir}")
-
     rows = []
-    for sample_file in sample_files:
-        for sample_record in sample_pose_records(sample_file):
-            candidates = train_by_object.get(sample_record["object_name"])
-            if not candidates:
-                candidates = train_by_canonical.get(sample_record["canonical_object_id"], train_records)
-            rows.append(nearest_train_record(sample_record, candidates, trans_ref_m, rot_ref_deg))
+    for sample_record in sample_records:
+        candidates = train_by_object.get(sample_record["object_name"])
+        if not candidates:
+            candidates = train_by_canonical.get(sample_record["canonical_object_id"], train_records)
+        rows.append(nearest_train_record(sample_record, candidates, trans_ref_m, rot_ref_deg))
 
     summarize_rows(
         rows,
@@ -585,3 +603,622 @@ def task_overfit_nn(config) -> None:
     if not output_csv:
         output_csv = os.path.join(sample_dir, "overfit_nearest_train_grasp.csv")
     write_csv(rows, output_csv)
+    return rows
+
+
+def count_grasp_types_by_object(records: list) -> dict:
+    """Count grasp types for each canonical object.
+
+    Args:
+        records: Training or sampled records containing ``canonical_object_id``
+            and ``grasp_type_id``.
+
+    Returns:
+        Mapping ``canonical_object_id -> Counter({grasp_type_id: count})``.
+    """
+    grouped_counts = {}
+    for record in records:
+        object_id = record["canonical_object_id"]
+        grasp_type_id = int(record["grasp_type_id"])
+        grouped_counts.setdefault(object_id, Counter())[grasp_type_id] += 1
+    return grouped_counts
+
+
+def counter_total(counter: Counter, type_ids=TARGET_GRASP_TYPE_IDS) -> int:
+    """Count valid grasp-type entries in a counter.
+
+    Args:
+        counter: Grasp-type counter.
+        type_ids: Type ids included in the valid distribution.
+
+    Returns:
+        Sum of counts for valid type ids.
+    """
+    return int(sum(int(counter.get(type_id, 0)) for type_id in type_ids))
+
+
+def counter_probs(counter: Counter, type_ids=TARGET_GRASP_TYPE_IDS) -> np.ndarray:
+    """Convert a grasp-type counter into a probability vector.
+
+    Args:
+        counter: Grasp-type counter.
+        type_ids: Ordered type ids used for the vector.
+
+    Returns:
+        Probability vector. Empty counters return zeros.
+    """
+    counts = np.asarray([counter.get(type_id, 0) for type_id in type_ids], dtype=np.float64)
+    total = counts.sum()
+    return counts / total if total > 0 else np.zeros_like(counts)
+
+
+def dominant_type(counter: Counter, type_ids=TARGET_GRASP_TYPE_IDS):
+    """Find the most frequent valid grasp type.
+
+    Args:
+        counter: Grasp-type counter.
+        type_ids: Valid type ids to compare.
+
+    Returns:
+        Dominant type id, or ``None`` if there are no valid counts.
+    """
+    valid_counts = [(type_id, int(counter.get(type_id, 0))) for type_id in type_ids]
+    valid_counts = [item for item in valid_counts if item[1] > 0]
+    if not valid_counts:
+        return None
+    return max(valid_counts, key=lambda item: (item[1], -item[0]))[0]
+
+
+def total_variation_distance(counter_a: Counter, counter_b: Counter, type_ids=TARGET_GRASP_TYPE_IDS) -> float:
+    """Compute total variation distance between two grasp-type distributions.
+
+    Args:
+        counter_a: First grasp-type counter.
+        counter_b: Second grasp-type counter.
+        type_ids: Type ids included in the distribution.
+
+    Returns:
+        Total variation distance in ``[0, 1]``.
+    """
+    return float(0.5 * np.abs(counter_probs(counter_a, type_ids) - counter_probs(counter_b, type_ids)).sum())
+
+
+def format_counter(counter: Counter, type_ids=TARGET_GRASP_TYPE_IDS) -> str:
+    """Format grasp-type counts as a compact string.
+
+    Args:
+        counter: Grasp-type counter.
+        type_ids: Type ids to include.
+
+    Returns:
+        String like ``1:3 2:0 3:1 4:0 5:0``.
+    """
+    return " ".join(f"{type_id}:{int(counter.get(type_id, 0))}" for type_id in type_ids)
+
+
+def type_percentage(counter: Counter, type_id: int, type_ids=TARGET_GRASP_TYPE_IDS) -> float:
+    """Compute one grasp type's percentage within a counter.
+
+    Args:
+        counter: Grasp-type counter.
+        type_id: Grasp type id whose percentage should be computed.
+        type_ids: Type ids included in the denominator.
+
+    Returns:
+        Percentage in ``[0, 100]``. Empty counters return ``0.0``.
+    """
+    total = counter_total(counter, type_ids)
+    if total <= 0:
+        return 0.0
+    return float(counter.get(type_id, 0) / total * 100.0)
+
+
+def format_percentages(counter: Counter, type_ids=TARGET_GRASP_TYPE_IDS) -> str:
+    """Format grasp-type percentages as a compact string.
+
+    Args:
+        counter: Grasp-type counter.
+        type_ids: Type ids to include.
+
+    Returns:
+        String like ``1:75.00% 2:0.00% 3:25.00% 4:0.00% 5:0.00%``.
+    """
+    return " ".join(f"{type_id}:{type_percentage(counter, type_id, type_ids):.2f}%" for type_id in type_ids)
+
+
+def global_type_summary(records: list) -> Counter:
+    """Count global grasp types across records.
+
+    Args:
+        records: Training or sampled records.
+
+    Returns:
+        Global grasp-type counter.
+    """
+    counter = Counter()
+    for record in records:
+        counter[int(record["grasp_type_id"])] += 1
+    return counter
+
+
+def build_distribution_rows(train_records: list, sample_records: list) -> list:
+    """Build per-object grasp-type distribution comparison rows.
+
+    Args:
+        train_records: Comparable training records.
+        sample_records: Comparable sampled records.
+
+    Returns:
+        Rows comparing train and sample distributions for each canonical object.
+    """
+    train_counts = count_grasp_types_by_object(train_records)
+    sample_counts = count_grasp_types_by_object(sample_records)
+    all_object_ids = sorted(set(train_counts) | set(sample_counts))
+    rows = []
+    for object_id in all_object_ids:
+        train_counter = train_counts.get(object_id, Counter())
+        sample_counter = sample_counts.get(object_id, Counter())
+        row = {
+            "canonical_object_id": object_id,
+            "train_total": counter_total(train_counter),
+            "sample_total": counter_total(sample_counter),
+            "train_dominant_type": dominant_type(train_counter),
+            "sample_dominant_type": dominant_type(sample_counter),
+            "dominant_type_match": dominant_type(train_counter) == dominant_type(sample_counter),
+            "type_tv_distance": total_variation_distance(train_counter, sample_counter),
+            "train_counts": format_counter(train_counter),
+            "sample_counts": format_counter(sample_counter),
+            "train_percentages": format_percentages(train_counter),
+            "sample_percentages": format_percentages(sample_counter),
+        }
+        for type_id in TARGET_GRASP_TYPE_IDS:
+            row[f"train_type_{type_id}"] = int(train_counter.get(type_id, 0))
+            row[f"sample_type_{type_id}"] = int(sample_counter.get(type_id, 0))
+            row[f"train_type_{type_id}_percent"] = type_percentage(train_counter, type_id)
+            row[f"sample_type_{type_id}_percent"] = type_percentage(sample_counter, type_id)
+        rows.append(row)
+    return rows
+
+
+def print_grasp_type_counter(title: str, counter: Counter) -> None:
+    """Print one global grasp-type distribution.
+
+    Args:
+        title: Printed section title.
+        counter: Grasp-type counter.
+
+    Returns:
+        None.
+    """
+    total = counter_total(counter)
+    print(f"\n{title}:")
+    print(f"  Total valid grasps: {total}")
+    print(f"  {'type':<8} {'count':>8} {'percent':>9}")
+    for type_id in TARGET_GRASP_TYPE_IDS:
+        count = int(counter.get(type_id, 0))
+        percent = count / total * 100.0 if total else 0.0
+        print(f"  {type_id:<8} {count:>8} {percent:>8.2f}%")
+    invalid_count = sum(count for type_id, count in counter.items() if type_id not in TARGET_GRASP_TYPE_IDS)
+    if invalid_count:
+        print(f"  invalid    {invalid_count:>8}")
+
+
+def summarize_distribution_rows(rows: list, top_k: int) -> None:
+    """Print per-object train/sample grasp-type distribution comparison.
+
+    Args:
+        rows: Per-object distribution comparison rows.
+        top_k: Number of highest-distance objects to print.
+
+    Returns:
+        None.
+    """
+    print("\nGrasp-type distribution by canonical object:")
+    if not rows:
+        print("  No rows.")
+        return
+
+    train_objects = [row for row in rows if row["train_total"] > 0]
+    sample_objects = [row for row in rows if row["sample_total"] > 0]
+    common_rows = [row for row in rows if row["train_total"] > 0 and row["sample_total"] > 0]
+    missing_sample = [row for row in rows if row["train_total"] > 0 and row["sample_total"] == 0]
+    sample_only = [row for row in rows if row["train_total"] == 0 and row["sample_total"] > 0]
+
+    print(f"  Train objects: {len(train_objects)}")
+    print(f"  Sample objects: {len(sample_objects)}")
+    print(f"  Common objects: {len(common_rows)}")
+    print(f"  Train objects without samples: {len(missing_sample)}")
+    print(f"  Sample objects absent from train: {len(sample_only)}")
+
+    if common_rows:
+        tv_values = np.asarray([row["type_tv_distance"] for row in common_rows], dtype=np.float64)
+        dominant_matches = [row for row in common_rows if row["dominant_type_match"]]
+        print(f"  Mean TV distance: {tv_values.mean():.4f}")
+        print(f"  Median TV distance: {np.median(tv_values):.4f}")
+        print(f"  Max TV distance: {tv_values.max():.4f}")
+        print(
+            f"  Dominant type match: {len(dominant_matches)}/{len(common_rows)} "
+            f"({len(dominant_matches) / len(common_rows) * 100.0:.1f}%)"
+        )
+
+    top_rows = sorted(common_rows, key=lambda row: row["type_tv_distance"], reverse=True)[: max(0, int(top_k))]
+    if top_rows:
+        print(f"\nTop {len(top_rows)} objects with largest train/sample type-distribution gap:")
+        print(
+            f"  {'object':<28} {'train_n':>8} {'sample_n':>8} {'tv':>7} "
+            f"{'train_dom':>9} {'sample_dom':>10}  train_counts -> sample_counts"
+        )
+        for row in top_rows:
+            print(
+                f"  {str(row['canonical_object_id'])[:28]:<28} "
+                f"{row['train_total']:>8} {row['sample_total']:>8} {row['type_tv_distance']:>7.3f} "
+                f"{str(row['train_dominant_type']):>9} {str(row['sample_dominant_type']):>10}  "
+                f"{row['train_counts']} -> {row['sample_counts']}"
+            )
+
+
+def write_distribution_csv(rows: list, csv_path: str) -> None:
+    """Write per-object grasp-type distribution rows to a CSV file.
+
+    Args:
+        rows: Per-object distribution comparison rows.
+        csv_path: Destination CSV path.
+
+    Returns:
+        None.
+    """
+    if not rows:
+        print("[overfit_nn] No distribution rows to write.")
+        return
+    csv_dir = os.path.dirname(csv_path)
+    if csv_dir:
+        os.makedirs(csv_dir, exist_ok=True)
+    fieldnames = list(rows[0].keys())
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\n[overfit_nn] Wrote grasp-type distribution rows to {csv_path}")
+
+
+def run_grasp_type_distribution_analysis(
+    train_records: list,
+    sample_records: list,
+    task_cfg,
+    sample_dir: str,
+) -> list:
+    """Compare train and sample grasp-type distributions per canonical object.
+
+    Args:
+        train_records: Comparable training records.
+        sample_records: Comparable sampled records.
+        task_cfg: Hydra task config containing output settings.
+        sample_dir: Directory containing saved sample results.
+
+    Returns:
+        Per-object distribution comparison rows.
+    """
+    print_grasp_type_counter("Global train grasp-type distribution", global_type_summary(train_records))
+    print_grasp_type_counter("Global sampled grasp-type distribution", global_type_summary(sample_records))
+
+    rows = build_distribution_rows(train_records, sample_records)
+    summarize_distribution_rows(rows, top_k=int(getattr(task_cfg, "distribution_top_k", 20)))
+
+    output_csv_value = getattr(task_cfg, "distribution_output_csv", "")
+    output_csv = "" if output_csv_value is None else str(output_csv_value)
+    if not output_csv:
+        output_csv = os.path.join(sample_dir, "grasp_type_distribution_by_object.csv")
+    write_distribution_csv(rows, output_csv)
+    return rows
+
+
+def records_by_canonical_object(records: list) -> dict:
+    """Group comparable records by canonical object id.
+
+    Args:
+        records: Training or sampled pose records.
+
+    Returns:
+        Mapping from canonical object id to records.
+    """
+    groups = {}
+    for record in records:
+        groups.setdefault(record["canonical_object_id"], []).append(record)
+    return groups
+
+
+def parse_object_id_list(value) -> list:
+    """Normalize object-id config values into a list.
+
+    Args:
+        value: String, list-like value, or ``None`` from Hydra config.
+
+    Returns:
+        List of non-empty canonical object ids.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, ListConfig)):
+        raw_values = value
+    else:
+        raw_values = str(value).split(",")
+    return [canonical_object_id(item) for item in raw_values if str(item).strip()]
+
+
+def select_object_analysis_ids(train_records: list, sample_records: list, task_cfg) -> list:
+    """Select canonical object ids for object-specific NN analysis.
+
+    Args:
+        train_records: Comparable training records.
+        sample_records: Comparable sampled records.
+        task_cfg: Hydra task config with optional object-analysis settings.
+
+    Returns:
+        Canonical object ids to analyze. Explicit config values are used first;
+        otherwise the objects with the most sampled records are selected.
+    """
+    object_ids = []
+    object_ids.extend(parse_object_id_list(getattr(task_cfg, "object_analysis_object_id", "")))
+    object_ids.extend(parse_object_id_list(getattr(task_cfg, "object_analysis_object_ids", [])))
+    if object_ids:
+        return list(dict.fromkeys(object_ids))
+
+    train_groups = records_by_canonical_object(train_records)
+    sample_groups = records_by_canonical_object(sample_records)
+    common_ids = sorted(set(train_groups) & set(sample_groups))
+    top_k = int(getattr(task_cfg, "object_analysis_top_k", 5))
+    ranked_ids = sorted(
+        common_ids,
+        key=lambda object_id: (len(sample_groups[object_id]), len(train_groups[object_id]), object_id),
+        reverse=True,
+    )
+    return ranked_ids[: max(0, top_k)]
+
+
+def nearest_training_distance_for_object(
+    sample_record: dict,
+    train_records: list,
+    trans_ref_m: float,
+    rot_ref_deg: float,
+    same_type_only: bool,
+) -> dict:
+    """Find a sample's nearest training grasp inside one canonical object.
+
+    Args:
+        sample_record: One sampled pose record.
+        train_records: Training pose records from the same canonical object.
+        trans_ref_m: Translation scale used to normalize the score.
+        rot_ref_deg: Rotation scale used to normalize the score.
+        same_type_only: Whether to search only training grasps with the same
+            grasp type as the sampled grasp.
+
+    Returns:
+        Joined nearest-neighbor row for object-specific analysis.
+    """
+    candidates = train_records
+    if same_type_only:
+        same_type_candidates = [
+            record for record in train_records if int(record["grasp_type_id"]) == int(sample_record["grasp_type_id"])
+        ]
+        if same_type_candidates:
+            candidates = same_type_candidates
+
+    row = nearest_train_record(sample_record, candidates, trans_ref_m, rot_ref_deg)
+    row["same_type_only"] = bool(same_type_only)
+    row["used_same_type_candidates"] = bool(
+        same_type_only and int(row["sample_grasp_type_id"]) == int(row["nearest_train_grasp_type_id"])
+    )
+    return row
+
+
+def percentile_summary(values: np.ndarray) -> dict:
+    """Compute compact percentiles for a one-dimensional numeric array.
+
+    Args:
+        values: Numeric values.
+
+    Returns:
+        Dictionary with mean and selected percentiles.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(values.mean()),
+        "p05": float(np.percentile(values, 5)),
+        "p25": float(np.percentile(values, 25)),
+        "p50": float(np.percentile(values, 50)),
+        "p75": float(np.percentile(values, 75)),
+        "p95": float(np.percentile(values, 95)),
+    }
+
+
+def print_object_specific_summary(
+    object_id: str,
+    object_rows: list,
+    train_count: int,
+    sample_count: int,
+    near_copy_trans_m: float,
+    near_copy_rot_deg: float,
+    novel_trans_m: float,
+    novel_rot_deg: float,
+) -> None:
+    """Print object-specific NN overfit and novelty statistics.
+
+    Args:
+        object_id: Canonical object id being analyzed.
+        object_rows: Per-sample nearest-neighbor rows for this object.
+        train_count: Number of training grasps for this object.
+        sample_count: Number of sampled grasps for this object.
+        near_copy_trans_m: Translation threshold for near-copy classification.
+        near_copy_rot_deg: Rotation threshold for near-copy classification.
+        novel_trans_m: Translation threshold for novel classification.
+        novel_rot_deg: Rotation threshold for novel classification.
+
+    Returns:
+        None.
+    """
+    print(f"\nObject-specific NN analysis: {object_id}")
+    print(f"  Training grasps: {train_count}")
+    print(f"  Sampled grasps: {sample_count}")
+    if not object_rows:
+        print("  No comparable sampled rows for this object.")
+        return
+
+    trans_values = np.asarray([row["trans_m"] for row in object_rows], dtype=np.float64)
+    rot_values = np.asarray([row["rot_deg"] for row in object_rows], dtype=np.float64)
+    near_copy_rows = [
+        row for row in object_rows if row["trans_m"] <= near_copy_trans_m and row["rot_deg"] <= near_copy_rot_deg
+    ]
+    novel_rows = [row for row in object_rows if row["trans_m"] >= novel_trans_m or row["rot_deg"] >= novel_rot_deg]
+
+    print(
+        f"  Near-copy rows: {len(near_copy_rows)}/{len(object_rows)} "
+        f"({len(near_copy_rows) / len(object_rows) * 100.0:.1f}%) "
+        f"with trans <= {near_copy_trans_m:.4f} m and rot <= {near_copy_rot_deg:.2f} deg"
+    )
+    print(
+        f"  Novel rows: {len(novel_rows)}/{len(object_rows)} "
+        f"({len(novel_rows) / len(object_rows) * 100.0:.1f}%) "
+        f"with trans >= {novel_trans_m:.4f} m or rot >= {novel_rot_deg:.2f} deg"
+    )
+
+    trans_stats = percentile_summary(trans_values)
+    rot_stats = percentile_summary(rot_values)
+    print(
+        "  Translation NN distance (m): "
+        f"mean={trans_stats['mean']:.4f}, p05={trans_stats['p05']:.4f}, "
+        f"p25={trans_stats['p25']:.4f}, p50={trans_stats['p50']:.4f}, "
+        f"p75={trans_stats['p75']:.4f}, p95={trans_stats['p95']:.4f}"
+    )
+    print(
+        "  Rotation NN distance (deg): "
+        f"mean={rot_stats['mean']:.2f}, p05={rot_stats['p05']:.2f}, "
+        f"p25={rot_stats['p25']:.2f}, p50={rot_stats['p50']:.2f}, "
+        f"p75={rot_stats['p75']:.2f}, p95={rot_stats['p95']:.2f}"
+    )
+
+
+def write_object_analysis_csv(rows: list, csv_path: str) -> None:
+    """Write object-specific nearest-neighbor rows to a CSV file.
+
+    Args:
+        rows: Per-sample object-specific nearest-neighbor rows.
+        csv_path: Destination CSV path.
+
+    Returns:
+        None.
+    """
+    if not rows:
+        print("[overfit_nn] No object-specific rows to write.")
+        return
+    csv_dir = os.path.dirname(csv_path)
+    if csv_dir:
+        os.makedirs(csv_dir, exist_ok=True)
+    fieldnames = list(rows[0].keys())
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\n[overfit_nn] Wrote object-specific NN rows to {csv_path}")
+
+
+def run_object_specific_nn_analysis(
+    train_records: list,
+    sample_records: list,
+    task_cfg,
+    sample_dir: str,
+) -> list:
+    """Analyze whether selected objects generate grasps different from training.
+
+    Args:
+        train_records: Comparable training pose records.
+        sample_records: Comparable sampled pose records.
+        task_cfg: Hydra task config containing object-analysis settings.
+        sample_dir: Directory containing saved sample results.
+
+    Returns:
+        Object-specific nearest-neighbor rows for all analyzed objects.
+    """
+    object_ids = select_object_analysis_ids(train_records, sample_records, task_cfg)
+    print("\nObject-specific NN overfit analysis:")
+    if not object_ids:
+        print("  No common train/sample objects selected.")
+        return []
+
+    train_groups = records_by_canonical_object(train_records)
+    sample_groups = records_by_canonical_object(sample_records)
+    trans_ref_m = float(getattr(task_cfg, "trans_ref_m", 0.02))
+    rot_ref_deg = float(getattr(task_cfg, "rot_ref_deg", 10.0))
+    near_copy_trans_m = float(getattr(task_cfg, "near_copy_trans_m", 0.01))
+    near_copy_rot_deg = float(getattr(task_cfg, "near_copy_rot_deg", 5.0))
+    novel_trans_m = float(getattr(task_cfg, "object_novel_trans_m", 0.03))
+    novel_rot_deg = float(getattr(task_cfg, "object_novel_rot_deg", 15.0))
+    same_type_only = bool(getattr(task_cfg, "object_analysis_same_type_only", False))
+    rows = []
+
+    print(f"  Analyze objects: {', '.join(object_ids)}")
+    print(f"  Same-type-only NN search: {same_type_only}")
+    for object_id in object_ids:
+        object_train_records = train_groups.get(object_id, [])
+        object_sample_records = sample_groups.get(object_id, [])
+        object_rows = []
+        if object_train_records and object_sample_records:
+            for sample_record in object_sample_records:
+                row = nearest_training_distance_for_object(
+                    sample_record,
+                    object_train_records,
+                    trans_ref_m=trans_ref_m,
+                    rot_ref_deg=rot_ref_deg,
+                    same_type_only=same_type_only,
+                )
+                row["analysis_canonical_object_id"] = object_id
+                row["is_near_copy"] = row["trans_m"] <= near_copy_trans_m and row["rot_deg"] <= near_copy_rot_deg
+                row["is_novel"] = row["trans_m"] >= novel_trans_m or row["rot_deg"] >= novel_rot_deg
+                object_rows.append(row)
+        print_object_specific_summary(
+            object_id,
+            object_rows,
+            train_count=len(object_train_records),
+            sample_count=len(object_sample_records),
+            near_copy_trans_m=near_copy_trans_m,
+            near_copy_rot_deg=near_copy_rot_deg,
+            novel_trans_m=novel_trans_m,
+            novel_rot_deg=novel_rot_deg,
+        )
+        rows.extend(object_rows)
+
+    output_csv_value = getattr(task_cfg, "object_analysis_output_csv", "")
+    output_csv = "" if output_csv_value is None else str(output_csv_value)
+    if not output_csv:
+        output_csv = os.path.join(sample_dir, "object_specific_nn_overfit.csv")
+    write_object_analysis_csv(rows, output_csv)
+    return rows
+
+
+def task_overfit_nn(config) -> None:
+    """Hydra task entry point for sampled-result diagnostics.
+
+    Args:
+        config: Full Hydra config for the current AnyScaleDexLearn run.
+
+    Returns:
+        None.
+    """
+    flatten_multidex_data_config(config.data)
+    flatten_multidex_data_config(config.test_data)
+    task_cfg = config.task
+    max_sample_files = int(getattr(task_cfg, "max_sample_files", 0))
+
+    train_records = load_training_records(config)
+
+    sample_dir = get_sample_output_dir(config)
+    sample_files = sorted(glob(os.path.join(sample_dir, "**/*.npy"), recursive=True))
+    if max_sample_files > 0:
+        sample_files = sample_files[:max_sample_files]
+    sample_records = load_sample_records(sample_files)
+    print(f"[overfit_nn] Loaded {len(train_records)} training records.")
+    print(f"[overfit_nn] Found {len(sample_files)} sampled result files in {sample_dir}")
+    print(f"[overfit_nn] Loaded {len(sample_records)} comparable sampled pose records.")
+
+    run_nearest_neighbor_analysis(train_records, sample_records, task_cfg, sample_dir)
+    run_grasp_type_distribution_analysis(train_records, sample_records, task_cfg, sample_dir)
+    run_object_specific_nn_analysis(train_records, sample_records, task_cfg, sample_dir)

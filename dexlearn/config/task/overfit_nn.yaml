@@ -16,3 +16,24 @@ max_sample_files: 0
 
 # Empty means write to <sample_output_dir>/overfit_nearest_train_grasp.csv.
 output_csv:
+
+# Print the top-k canonical objects whose sampled grasp-type distribution differs
+# most from the training distribution.
+distribution_top_k: 20
+
+# Empty means write to <sample_output_dir>/grasp_type_distribution_by_object.csv.
+distribution_output_csv:
+
+# Object-specific NN overfit analysis. Leave object ids empty to automatically
+# analyze the sampled objects with the largest number of generated grasps.
+object_analysis_object_id: ""
+object_analysis_object_ids: []
+object_analysis_top_k: 5
+object_analysis_same_type_only: False
+
+# A generated grasp is counted as object-level novel when either threshold is met.
+object_novel_trans_m: 0.03
+object_novel_rot_deg: 15.0
+
+# Empty means write to <sample_output_dir>/object_specific_nn_overfit.csv.
+object_analysis_output_csv:

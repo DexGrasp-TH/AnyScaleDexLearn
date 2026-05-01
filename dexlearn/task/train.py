@@ -1,11 +1,12 @@
 import sys
 import os
 import time
+from datetime import datetime
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tqdm import trange
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,9 +21,129 @@ def _maybe_cuda_sync(device: str, enabled: bool):
         torch.cuda.synchronize(device)
 
 
+def _markdown_cell(value) -> str:
+    """Escape a value for safe use inside a markdown table cell.
+
+    Args:
+        value: Object to stringify and place into one table cell.
+
+    Returns:
+        A single-line markdown-safe string.
+    """
+    if value is None:
+        return ""
+    return str(value).replace("\n", " ").replace("|", "\\|")
+
+
+def _summarize_model_features(config: DictConfig) -> str:
+    """Build a compact feature summary for the model registry table.
+
+    Args:
+        config: Full Hydra config for the current training run.
+
+    Returns:
+        Human-readable summary of key options that distinguish this run.
+    """
+    user_note = OmegaConf.select(config, "model_registry.key_features")
+    if user_note:
+        return str(user_note)
+
+    parts = [
+        f"data={config.data_name}",
+        f"algo={config.algo_name}",
+        f"max_iter={config.algo.max_iter}",
+    ]
+    pc_random = OmegaConf.select(config, "data.point_cloud.random_pc_across_sequences")
+    if pc_random is not None:
+        parts.append(f"random_pc_across_sequences={bool(pc_random)}")
+    scale_enabled = OmegaConf.select(config, "data.augmentation.scale.enabled")
+    if scale_enabled is not None:
+        scale_min = OmegaConf.select(config, "data.augmentation.scale.min")
+        scale_max = OmegaConf.select(config, "data.augmentation.scale.max")
+        parts.append(f"scale_aug={bool(scale_enabled)}[{scale_min},{scale_max}]")
+    type_balance_enabled = OmegaConf.select(config, "data.type_balancing.enabled")
+    if type_balance_enabled is not None:
+        sampler_alpha = OmegaConf.select(config, "data.type_balancing.sampler.alpha")
+        loss_beta = OmegaConf.select(config, "data.type_balancing.loss_weight.beta")
+        parts.append(
+            f"type_balancing={bool(type_balance_enabled)}"
+            f"[sampler_alpha={sampler_alpha},loss_beta={loss_beta}]"
+        )
+    return "; ".join(parts)
+
+
+def _resolve_model_registry_path(config: DictConfig) -> str:
+    """Resolve the markdown model registry path from Hydra config.
+
+    Args:
+        config: Full Hydra config for the current training run.
+
+    Returns:
+        Absolute path to the markdown registry file.
+    """
+    registry_path = OmegaConf.select(config, "model_registry.path") or "docs/trained_models.md"
+    registry_path = str(registry_path)
+    if os.path.isabs(registry_path):
+        return registry_path
+    try:
+        root_dir = hydra.utils.get_original_cwd()
+    except ValueError:
+        root_dir = os.getcwd()
+    return os.path.join(root_dir, registry_path)
+
+
+def _append_model_registry_entry(config: DictConfig) -> None:
+    """Append the current training run to the markdown model registry.
+
+    Args:
+        config: Full Hydra config for the current training run.
+
+    Returns:
+        None.
+    """
+    if not bool(OmegaConf.select(config, "model_registry.enabled")):
+        return
+
+    path = _resolve_model_registry_path(config)
+    registry_dir = os.path.dirname(path)
+    if registry_dir:
+        os.makedirs(registry_dir, exist_ok=True)
+    header = (
+        "# Trained Models\n\n"
+        "This table is appended automatically by `task=train` when "
+        "`model_registry.enabled=true`. Use `model_registry.key_features` "
+        "to describe intentional differences from previous runs.\n\n"
+        "| Exp Name | Timestamp | Data | Algo | Max Iter | Key Features / Differences | Notes |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+    )
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header)
+
+    exp_name = str(config.wandb.id)
+    with open(path, "r", encoding="utf-8") as f:
+        existing = f.read()
+    if f"| {exp_name} |" in existing:
+        return
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = "| {} | {} | {} | {} | {} | {} | {} |\n".format(
+        _markdown_cell(exp_name),
+        _markdown_cell(timestamp),
+        _markdown_cell(config.data_name),
+        _markdown_cell(config.algo_name),
+        _markdown_cell(config.algo.max_iter),
+        _markdown_cell(_summarize_model_features(config)),
+        "",
+    )
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(row)
+
+
 def task_train(config: DictConfig):
     set_seed(config.seed)
     logger = Logger(config)
+    _append_model_registry_entry(config)
     train_loader, val_loader = create_train_dataloader(config)
     timing_cfg = config.timing
     timing_enabled = timing_cfg.enabled

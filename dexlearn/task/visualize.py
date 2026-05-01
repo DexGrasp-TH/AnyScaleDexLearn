@@ -12,6 +12,11 @@ from omegaconf import DictConfig, OmegaConf
 from dexlearn.utils.config import flatten_multidex_data_config
 
 try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+try:
     import viser
 
     VISER_AVAILABLE = True
@@ -21,6 +26,36 @@ except ImportError:
 
 
 VISUALIZE_MODE_OPTIONS = ("random_object", "one_object", "one_object_multi_seq", "grasp_type")
+CAPTION_ASPECTS = (
+    ("scene_id", "Scene ID"),
+    ("object_id", "Object ID"),
+    ("file", "File"),
+    ("given_grasp_type", "Given Grasp Type"),
+    ("pred_grasp_type", "Pred Grasp Type"),
+    ("pred_grasp_type_prob", "Pred Grasp Type Prob"),
+    ("position_source", "Position Source"),
+    ("point_cloud", "Point Cloud"),
+    ("error", "Error"),
+    ("ik_status", "IK Status"),
+    ("other", "Other"),
+)
+
+
+def progress_iter(iterable, desc: str, total=None):
+    """Wrap an iterable with a progress bar when tqdm is available.
+
+    Args:
+        iterable: Iterable to wrap.
+        desc: Progress bar description.
+        total: Optional total item count for iterables without ``len``.
+
+    Returns:
+        An iterable that yields the same items, with a tqdm progress bar when
+        the dependency is installed.
+    """
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, desc=desc, total=total)
 
 
 def get_task_value(config: DictConfig, key: str, default):
@@ -48,6 +83,27 @@ def list_sample_files(output_dir: str):
     return sorted(glob(os.path.join(output_dir, "**/*.npy"), recursive=True))
 
 
+def infer_object_id_from_sample_path(output_dir: str, sample_file: str):
+    """Infer a scene-like object id from the saved sample path.
+
+    Args:
+        output_dir: Root directory that contains saved visualization samples.
+        sample_file: Path to one saved sample file.
+
+    Returns:
+        A slash-separated id inferred from the relative sample path. The first
+        relative component is the logger group such as ``0_any`` and is skipped.
+    """
+    try:
+        rel_path = os.path.relpath(sample_file, output_dir)
+    except ValueError:
+        rel_path = sample_file
+    parts = rel_path.split(os.sep)
+    if len(parts) >= 3:
+        return "/".join(parts[1:-1])
+    return os.path.splitext(os.path.basename(sample_file))[0]
+
+
 def extract_grasp_type_id(data: dict):
     if "pred_grasp_type_id" in data:
         return int(np.asarray(data["pred_grasp_type_id"]).reshape(-1)[0])
@@ -69,33 +125,89 @@ def infer_object_id_from_scene_cfg(scene_cfg: dict, scene_path: str):
     return os.path.splitext(os.path.basename(scene_path))[0]
 
 
-def build_visualization_sample_index(output_dir: str, scene_path_resolver=None):
+def load_visualization_record_payload(record: dict, scene_path_resolver=None, load_scene_cfg: bool = True):
+    """Load sample data and optional scene config into a lightweight record.
+
+    Args:
+        record: Sample record created by ``build_visualization_sample_index``.
+        scene_path_resolver: Optional callable that maps saved scene paths to
+            paths that are valid in the current workspace.
+        load_scene_cfg: Whether to load the referenced scene config.
+
+    Returns:
+        The same record dictionary after adding loaded payload fields.
+    """
+    if record.get("data") is not None and (not load_scene_cfg or record.get("scene_cfg")):
+        return record
+
+    sample_file = record["sample_file"]
+    data = np.load(sample_file, allow_pickle=True).item()
+    scene_path = str(data.get("scene_path", ""))
+    if scene_path_resolver is not None and scene_path:
+        scene_path = scene_path_resolver(scene_path)
+
+    scene_cfg = record.get("scene_cfg") or {}
+    if load_scene_cfg and scene_path:
+        scene_cfg = np.load(scene_path, allow_pickle=True).item()
+
+    record["data"] = data
+    record["scene_path"] = scene_path
+    record["scene_cfg"] = scene_cfg
+    record["grasp_type_id"] = extract_grasp_type_id(data)
+    if scene_cfg:
+        record["object_id"] = infer_object_id_from_scene_cfg(scene_cfg, scene_path)
+    return record
+
+
+def build_visualization_sample_index(
+    output_dir: str,
+    scene_path_resolver=None,
+    load_payload: bool = True,
+    load_scene_cfg: bool = True,
+):
+    """Build an index for saved visualization samples.
+
+    Args:
+        output_dir: Directory containing saved ``.npy`` sample files.
+        scene_path_resolver: Optional callable used to resolve saved scene paths.
+        load_payload: Whether to load every sample file while indexing.
+        load_scene_cfg: Whether to load every scene config while indexing.
+
+    Returns:
+        A list of sample records. With ``load_payload=False``, records contain
+        only path-derived metadata and are hydrated later for selected samples.
+    """
     sample_records = []
-    for sample_file in list_sample_files(output_dir):
+    sample_files = list_sample_files(output_dir)
+    print(
+        f"[visualize] Found {len(sample_files)} saved sample file(s) in {output_dir}. "
+        f"load_payload={load_payload}, load_scene_cfg={load_scene_cfg}"
+    )
+    file_iter = progress_iter(sample_files, desc="Indexing saved visualization samples", total=len(sample_files))
+    for idx, sample_file in enumerate(file_iter, 1):
+        record = {
+            "sample_file": sample_file,
+            "data": None,
+            "scene_path": "",
+            "scene_cfg": {},
+            "object_id": infer_object_id_from_sample_path(output_dir, sample_file),
+            "grasp_type_id": None,
+        }
+        if not load_payload:
+            sample_records.append(record)
+            continue
         try:
-            data = np.load(sample_file, allow_pickle=True).item()
+            load_visualization_record_payload(
+                record,
+                scene_path_resolver=scene_path_resolver,
+                load_scene_cfg=load_scene_cfg,
+            )
         except Exception as exc:
             print(f"[visualize] Skipping unreadable sample {sample_file}: {exc}")
             continue
-        scene_path = str(data.get("scene_path", ""))
-        if scene_path_resolver is not None and scene_path:
-            scene_path = scene_path_resolver(scene_path)
-        scene_cfg = {}
-        if scene_path:
-            try:
-                scene_cfg = np.load(scene_path, allow_pickle=True).item()
-            except Exception as exc:
-                print(f"[visualize] Could not load scene config for {sample_file}: {exc}")
-        sample_records.append(
-            {
-                "sample_file": sample_file,
-                "data": data,
-                "scene_path": scene_path,
-                "scene_cfg": scene_cfg,
-                "object_id": infer_object_id_from_scene_cfg(scene_cfg, scene_path) if scene_cfg else "",
-                "grasp_type_id": extract_grasp_type_id(data),
-            }
-        )
+        if idx % 50000 == 0:
+            print(f"[visualize] Indexed {idx}/{len(sample_files)} sample file(s).")
+        sample_records.append(record)
     return sample_records
 
 
@@ -103,6 +215,49 @@ def limit_records(records, max_grasps: int):
     if max_grasps <= 0 or len(records) <= max_grasps:
         return records
     return random.sample(records, k=max_grasps)
+
+
+def randomize_records(records, max_grasps: int):
+    """Return a randomized subset of records.
+
+    Args:
+        records: Candidate records or ids.
+        max_grasps: Maximum number of records to return. Non-positive values
+            return all candidates in randomized order.
+
+    Returns:
+        A list sampled from the candidate pool without preferring path-sorted
+        prefixes.
+    """
+    records = list(records)
+    if max_grasps <= 0 or len(records) <= max_grasps:
+        random.shuffle(records)
+        return records
+    return random.sample(records, k=max_grasps)
+
+
+def slice_records_batch(records, max_grasps: int, batch_index: int):
+    """Return one circular batch from an ordered record list.
+
+    Args:
+        records: Ordered records or ids to batch.
+        max_grasps: Maximum number of entries in each batch. Non-positive
+            values keep all records in one batch.
+        batch_index: Zero-based batch index to show.
+
+    Returns:
+        A list containing the selected batch. When ``batch_index`` exceeds the
+        number of available batches, selection wraps around.
+    """
+    records = list(records)
+    if max_grasps <= 0 or len(records) <= max_grasps:
+        return records
+    batch_index = max(0, int(batch_index))
+    start = (batch_index * max_grasps) % len(records)
+    end = start + max_grasps
+    if end <= len(records):
+        return records[start:end]
+    return records[start:] + records[: end - len(records)]
 
 
 def object_id_matches(record_object_id: str, target_object_id: str):
@@ -167,6 +322,124 @@ def select_evenly_across_sequences(records, max_grasps: int):
     return selected
 
 
+def select_random_across_sequences(records, max_grasps: int):
+    """Select records randomly while spreading them across sequence ids.
+
+    Args:
+        records: Candidate records with ``object_id`` metadata.
+        max_grasps: Maximum number of records to return.
+
+    Returns:
+        Randomly selected records, round-robin across sequence ids when
+        multiple sequence ids are present.
+    """
+    grouped = {}
+    for record in records:
+        grouped.setdefault(canonical_object_id(record["object_id"]), []).append(record)
+    if not grouped:
+        return []
+
+    for group_records in grouped.values():
+        random.shuffle(group_records)
+    sequence_ids = list(grouped.keys())
+    random.shuffle(sequence_ids)
+
+    selected = []
+    while sequence_ids:
+        next_sequence_ids = []
+        for sequence_id in sequence_ids:
+            if not grouped[sequence_id]:
+                continue
+            selected.append(grouped[sequence_id].pop())
+            if max_grasps > 0 and len(selected) >= max_grasps:
+                return selected
+            if grouped[sequence_id]:
+                next_sequence_ids.append(sequence_id)
+        random.shuffle(next_sequence_ids)
+        sequence_ids = next_sequence_ids
+    return selected
+
+
+def object_variant_bucket_id(object_id: str):
+    """Return the coarse scale bucket for a scene-like object id.
+
+    Args:
+        object_id: Full object id inferred from a saved sample path.
+
+    Returns:
+        A bucket id used to interleave scene variants. DGN ids end with tokens
+        like ``scale002_pose000_0``; grouping by ``scale002`` prevents the first
+        one-object batch from showing only the smallest scale.
+    """
+    leaf = canonical_object_id(object_id).split("/")[-1]
+    match = re.match(r"^(scale\d+)_pose", leaf)
+    return match.group(1) if match else leaf
+
+
+def interleave_object_variant_ids(object_ids):
+    """Interleave full object ids across coarse variant buckets.
+
+    Args:
+        object_ids: Full object ids, usually one per scene/scale/pose variant.
+
+    Returns:
+        A list of object ids ordered round-robin across buckets.
+    """
+    buckets = {}
+    for object_id in sorted(object_ids, key=natural_sort_key):
+        buckets.setdefault(object_variant_bucket_id(object_id), []).append(object_id)
+
+    ordered = []
+    bucket_ids = sorted(buckets.keys(), key=natural_sort_key)
+    while bucket_ids:
+        next_bucket_ids = []
+        for bucket_id in bucket_ids:
+            if not buckets[bucket_id]:
+                continue
+            ordered.append(buckets[bucket_id].pop(0))
+            if buckets[bucket_id]:
+                next_bucket_ids.append(bucket_id)
+        bucket_ids = next_bucket_ids
+    return ordered
+
+
+def select_one_object_variant_batch(records, max_grasps: int, batch_index: int):
+    """Randomly select a one-object batch across full scene variants.
+
+    Args:
+        records: Records matched by the selected object id.
+        max_grasps: Maximum number of scenes to show.
+        batch_index: Zero-based batch index. This is accepted for compatibility
+            with the Selection panel state; the selected batch is randomized
+            rather than sliced by index.
+
+    Returns:
+        Selected records. When a selected base object expands to many DGN
+        scale/pose variants, the batch samples scene variants randomly instead
+        of taking the first lexicographic scale only.
+    """
+    del batch_index
+    records = list(records)
+    if max_grasps <= 0:
+        return randomize_records(records, max_grasps)
+    grouped = {}
+    for record in records:
+        grouped.setdefault(canonical_object_id(record["object_id"]), []).append(record)
+    if len(grouped) <= 1:
+        return randomize_records(records, max_grasps)
+
+    selected_object_ids = randomize_records(grouped.keys(), max_grasps)
+    selected = []
+    for object_id in selected_object_ids:
+        object_records = grouped[object_id]
+        selected.append(random.choice(object_records))
+    if len(selected) < max_grasps and len(selected) < len(records):
+        used_paths = {record["sample_file"] for record in selected}
+        remaining = [record for record in records if record["sample_file"] not in used_paths]
+        selected.extend(randomize_records(remaining, max_grasps - len(selected)))
+    return selected
+
+
 def annotate_scene_labels(records, mode: str):
     for record in records:
         record.pop("viser_all_label", None)
@@ -217,6 +490,7 @@ def select_visualization_records(
     object_id=None,
     target_grasp_type_id=None,
     is_our_human_grasp_format=False,
+    batch_index=None,
 ):
     mode = normalize_visualize_mode(mode)
 
@@ -225,16 +499,17 @@ def select_visualization_records(
         for record in records:
             group_id = base_object_id_from_sequence(record["object_id"]) if is_our_human_grasp_format else record["object_id"]
             grouped.setdefault(group_id, []).append(record)
-        object_ids = list(grouped.keys())
-        if max_grasps > 0 and len(object_ids) > max_grasps:
-            object_ids = random.sample(object_ids, k=max_grasps)
-        selected = [random.choice(grouped[object_id]) for object_id in object_ids]
+        object_ids = randomize_records(grouped.keys(), max_grasps)
+        selected = []
+        for selected_object_id in object_ids:
+            selected.append(random.choice(grouped[selected_object_id]))
 
     elif mode == "one_object":
         if object_id is None:
             raise ValueError("task.object_id must be set when task.visualize_mode=one_object.")
         selected = [record for record in records if object_id_matches(record["object_id"], object_id)]
-        selected = limit_records(selected, max_grasps)
+        selected = sorted(selected, key=lambda record: record["sample_file"])
+        selected = select_one_object_variant_batch(selected, max_grasps, 0 if batch_index is None else batch_index)
 
     elif mode == "one_object_multi_seq":
         if not is_our_human_grasp_format:
@@ -245,14 +520,15 @@ def select_visualization_records(
         if object_id is None:
             raise ValueError("task.object_id must be set when task.visualize_mode=one_object_multi_seq.")
         selected = [record for record in records if sequence_object_id_matches(record["object_id"], object_id)]
-        selected = select_evenly_across_sequences(selected, max_grasps)
+        selected = select_random_across_sequences(selected, max_grasps)
 
     elif mode == "grasp_type":
         if target_grasp_type_id is None:
             raise ValueError("task.target_grasp_type_id must be set when task.visualize_mode=grasp_type.")
         target_grasp_type_id = int(target_grasp_type_id)
+        populate_grasp_type_ids(records)
         selected = [record for record in records if record["grasp_type_id"] == target_grasp_type_id]
-        selected = limit_records(selected, max_grasps)
+        selected = randomize_records(selected, max_grasps)
 
     else:
         raise ValueError(
@@ -260,10 +536,13 @@ def select_visualization_records(
         )
 
     if not selected:
-        raise RuntimeError(f"No samples matched visualize_mode={mode}.")
+        example_object_ids = list_available_object_ids(records)[:10]
+        example_text = ", ".join(example_object_ids) if example_object_ids else "none"
+        raise RuntimeError(
+            f"No samples matched visualize_mode={mode}, object_id={object_id}, "
+            f"target_grasp_type_id={target_grasp_type_id}. Available object examples: {example_text}"
+        )
 
-    if mode != "one_object_multi_seq":
-        selected = sorted(selected, key=lambda record: record["sample_file"])
     selected = annotate_scene_labels(selected, mode)
     print(f"[visualize] Selected {len(selected)} sample(s) with visualize_mode={mode}.")
     return selected
@@ -271,6 +550,88 @@ def select_visualization_records(
 
 def compact_caption(caption: str):
     return caption.split(" | ", 1)[0]
+
+
+def split_caption_after_viser_label(record):
+    """Split a full caption into the compact viser label and content parts.
+
+    Args:
+        record: Scene record containing ``caption`` and optional
+            ``viser_all_label`` metadata.
+
+    Returns:
+        A tuple ``(label_parts, content_parts)``. Label parts come from
+        ``viser_all_label`` when present, so labels like ``0 | obj_1`` are not
+        confused with regular caption separators.
+    """
+    caption = str(record.get("caption", ""))
+    label = str(record.get("viser_all_label", ""))
+    if label and caption.startswith(f"{label} | "):
+        return label.split(" | "), caption[len(label) + 3 :].split(" | ")
+    if label and caption == label:
+        return label.split(" | "), []
+    return [], [part.strip() for part in caption.split(" | ") if part.strip()]
+
+
+def caption_aspects_for_record(record):
+    """Extract named caption aspects from one scene record.
+
+    Args:
+        record: Scene record with a full caption.
+
+    Returns:
+        A dictionary mapping caption aspect ids to display strings.
+    """
+    label_parts, content_parts = split_caption_after_viser_label(record)
+    aspects = {}
+    if label_parts:
+        aspects["scene_id"] = label_parts[0]
+    if len(label_parts) >= 2:
+        aspects["object_id"] = " | ".join(label_parts[1:])
+
+    other_parts = []
+    for part in content_parts:
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("Given:") or part.startswith("grasp_type_id="):
+            aspects["given_grasp_type"] = part
+        elif part.startswith("Pred:") or part.startswith("pred_grasp_type_id="):
+            aspects["pred_grasp_type"] = part
+        elif part.startswith("pred_grasp_type_prob="):
+            aspects["pred_grasp_type_prob"] = part
+        elif part.startswith("Pos:"):
+            aspects["position_source"] = part
+        elif part.startswith("PC:"):
+            aspects["point_cloud"] = part
+        elif part.startswith("err="):
+            aspects["error"] = part
+        elif "IK:" in part:
+            aspects["ik_status"] = part
+        elif "file" not in aspects:
+            aspects["file"] = part
+        else:
+            other_parts.append(part)
+
+    if other_parts:
+        aspects["other"] = " | ".join(other_parts)
+    return aspects
+
+
+def build_caption_from_aspects(record, selected_aspects):
+    """Build a scene caption from selected aspect ids.
+
+    Args:
+        record: Scene record with a full caption.
+        selected_aspects: Iterable of aspect ids enabled in the web UI.
+
+    Returns:
+        A compact caption containing only the selected aspects. Returns an empty
+        string when no selected aspect is available for the record.
+    """
+    aspects = caption_aspects_for_record(record)
+    parts = [aspects[aspect_id] for aspect_id, _ in CAPTION_ASPECTS if aspect_id in selected_aspects and aspect_id in aspects]
+    return " | ".join(parts)
 
 
 def set_viser_dropdown_options(dropdown, options, initial_value=None):
@@ -301,6 +662,259 @@ def list_available_base_object_ids(sample_records):
 
 def list_available_grasp_type_ids(sample_records):
     return tuple(sorted({int(record["grasp_type_id"]) for record in sample_records if record["grasp_type_id"] is not None}))
+
+
+def build_grasp_type_options(sample_records, grasp_type_names=None):
+    """Build grasp type dropdown options without forcing sample payload reads.
+
+    Args:
+        sample_records: Visualization sample records, which may only contain
+            path-derived metadata during fast startup.
+        grasp_type_names: Optional ordered grasp type names from the dataset.
+
+    Returns:
+        A tuple of dropdown option strings. When dataset grasp names are known,
+        all concrete grasp types are exposed immediately so startup does not
+        need to read every saved sample.
+    """
+    if grasp_type_names is not None:
+        return tuple(format_grasp_type_option(idx, grasp_type_names) for idx in range(1, len(grasp_type_names)))
+    grasp_type_ids = list_available_grasp_type_ids(sample_records)
+    return tuple(format_grasp_type_option(idx, grasp_type_names) for idx in grasp_type_ids) or ("",)
+
+
+def populate_grasp_type_ids(sample_records):
+    """Populate grasp type metadata for records indexed without full payloads.
+
+    Args:
+        sample_records: Visualization sample records created by
+            ``build_visualization_sample_index``.
+
+    Returns:
+        The number of records whose grasp type id is available after the pass.
+    """
+    available_count = 0
+    record_iter = progress_iter(sample_records, desc="Reading grasp type ids", total=len(sample_records))
+    for record in record_iter:
+        if record.get("grasp_type_id") is not None:
+            available_count += 1
+            continue
+        data = record.get("data")
+        if data is None:
+            try:
+                data = np.load(record["sample_file"], allow_pickle=True).item()
+            except Exception as exc:
+                print(f"[visualize] Could not read grasp type from {record['sample_file']}: {exc}")
+                continue
+        record["grasp_type_id"] = extract_grasp_type_id(data)
+        if record["grasp_type_id"] is not None:
+            available_count += 1
+    return available_count
+
+
+def build_selection_record_index(sample_records, is_our_human_grasp_format=False):
+    """Build reusable record groups for responsive web UI selection.
+
+    Args:
+        sample_records: Visualization records indexed from saved sample files.
+        is_our_human_grasp_format: Whether sequence-base object grouping is
+            valid for ``one_object_multi_seq``.
+
+    Returns:
+        A dictionary containing sorted records grouped by exact object id, base
+        object id, and random-object group id. Grasp-type groups are populated
+        lazily because they require reading saved sample payloads.
+    """
+    records_by_object = {}
+    records_by_base_object = {}
+    records_by_random_group = {}
+    record_iter = progress_iter(sample_records, desc="Building visualization selection index", total=len(sample_records))
+    for record in record_iter:
+        object_id = canonical_object_id(record["object_id"])
+        base_object_id = base_object_id_from_sequence(object_id)
+        random_group_id = base_object_id if is_our_human_grasp_format else object_id
+        records_by_object.setdefault(object_id, []).append(record)
+        records_by_base_object.setdefault(base_object_id, []).append(record)
+        records_by_random_group.setdefault(random_group_id, []).append(record)
+
+    for grouped_records in (
+        list(records_by_object.values())
+        + list(records_by_base_object.values())
+        + list(records_by_random_group.values())
+    ):
+        grouped_records.sort(key=lambda record: record["sample_file"])
+
+    return {
+        "records": sample_records,
+        "records_by_object": records_by_object,
+        "records_by_base_object": records_by_base_object,
+        "records_by_random_group": records_by_random_group,
+        "random_group_ids": tuple(sorted(records_by_random_group.keys(), key=natural_sort_key)),
+        "object_ids": tuple(sorted(records_by_object.keys(), key=natural_sort_key)),
+        "base_object_ids": tuple(sorted(records_by_base_object.keys(), key=natural_sort_key)),
+        "grasp_type_records": {},
+        "grasp_type_scan_complete": False,
+    }
+
+
+def get_indexed_object_records(selection_index, object_id):
+    """Return records for an object id using exact lookup with scan fallback.
+
+    Args:
+        selection_index: Selection index from ``build_selection_record_index``.
+        object_id: Object id selected in the web UI or provided by config.
+
+    Returns:
+        A sorted list of matching records.
+    """
+    object_id = canonical_object_id(object_id)
+    exact_records = selection_index["records_by_object"].get(object_id)
+    if exact_records is not None:
+        return exact_records
+    base_records = selection_index["records_by_base_object"].get(base_object_id_from_sequence(object_id))
+    if base_records is not None:
+        return base_records
+    return sorted(
+        [
+            record
+            for record in selection_index["records"]
+            if object_id_matches(record["object_id"], object_id)
+        ],
+        key=lambda record: record["sample_file"],
+    )
+
+
+def select_grasp_type_records_lazy(selection_index, target_grasp_type_id: int, max_grasps: int, batch_index: int):
+    """Randomly select grasp-type records while reading few payloads.
+
+    Args:
+        selection_index: Selection index from ``build_selection_record_index``.
+        target_grasp_type_id: Integer grasp type id to match.
+        max_grasps: Maximum records to return. Non-positive values require a
+            complete scan and return all matches.
+        batch_index: Zero-based batch index. This is accepted for compatibility
+            with Selection panel state; selection is randomized.
+
+    Returns:
+        A list of records matching the requested grasp type.
+    """
+    del batch_index
+    target_grasp_type_id = int(target_grasp_type_id)
+    target_records = selection_index["grasp_type_records"].setdefault(target_grasp_type_id, [])
+    if max_grasps <= 0:
+        populate_grasp_type_ids(selection_index["records"])
+        target_records[:] = [record for record in selection_index["records"] if record["grasp_type_id"] == target_grasp_type_id]
+        selection_index["grasp_type_scan_complete"] = True
+        return randomize_records(target_records, max_grasps)
+
+    cached_paths = {record["sample_file"] for record in target_records}
+    selected = randomize_records(target_records, max_grasps)
+    selected_paths = {record["sample_file"] for record in selected}
+    if len(selected) < max_grasps and not selection_index["grasp_type_scan_complete"]:
+        shuffled_records = list(selection_index["records"])
+        random.shuffle(shuffled_records)
+        record_iter = progress_iter(
+            shuffled_records,
+            desc=f"Scanning grasp type {target_grasp_type_id}",
+            total=len(shuffled_records),
+        )
+        for record in record_iter:
+            if record.get("grasp_type_id") is None:
+                data = record.get("data")
+                if data is None:
+                    try:
+                        data = np.load(record["sample_file"], allow_pickle=True).item()
+                    except Exception as exc:
+                        print(f"[visualize] Could not read grasp type from {record['sample_file']}: {exc}")
+                        continue
+                record["grasp_type_id"] = extract_grasp_type_id(data)
+            if record["grasp_type_id"] != target_grasp_type_id:
+                continue
+            if record["sample_file"] not in cached_paths:
+                target_records.append(record)
+                cached_paths.add(record["sample_file"])
+            if record["sample_file"] not in selected_paths:
+                selected.append(record)
+                selected_paths.add(record["sample_file"])
+            if len(selected) >= max_grasps:
+                break
+        else:
+            selection_index["grasp_type_scan_complete"] = True
+
+    if len(selected) < max_grasps and target_records:
+        selected_paths = {record["sample_file"] for record in selected}
+        remaining = [record for record in target_records if record["sample_file"] not in selected_paths]
+        selected.extend(randomize_records(remaining, max_grasps - len(selected)))
+    return selected
+
+
+def select_visualization_records_from_index(
+    selection_index,
+    mode: str,
+    max_grasps: int,
+    object_id=None,
+    target_grasp_type_id=None,
+    is_our_human_grasp_format=False,
+    batch_index=0,
+):
+    """Select visualization records from precomputed web UI indexes.
+
+    Args:
+        selection_index: Selection index from ``build_selection_record_index``.
+        mode: Visualization mode.
+        max_grasps: Maximum number of records in one batch.
+        object_id: Optional selected object id.
+        target_grasp_type_id: Optional selected grasp type id.
+        is_our_human_grasp_format: Whether ``one_object_multi_seq`` is valid.
+        batch_index: Zero-based batch index.
+
+    Returns:
+        Selected and annotated sample records.
+    """
+    mode = normalize_visualize_mode(mode)
+    batch_index = max(0, int(batch_index))
+    if mode == "random_object":
+        group_ids = randomize_records(selection_index["random_group_ids"], max_grasps)
+        selected = []
+        for group_id in group_ids:
+            group_records = selection_index["records_by_random_group"][group_id]
+            selected.append(random.choice(group_records))
+    elif mode == "one_object":
+        if object_id is None:
+            raise ValueError("task.object_id must be set when task.visualize_mode=one_object.")
+        selected = select_one_object_variant_batch(
+            get_indexed_object_records(selection_index, object_id),
+            max_grasps,
+            batch_index,
+        )
+    elif mode == "one_object_multi_seq":
+        if not is_our_human_grasp_format:
+            raise RuntimeError(
+                "task.visualize_mode=one_object_multi_seq is only valid when test_data.object_path points to "
+                "OurHumanGraspFormat."
+            )
+        if object_id is None:
+            raise ValueError("task.object_id must be set when task.visualize_mode=one_object_multi_seq.")
+        base_object_id = base_object_id_from_sequence(object_id)
+        selected = select_random_across_sequences(selection_index["records_by_base_object"].get(base_object_id, []), max_grasps)
+    elif mode == "grasp_type":
+        if target_grasp_type_id is None:
+            raise ValueError("task.target_grasp_type_id must be set when task.visualize_mode=grasp_type.")
+        selected = select_grasp_type_records_lazy(selection_index, int(target_grasp_type_id), max_grasps, batch_index)
+    else:
+        raise ValueError(f"Unsupported visualize_mode={mode}. Expected one of {list(VISUALIZE_MODE_OPTIONS)}.")
+
+    if not selected:
+        example_object_ids = selection_index["object_ids"][:10]
+        example_text = ", ".join(example_object_ids) if example_object_ids else "none"
+        raise RuntimeError(
+            f"No samples matched visualize_mode={mode}, object_id={object_id}, "
+            f"target_grasp_type_id={target_grasp_type_id}. Available object examples: {example_text}"
+        )
+
+    selected = annotate_scene_labels(selected, mode)
+    print(f"[visualize] Selected {len(selected)} sample(s) with visualize_mode={mode}.")
+    return selected
 
 
 def format_grasp_type_option(grasp_type_id: int, grasp_type_names=None):
@@ -334,6 +948,25 @@ def pick_initial_object_option(options, preferred):
     return options[0]
 
 
+def format_gui_wrappable_value(value):
+    """Format a long GUI value with safe wrap points.
+
+    Args:
+        value: Value to display in a markdown GUI panel.
+
+    Returns:
+        HTML-escaped text with zero-width break points inserted after common
+        object-id separators so long DGN object names can wrap inside the side
+        panel while preserving the visible object id.
+    """
+    text = str(value)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for separator in ("/", "_", "-"):
+        text = text.replace(separator, f"{separator}\u200b")
+    text = re.sub(r"([A-Za-z0-9]{12})", lambda match: f"{match.group(1)}\u200b", text)
+    return text
+
+
 def build_viser_selection_controls(
     sample_records,
     config,
@@ -341,33 +974,48 @@ def build_viser_selection_controls(
     grasp_type_names=None,
     is_our_human_grasp_format=False,
 ):
-    object_options = list_available_object_ids(sample_records) or ("",)
-    base_object_options = list_available_base_object_ids(sample_records) or object_options
-    grasp_type_ids = list_available_grasp_type_ids(sample_records)
-    grasp_type_options = tuple(format_grasp_type_option(idx, grasp_type_names) for idx in grasp_type_ids) or ("",)
+    selection_index = build_selection_record_index(sample_records, is_our_human_grasp_format=is_our_human_grasp_format)
+    mode_options = (
+        VISUALIZE_MODE_OPTIONS
+        if is_our_human_grasp_format
+        else tuple(mode for mode in VISUALIZE_MODE_OPTIONS if mode != "one_object_multi_seq")
+    )
+    object_options = selection_index["object_ids"] or ("",)
+    base_object_options = selection_index["base_object_ids"] or object_options
+    grasp_type_options = build_grasp_type_options(sample_records, grasp_type_names)
     initial_mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_object"))
-    if initial_mode not in VISUALIZE_MODE_OPTIONS:
+    if initial_mode not in mode_options:
         initial_mode = "random_object"
-    initial_object_options = base_object_options if initial_mode == "one_object_multi_seq" else object_options
+    initial_object_options = base_object_options if initial_mode in {"one_object", "one_object_multi_seq"} else object_options
     initial_object = pick_initial_object_option(initial_object_options, get_task_value(config, "object_id", None))
     initial_grasp_type = pick_initial_option(grasp_type_options, get_task_value(config, "target_grasp_type_id", None))
     max_grasps = int(get_task_value(config, "max_grasps", 20))
+    batch_state = {"key": None, "index": 0}
 
-    def load_scene_records(mode, object_id, grasp_type_option):
+    def load_scene_records(mode, object_id, grasp_type_option, advance_batch=False):
         mode = normalize_visualize_mode(mode)
         target_grasp_type_id = parse_grasp_type_option(grasp_type_option) if grasp_type_option else None
-        selected_records = select_visualization_records(
-            sample_records,
+        selection_key = (mode, str(object_id), target_grasp_type_id)
+        if selection_key != batch_state["key"]:
+            batch_state["key"] = selection_key
+            batch_state["index"] = 0
+        elif advance_batch:
+            batch_state["index"] += 1
+        elif not advance_batch:
+            batch_state["index"] = 0
+        selected_records = select_visualization_records_from_index(
+            selection_index,
             mode,
             max_grasps,
             object_id=object_id,
             target_grasp_type_id=target_grasp_type_id,
             is_our_human_grasp_format=is_our_human_grasp_format,
+            batch_index=batch_state["index"],
         )
         return build_scene_records(selected_records)
 
     return {
-        "mode_options": VISUALIZE_MODE_OPTIONS,
+        "mode_options": mode_options,
         "initial_mode": initial_mode,
         "object_options": object_options,
         "base_object_options": base_object_options,
@@ -375,6 +1023,7 @@ def build_viser_selection_controls(
         "grasp_type_options": grasp_type_options,
         "initial_grasp_type": initial_grasp_type,
         "load_scene_records": load_scene_records,
+        "batch_state": batch_state,
     }
 
 
@@ -496,7 +1145,14 @@ def show_scenes_with_trimesh(scene_records):
         scene.show(caption=record["caption"], smooth=bool(record.get("smooth", True)))
 
 
-def add_caption_gui(server, scene_records, log_prefix: str, on_show_full_caption=None):
+def add_caption_gui(
+    server,
+    scene_records,
+    log_prefix: str,
+    on_show_full_caption=None,
+    on_hide_full_caption=None,
+    on_toggle_caption_aspect=None,
+):
     if not hasattr(server, "gui") or not scene_records:
         return None
 
@@ -515,6 +1171,9 @@ def add_caption_gui(server, scene_records, log_prefix: str, on_show_full_caption
     with server.gui.add_folder("Captions"):
         caption_dropdown = server.gui.add_dropdown("Sample", options=options, initial_value=options[0])
         show_button = server.gui.add_button("Show Full Caption")
+        aspect_buttons = {}
+        for aspect_id, aspect_name in CAPTION_ASPECTS:
+            aspect_buttons[aspect_id] = server.gui.add_button(aspect_name)
         if hasattr(server.gui, "add_markdown"):
             caption_handle = server.gui.add_markdown("Caption hidden.")
             caption_mode = "markdown"
@@ -548,9 +1207,21 @@ def add_caption_gui(server, scene_records, log_prefix: str, on_show_full_caption
         def _on_show_caption(event):
             del event
             selected_idx = caption_state["options"].index(caption_dropdown.value)
+            if caption_state["visible"]:
+                hide_caption()
+                if on_hide_full_caption is not None:
+                    on_hide_full_caption()
+                return
             show_caption(selected_idx)
             if on_show_full_caption is not None:
                 on_show_full_caption(selected_idx)
+
+        for aspect_id, aspect_button in aspect_buttons.items():
+            @aspect_button.on_click
+            def _on_toggle_aspect(event, aspect_id=aspect_id):
+                del event
+                if on_toggle_caption_aspect is not None:
+                    on_toggle_caption_aspect(aspect_id)
 
         @caption_dropdown.on_update
         def _on_caption_select(event):
@@ -572,6 +1243,7 @@ def add_caption_gui(server, scene_records, log_prefix: str, on_show_full_caption
         "show_caption": show_caption,
         "hide_caption": hide_caption,
         "update_records": update_records,
+        "aspect_buttons": aspect_buttons,
     }
 
 
@@ -583,6 +1255,7 @@ def show_scenes_with_viser(
     scene_id: int = 0,
     log_prefix: str = "visualize",
     selection_controls=None,
+    next_batch_loader=None,
 ):
     if not VISER_AVAILABLE:
         raise ImportError(
@@ -595,6 +1268,8 @@ def show_scenes_with_viser(
     scene_id = int(np.clip(scene_id, 0, len(scene_records) - 1))
 
     server = viser.ViserServer(port=port)
+    if hasattr(server.gui, "configure_theme"):
+        server.gui.configure_theme(control_layout="floating", control_width="large")
     server.scene.set_up_direction("+z")
     scene_handles = {"value": []}
 
@@ -607,7 +1282,12 @@ def show_scenes_with_viser(
         )
 
     sample_options_state = {"options": build_sample_options(records_state["records"])}
-    state = {"display_mode": display_mode, "scene_id": scene_id, "show_full_scene_captions": False}
+    state = {
+        "display_mode": display_mode,
+        "scene_id": scene_id,
+        "show_full_scene_captions": False,
+        "caption_aspects": set(),
+    }
 
     with server.gui.add_folder("Display"):
         display_dropdown = server.gui.add_dropdown(
@@ -626,7 +1306,26 @@ def show_scenes_with_viser(
         state["show_full_scene_captions"] = True
         render_current_view()
 
-    caption_gui = add_caption_gui(server, scene_records, log_prefix, on_show_full_caption=show_full_scene_captions)
+    def hide_full_scene_captions():
+        state["show_full_scene_captions"] = False
+        render_current_view()
+
+    def toggle_caption_aspect(aspect_id: str):
+        if aspect_id in state["caption_aspects"]:
+            state["caption_aspects"].remove(aspect_id)
+        else:
+            state["caption_aspects"].add(aspect_id)
+        state["show_full_scene_captions"] = False
+        render_current_view()
+
+    caption_gui = add_caption_gui(
+        server,
+        scene_records,
+        log_prefix,
+        on_show_full_caption=show_full_scene_captions,
+        on_hide_full_caption=hide_full_scene_captions,
+        on_toggle_caption_aspect=toggle_caption_aspect,
+    )
 
     def render_current_view():
         current_records = records_state["records"]
@@ -641,11 +1340,11 @@ def show_scenes_with_viser(
         for idx, record, offset in records_and_offsets:
             scene_name = f"/sample_{idx:04d}"
             scene_handles["value"].extend(add_scene_elements_to_viser(server, record["elements"], scene_name, offset))
-            if state["display_mode"] == "single" or state["show_full_scene_captions"]:
+            if state["show_full_scene_captions"]:
                 label_text = record["caption"]
             else:
-                label_text = record.get("viser_all_label", f"{idx:04d}")
-            label = add_scene_label_to_viser(server, scene_name, label_text, offset, log_prefix)
+                label_text = build_caption_from_aspects(record, state["caption_aspects"])
+            label = add_scene_label_to_viser(server, scene_name, label_text, offset, log_prefix) if label_text else None
             if label is not None:
                 scene_handles["value"].append(label)
 
@@ -670,6 +1369,7 @@ def show_scenes_with_viser(
         records_state["records"] = new_scene_records
         state["scene_id"] = int(np.clip(state["scene_id"], 0, len(new_scene_records) - 1))
         state["show_full_scene_captions"] = False
+        state["caption_aspects"].clear()
         sample_options_state["options"] = build_sample_options(new_scene_records)
         set_viser_dropdown_options(
             scene_dropdown,
@@ -683,7 +1383,7 @@ def show_scenes_with_viser(
     if selection_controls is not None and hasattr(server, "gui"):
         def object_options_for_mode(mode):
             mode = normalize_visualize_mode(mode)
-            if mode == "one_object_multi_seq":
+            if mode in {"one_object", "one_object_multi_seq"}:
                 return selection_controls["base_object_options"]
             return selection_controls["object_options"]
 
@@ -699,13 +1399,29 @@ def show_scenes_with_viser(
                 options=initial_object_options,
                 initial_value=selection_controls["initial_object"],
             )
+            object_info_handle = (
+                server.gui.add_markdown("")
+                if hasattr(server.gui, "add_markdown")
+                else None
+            )
             grasp_type_dropdown = server.gui.add_dropdown(
                 "Grasp Type",
                 options=selection_controls["grasp_type_options"],
                 initial_value=selection_controls["initial_grasp_type"],
             )
             apply_button = server.gui.add_button("Apply Selection")
+            next_batch_button = server.gui.add_button("Next Batch")
             status_handle = server.gui.add_markdown("Selection loaded.") if hasattr(server.gui, "add_markdown") else None
+
+            def update_object_info():
+                if object_info_handle is None or not hasattr(object_info_handle, "content"):
+                    return
+                object_info_handle.content = (
+                    "Selected Object: "
+                    f"{format_gui_wrappable_value(object_dropdown.value)}"
+                )
+
+            update_object_info()
 
             @apply_button.on_click
             def _on_apply_selection(event):
@@ -725,6 +1441,26 @@ def show_scenes_with_viser(
                     status_handle.content = f"Loaded {len(new_scene_records)} scene(s)."
                 update_scene_records(new_scene_records)
 
+            @next_batch_button.on_click
+            def _on_next_selection_batch(event):
+                del event
+                try:
+                    new_scene_records = selection_controls["load_scene_records"](
+                        str(mode_dropdown.value),
+                        str(object_dropdown.value),
+                        str(grasp_type_dropdown.value),
+                        advance_batch=True,
+                    )
+                except Exception as exc:
+                    if status_handle is not None and hasattr(status_handle, "content"):
+                        status_handle.content = f"Next batch failed: `{exc}`"
+                    print(f"[{log_prefix}] Next batch failed: {exc}")
+                    return
+                batch_index = selection_controls.get("batch_state", {}).get("index", 0)
+                if status_handle is not None and hasattr(status_handle, "content"):
+                    status_handle.content = f"Loaded batch {batch_index + 1} with {len(new_scene_records)} scene(s)."
+                update_scene_records(new_scene_records)
+
             @mode_dropdown.on_update
             def _on_selection_mode_update(event):
                 del event
@@ -732,6 +1468,35 @@ def show_scenes_with_viser(
                 preferred = object_dropdown.value if hasattr(object_dropdown, "value") else None
                 initial_object = pick_initial_object_option(options, preferred)
                 set_viser_dropdown_options(object_dropdown, options, initial_object)
+                update_object_info()
+
+            @object_dropdown.on_update
+            def _on_selection_object_update(event):
+                del event
+                update_object_info()
+
+    if next_batch_loader is not None and hasattr(server, "gui"):
+        with server.gui.add_folder("Dataloader"):
+            next_batch_button = server.gui.add_button("Next Batch")
+            batch_status = (
+                server.gui.add_markdown("Current batch loaded.")
+                if hasattr(server.gui, "add_markdown")
+                else None
+            )
+
+            @next_batch_button.on_click
+            def _on_next_batch(event):
+                del event
+                try:
+                    new_scene_records = next_batch_loader()
+                except Exception as exc:
+                    if batch_status is not None and hasattr(batch_status, "content"):
+                        batch_status.content = f"Next batch failed: `{exc}`"
+                    print(f"[{log_prefix}] Next batch failed: {exc}")
+                    return
+                update_scene_records(new_scene_records)
+                if batch_status is not None and hasattr(batch_status, "content"):
+                    batch_status.content = f"Loaded next batch with {len(new_scene_records)} scene(s)."
 
     @display_dropdown.on_update
     def _on_display_update(event):
@@ -964,15 +1729,20 @@ def task_visualize_human(config: DictConfig) -> None:
     if pc_source not in {"partial", "complete"}:
         raise ValueError(f"Unsupported pc_source={pc_source}. Expected one of ['partial', 'complete'].")
 
-    all_sample_records = build_visualization_sample_index(output_dir, scene_path_resolver=resolve_human_dataset_path)
+    all_sample_records = build_visualization_sample_index(
+        output_dir,
+        scene_path_resolver=resolve_human_dataset_path,
+        load_payload=False,
+    )
     if not all_sample_records:
         raise RuntimeError(f"No saved grasp files found in {output_dir}")
 
     def build_human_scene_records(sample_records):
         scene_records = []
-        for sample_record in sample_records:
+        record_iter = progress_iter(sample_records, desc="Building human visualization scenes", total=len(sample_records))
+        for sample_record in record_iter:
+            load_visualization_record_payload(sample_record, scene_path_resolver=resolve_human_dataset_path)
             sample_file = sample_record["sample_file"]
-            print(f"Processing {sample_file}")
 
             data = sample_record["data"]
             grasp_pose = data["grasp_pose"]
@@ -1247,9 +2017,11 @@ def task_visualize_robot(config: DictConfig) -> None:
     is_our_human_grasp_format = is_our_human_grasp_format_test_data(config)
 
     output_dir = get_output_dir(config)
+    robot_scene_path_resolver = lambda path: resolve_robot_dataset_path(path, config.test_data.object_path)
     all_sample_records = build_visualization_sample_index(
         output_dir,
-        scene_path_resolver=lambda path: resolve_robot_dataset_path(path, config.test_data.object_path),
+        scene_path_resolver=robot_scene_path_resolver,
+        load_payload=False,
     )
     if not all_sample_records:
         raise RuntimeError(f"No saved grasp files found in {output_dir}")
@@ -1260,9 +2032,10 @@ def task_visualize_robot(config: DictConfig) -> None:
 
     def build_robot_scene_records(sample_records):
         scene_records = []
-        for sample_record in sample_records:
+        record_iter = progress_iter(sample_records, desc="Building robot visualization scenes", total=len(sample_records))
+        for sample_record in record_iter:
+            load_visualization_record_payload(sample_record, scene_path_resolver=robot_scene_path_resolver)
             sample_file = sample_record["sample_file"]
-            print(f"Processing {sample_file}")
 
             data = sample_record["data"]
             scene_path = sample_record["scene_path"]

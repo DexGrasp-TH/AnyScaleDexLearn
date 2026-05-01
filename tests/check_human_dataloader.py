@@ -50,6 +50,90 @@ def build_hand_mesh_elements(verts, faces, joints=None, color=(200, 200, 250, 25
     return scene_elements
 
 
+def build_human_batch_scene_records(data, mano_layers, mano_cfg, hand_pos_source, hand_colors, device):
+    """Build viser scene records from one human dataloader batch.
+
+    Args:
+        data: Collated human dataloader batch moved to the target device.
+        mano_layers: Mapping from hand side to MANO layer.
+        mano_cfg: MANO configuration inferred from the dataset format.
+        hand_pos_source: Name of the hand target position convention.
+        hand_colors: Mapping from hand side to RGBA mesh color.
+        device: Torch device used for temporary MANO tensors.
+
+    Returns:
+        List of scene records accepted by ``show_scenes_with_viser``.
+    """
+    batch_size = int(data["grasp_type_id"].shape[0])
+    scene_records = []
+
+    for i in range(batch_size):
+        grasp_type_id = int(data["grasp_type_id"][i])
+        grasp_type_name = GRASP_TYPES[grasp_type_id]
+        caption = f"{i} | path: {data['path'][i]} | grasp_type: {grasp_type_name}"
+        scene_elements = []
+
+        for side in ["right", "left"]:
+            hand_target_pos = data[f"{side}_hand_trans"][i, 0, 0, :]
+            hand_rot_mat = data[f"{side}_hand_rot"][i, 0, 0, ...]
+
+            if side == "left" and "left_hand_fixed" in data and bool(data["left_hand_fixed"][i]):
+                continue
+            if not hand_rot_mat.any():
+                continue
+
+            hand_rot_aa = matrix_to_axis_angle(hand_rot_mat.unsqueeze(0))
+            if f"{side}_mano_pose" in data:
+                mano_pose = data[f"{side}_mano_pose"][i].unsqueeze(0).to(device)
+                mano_betas = data[f"{side}_mano_betas"][i].unsqueeze(0).to(device)
+            else:
+                mano_pose = torch.zeros((1, mano_cfg.ncomps), device=device)
+                mano_betas = torch.zeros((1, 10), device=device)
+            mano_params = torch.cat([hand_rot_aa, mano_pose], dim=-1)
+
+            verts, joints = mano_layers[side](mano_params, th_betas=mano_betas)
+            wrist_trans = get_wrist_translation_from_target(hand_target_pos, joints[0], hand_pos_source)
+            verts = (verts / 1000.0) + wrist_trans.unsqueeze(0)
+            joints = (joints / 1000.0) + wrist_trans.unsqueeze(0)
+
+            hand_pose = torch.eye(4, device=hand_rot_mat.device, dtype=hand_rot_mat.dtype)
+            hand_pose[:3, :3] = hand_rot_mat
+            hand_pose[:3, 3] = wrist_trans
+            scene_elements.append(
+                trimesh.creation.axis(
+                    transform=hand_pose.cpu().numpy(),
+                    origin_size=0.01,
+                    axis_radius=0.005,
+                    axis_length=0.1,
+                )
+            )
+
+            v_np = verts[0].cpu().detach().numpy()
+            j_np = joints[0].cpu().detach().numpy()
+            f_np = mano_layers[side].th_faces.cpu().numpy()
+            scene_elements.extend(build_hand_mesh_elements(v_np, f_np, j_np, color=hand_colors[side]))
+
+            if hand_pos_source == "index_mcp":
+                mcp_pose = torch.eye(4, device=hand_rot_mat.device, dtype=hand_rot_mat.dtype)
+                mcp_pose[:3, :3] = hand_rot_mat
+                mcp_pose[:3, 3] = hand_target_pos
+                scene_elements.append(
+                    trimesh.creation.axis(
+                        transform=mcp_pose.cpu().numpy(),
+                        origin_size=0.008,
+                        axis_radius=0.003,
+                        axis_length=0.08,
+                    )
+                )
+
+        pc_np = data["point_clouds"][i, ...].cpu().numpy()
+        scene_elements.append(trimesh.points.PointCloud(pc_np, colors=[255, 165, 0, 255]))
+        scene_elements.append(trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3))
+        scene_records.append({"elements": scene_elements, "caption": caption})
+
+    return scene_records
+
+
 @hydra.main(config_path="../dexlearn/config", config_name="base", version_base=None)
 def main(config: DictConfig) -> None:
     set_seed(config.seed)
@@ -96,72 +180,26 @@ def main(config: DictConfig) -> None:
         config.device,
     )
 
-    data = train_loader.get()
-    scene_records = []
+    def load_next_batch_scene_records():
+        """Load and convert the next human dataloader batch.
 
-    for i in range(config.algo.batch_size):
-        grasp_type_id = int(data["grasp_type_id"][i])
-        grasp_type_name = GRASP_TYPES[grasp_type_id]
-        caption = f"{i} | path: {data['path'][i]} | grasp_type: {grasp_type_name}"
-        scene_elements = []
+        Args:
+            None.
 
-        for side in ["right", "left"]:
-            hand_target_pos = data[f"{side}_hand_trans"][i, 0, 0, :]
-            hand_rot_mat = data[f"{side}_hand_rot"][i, 0, 0, ...]
+        Returns:
+            List of scene records for the next batch.
+        """
+        data = train_loader.get()
+        return build_human_batch_scene_records(
+            data=data,
+            mano_layers=mano_layers,
+            mano_cfg=mano_cfg,
+            hand_pos_source=hand_pos_source,
+            hand_colors=hand_colors,
+            device=config.device,
+        )
 
-            if side == "left" and "left_hand_fixed" in data and bool(data["left_hand_fixed"][i]):
-                continue
-            if not hand_rot_mat.any():
-                continue
-
-            hand_rot_aa = matrix_to_axis_angle(hand_rot_mat.unsqueeze(0))
-            if f"{side}_mano_pose" in data:
-                mano_pose = data[f"{side}_mano_pose"][i].unsqueeze(0).to(config.device)
-                mano_betas = data[f"{side}_mano_betas"][i].unsqueeze(0).to(config.device)
-            else:
-                mano_pose = torch.zeros((1, mano_cfg.ncomps), device=config.device)
-                mano_betas = torch.zeros((1, 10), device=config.device)
-            mano_params = torch.cat([hand_rot_aa, mano_pose], dim=-1)
-
-            verts, joints = mano_layers[side](mano_params, th_betas=mano_betas)
-            wrist_trans = get_wrist_translation_from_target(hand_target_pos, joints[0], hand_pos_source)
-            verts = (verts / 1000.0) + wrist_trans.unsqueeze(0)
-            joints = (joints / 1000.0) + wrist_trans.unsqueeze(0)
-
-            hand_pose = torch.eye(4, device=hand_rot_mat.device, dtype=hand_rot_mat.dtype)
-            hand_pose[:3, :3] = hand_rot_mat
-            hand_pose[:3, 3] = wrist_trans
-            scene_elements.append(
-                trimesh.creation.axis(
-                    transform=hand_pose.cpu().numpy(),
-                    origin_size=0.01,
-                    axis_radius=0.005,
-                    axis_length=0.1,
-                )
-            )
-
-            v_np = verts[0].cpu().detach().numpy()
-            j_np = joints[0].cpu().detach().numpy()
-            f_np = mano_layers[side].th_faces.cpu().numpy()
-            scene_elements.extend(build_hand_mesh_elements(v_np, f_np, j_np, color=hand_colors[side]))
-
-            if hand_pos_source == "index_mcp":
-                mcp_pose = torch.eye(4, device=hand_rot_mat.device, dtype=hand_rot_mat.dtype)
-                mcp_pose[:3, :3] = hand_rot_mat
-                mcp_pose[:3, 3] = hand_target_pos
-                scene_elements.append(
-                    trimesh.creation.axis(
-                        transform=mcp_pose.cpu().numpy(),
-                        origin_size=0.008,
-                        axis_radius=0.003,
-                        axis_length=0.08,
-                    )
-                )
-
-        pc_np = data["point_clouds"][i, ...].cpu().numpy()
-        scene_elements.append(trimesh.points.PointCloud(pc_np, colors=[255, 165, 0, 255]))
-        scene_elements.append(trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3))
-        scene_records.append({"elements": scene_elements, "caption": caption})
+    scene_records = load_next_batch_scene_records()
 
     show_scenes_with_viser(
         scene_records,
@@ -170,6 +208,7 @@ def main(config: DictConfig) -> None:
         display_mode=str(cfg_select(config, "viser_display_mode", "all")),
         scene_id=int(cfg_select(config, "viser_scene_id", 0)),
         log_prefix="check_human_dataloader",
+        next_batch_loader=load_next_batch_scene_records,
     )
 
 

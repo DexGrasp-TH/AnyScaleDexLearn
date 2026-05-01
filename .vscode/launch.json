@@ -10,24 +10,6 @@
         "console": "integratedTerminal",
         "args": ["minitest_right_full_shadow"]
         },
-         {
-            "name": "sample: humanbi / humanBiDiffusion",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/dexlearn/main.py",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "args": ["task=sample", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "algo.batch_size=64", "exp_name=debug3"]
-        },
-        {
-            "name": "visualize_human: humanbi / humanBiDiffusion",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/dexlearn/main.py",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "args": ["task=visualize_human", "data=humanbi", "algo=humanBiDiffusion", "test_data=DGN_grasp_type", "exp_name=debug3"]
-        },
 
         {
             "name": "check_dataloader: humanMulti",
