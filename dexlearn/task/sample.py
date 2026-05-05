@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.logger import Logger
+from dexlearn.utils.config import resolve_type_supervision_config
 from dexlearn.utils.human_hand import normalize_hand_pos_source
 from dexlearn.utils.util import set_seed
 from dexlearn.dataset import create_test_dataloader
@@ -92,6 +93,7 @@ def _decenter_robot_pose(
 
 
 def task_sample(config: DictConfig):
+    resolve_type_supervision_config(config)
     set_seed(config.seed)
     config.wandb.mode = "disabled"
     logger = Logger(config)
@@ -116,6 +118,30 @@ def task_sample(config: DictConfig):
     with torch.no_grad():
         for data in tqdm(test_loader, desc="Sampling grasps (inference)"):
             result = model.sample(data, config.algo.test_grasp_num)
+
+            if isinstance(result, dict):
+                pred_grasp_type_prob = result.get("pred_grasp_type_prob")
+                pred_grasp_type = result.get("pred_grasp_type_id")
+                if pred_grasp_type_prob is None:
+                    raise KeyError("Score-only sample result must contain pred_grasp_type_prob")
+                if pred_grasp_type_prob.ndim == 2:
+                    pred_grasp_type_prob = pred_grasp_type_prob.unsqueeze(1)
+                if pred_grasp_type is not None and pred_grasp_type.ndim == 1:
+                    pred_grasp_type = pred_grasp_type.unsqueeze(1)
+
+                save_dict = {
+                    "scene_path": data["scene_path"],
+                    "pred_grasp_type_prob": pred_grasp_type_prob,
+                }
+                if "pc_path" in data:
+                    save_dict["pc_path"] = data["pc_path"]
+                if "grasp_type_id" in data:
+                    save_dict["grasp_type_id"] = data["grasp_type_id"]
+                if pred_grasp_type is not None:
+                    save_dict["pred_grasp_type_id"] = pred_grasp_type
+
+                logger.save_samples(save_dict, ckpt_iter, data["save_path"])
+                continue
 
             pred_grasp_type_prob = None
             if len(result) == 4:

@@ -10,6 +10,7 @@ import numpy as np
 import trimesh
 from omegaconf import DictConfig, OmegaConf
 from dexlearn.utils.config import flatten_multidex_data_config
+from dexlearn.dataset.grasp_types import GRASP_TYPES
 
 try:
     from tqdm import tqdm
@@ -25,7 +26,9 @@ except ImportError:
     VISER_AVAILABLE = False
 
 
-VISUALIZE_MODE_OPTIONS = ("random_object", "one_object", "one_object_multi_seq", "grasp_type")
+VISUALIZE_MODE_OPTIONS = ("random_objects", "one_object", "one_object_multi_seq", "grasp_type")
+HUMAN_VISER_MODE_OPTIONS = ("random_objects", "one_object")
+HUMAN_SCORE_SUMMARY_MAX_RECORDS = 20
 CAPTION_ASPECTS = (
     ("scene_id", "Scene ID"),
     ("object_id", "Object ID"),
@@ -65,8 +68,8 @@ def get_task_value(config: DictConfig, key: str, default):
 
 def normalize_visualize_mode(mode: str):
     aliases = {
-        "random": "random_object",
-        "random_objects": "random_object",
+        "random": "random_objects",
+        "random_object": "random_objects",
         "object": "one_object",
         "single_object": "one_object",
         "multi_seq": "one_object_multi_seq",
@@ -81,6 +84,26 @@ def normalize_visualize_mode(mode: str):
 
 def list_sample_files(output_dir: str):
     return sorted(glob(os.path.join(output_dir, "**/*.npy"), recursive=True))
+
+
+def infer_sample_group_from_sample_path(output_dir: str, sample_file: str):
+    """Infer the first-level saved sample group from a sample path.
+
+    Args:
+        output_dir: Root directory that contains saved visualization samples.
+        sample_file: Path to one saved sample file.
+
+    Returns:
+        The first relative path component under ``output_dir`` such as
+        ``0_any`` or ``3_right_full``. Returns an empty string when the path is
+        too short to contain a saved sample group.
+    """
+    try:
+        rel_path = os.path.relpath(sample_file, output_dir)
+    except ValueError:
+        rel_path = sample_file
+    parts = rel_path.split(os.sep)
+    return parts[0] if len(parts) >= 2 else ""
 
 
 def infer_object_id_from_sample_path(output_dir: str, sample_file: str):
@@ -102,6 +125,56 @@ def infer_object_id_from_sample_path(output_dir: str, sample_file: str):
     if len(parts) >= 3:
         return "/".join(parts[1:-1])
     return os.path.splitext(os.path.basename(sample_file))[0]
+
+
+def sample_group_to_grasp_type_id(sample_group: str):
+    """Map a saved sample group name to a grasp type id when possible.
+
+    Args:
+        sample_group: First relative path component under one sample root.
+
+    Returns:
+        Integer grasp type id such as ``0`` or ``3`` when the name starts with
+        a numeric prefix, otherwise ``None``.
+    """
+    match = re.match(r"^(\d+)_", str(sample_group))
+    return int(match.group(1)) if match else None
+
+
+def normalize_human_score_vector(scores, grasp_type_names):
+    """Normalize human type scores to real grasp types ``1..5``.
+
+    Args:
+        scores: Raw score/probability vector saved by the sampler.
+        grasp_type_names: Ordered grasp type names including ``0_any``.
+
+    Returns:
+        A float64 vector aligned with real grasp type ids ``1..5``, or
+        ``None`` when the raw vector shape is not recognized.
+    """
+    score_values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    real_type_num = len(grasp_type_names) - 1
+    if score_values.size == len(grasp_type_names):
+        return score_values[1:].astype(np.float64)
+    if score_values.size == real_type_num:
+        return score_values.astype(np.float64)
+    return None
+
+
+def get_human_score_vector_from_data(data: dict, grasp_type_names):
+    """Read a normalized human type-score vector from one saved sample.
+
+    Args:
+        data: Saved visualization sample payload.
+        grasp_type_names: Ordered grasp type names including ``0_any``.
+
+    Returns:
+        A float64 vector aligned with real grasp type ids ``1..5``, or
+        ``None`` when the sample does not contain compatible scores.
+    """
+    if "pred_grasp_type_prob" not in data:
+        return None
+    return normalize_human_score_vector(data["pred_grasp_type_prob"], grasp_type_names)
 
 
 def extract_grasp_type_id(data: dict):
@@ -190,6 +263,7 @@ def build_visualization_sample_index(
             "data": None,
             "scene_path": "",
             "scene_cfg": {},
+            "sample_group": infer_sample_group_from_sample_path(output_dir, sample_file),
             "object_id": infer_object_id_from_sample_path(output_dir, sample_file),
             "grasp_type_id": None,
         }
@@ -465,7 +539,7 @@ def copy_viser_record_metadata(sample_record, scene_record):
 
 
 def select_visualization_samples(output_dir: str, config: DictConfig, scene_path_resolver=None):
-    mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_object"))
+    mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_objects"))
     max_grasps = int(get_task_value(config, "max_grasps", 20))
     object_id = get_task_value(config, "object_id", None)
     target_grasp_type_id = get_task_value(config, "target_grasp_type_id", None)
@@ -494,7 +568,7 @@ def select_visualization_records(
 ):
     mode = normalize_visualize_mode(mode)
 
-    if mode == "random_object":
+    if mode == "random_objects":
         grouped = {}
         for record in records:
             group_id = base_object_id_from_sequence(record["object_id"]) if is_our_human_grasp_format else record["object_id"]
@@ -873,7 +947,7 @@ def select_visualization_records_from_index(
     """
     mode = normalize_visualize_mode(mode)
     batch_index = max(0, int(batch_index))
-    if mode == "random_object":
+    if mode == "random_objects":
         group_ids = randomize_records(selection_index["random_group_ids"], max_grasps)
         selected = []
         for group_id in group_ids:
@@ -983,9 +1057,9 @@ def build_viser_selection_controls(
     object_options = selection_index["object_ids"] or ("",)
     base_object_options = selection_index["base_object_ids"] or object_options
     grasp_type_options = build_grasp_type_options(sample_records, grasp_type_names)
-    initial_mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_object"))
+    initial_mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_objects"))
     if initial_mode not in mode_options:
-        initial_mode = "random_object"
+        initial_mode = "random_objects"
     initial_object_options = base_object_options if initial_mode in {"one_object", "one_object_multi_seq"} else object_options
     initial_object = pick_initial_object_option(initial_object_options, get_task_value(config, "object_id", None))
     initial_grasp_type = pick_initial_option(grasp_type_options, get_task_value(config, "target_grasp_type_id", None))
@@ -1047,6 +1121,27 @@ def build_scene_grid_offsets(num_scenes: int, spacing: float):
 
 
 def build_grouped_scene_offsets(scene_records, spacing: float):
+    if scene_records and all(
+        "viser_grid_row" in record and "viser_grid_col" in record
+        for record in scene_records
+    ):
+        total_rows = max(int(record.get("viser_grid_rows", 0)) for record in scene_records)
+        total_cols = max(int(record.get("viser_grid_cols", 0)) for record in scene_records)
+        total_rows = max(total_rows, max(int(record["viser_grid_row"]) for record in scene_records) + 1)
+        total_cols = max(total_cols, max(int(record["viser_grid_col"]) for record in scene_records) + 1)
+        offsets = []
+        for record in scene_records:
+            row = int(record["viser_grid_row"])
+            col = int(record["viser_grid_col"])
+            offsets.append(
+                [
+                    (col - (total_cols - 1) / 2.0) * spacing,
+                    ((total_rows - 1) / 2.0 - row) * spacing,
+                    0.0,
+                ]
+            )
+        return np.asarray(offsets, dtype=np.float32)
+
     group_to_indices = {}
     for idx, record in enumerate(scene_records):
         group_id = record.get("viser_spatial_group")
@@ -1342,8 +1437,10 @@ def show_scenes_with_viser(
             scene_handles["value"].extend(add_scene_elements_to_viser(server, record["elements"], scene_name, offset))
             if state["show_full_scene_captions"]:
                 label_text = record["caption"]
-            else:
+            elif state["caption_aspects"]:
                 label_text = build_caption_from_aspects(record, state["caption_aspects"])
+            else:
+                label_text = str(record.get("label_caption", ""))
             label = add_scene_label_to_viser(server, scene_name, label_text, offset, log_prefix) if label_text else None
             if label is not None:
                 scene_handles["value"].append(label)
@@ -1421,7 +1518,32 @@ def show_scenes_with_viser(
                     f"{format_gui_wrappable_value(object_dropdown.value)}"
                 )
 
-            update_object_info()
+            def refresh_selection_widgets():
+                mode = normalize_visualize_mode(str(mode_dropdown.value))
+                object_options = (
+                    selection_controls["object_options_for_mode"](mode)
+                    if "object_options_for_mode" in selection_controls
+                    else object_options_for_mode(mode)
+                )
+                preferred_object = object_dropdown.value if hasattr(object_dropdown, "value") else None
+                initial_object = pick_initial_object_option(object_options, preferred_object)
+                set_viser_dropdown_options(object_dropdown, object_options, initial_object)
+
+                if hasattr(object_dropdown, "disabled"):
+                    object_dropdown.disabled = bool(
+                        selection_controls.get("disable_object_for_mode", lambda current_mode: False)(mode)
+                    )
+                if hasattr(grasp_type_dropdown, "disabled"):
+                    grasp_type_dropdown.disabled = bool(
+                        selection_controls.get("disable_grasp_type_for_mode", lambda current_mode: False)(mode)
+                    )
+                if hasattr(next_batch_button, "disabled"):
+                    next_batch_button.disabled = bool(
+                        selection_controls.get("disable_next_batch_for_mode", lambda current_mode: False)(mode)
+                    )
+                update_object_info()
+
+            refresh_selection_widgets()
 
             @apply_button.on_click
             def _on_apply_selection(event):
@@ -1464,11 +1586,7 @@ def show_scenes_with_viser(
             @mode_dropdown.on_update
             def _on_selection_mode_update(event):
                 del event
-                options = object_options_for_mode(str(mode_dropdown.value))
-                preferred = object_dropdown.value if hasattr(object_dropdown, "value") else None
-                initial_object = pick_initial_object_option(options, preferred)
-                set_viser_dropdown_options(object_dropdown, options, initial_object)
-                update_object_info()
+                refresh_selection_widgets()
 
             @object_dropdown.on_update
             def _on_selection_object_update(event):
@@ -1687,13 +1805,321 @@ def transform_complete_pc(pc, obj_scale_xyz, obj_rot, obj_trans):
     return np.matmul(scaled_pc, obj_rot.T) + obj_trans[None, :]
 
 
+def build_human_visualization_index(sample_records, grasp_type_names):
+    """Build human-specific sample indexes for score-only and pose visualization.
+
+    Args:
+        sample_records: Saved sample records from ``build_visualization_sample_index``.
+        grasp_type_names: Ordered grasp type names such as ``GRASP_TYPES``.
+
+    Returns:
+        Dictionary containing canonical-object-level score and pose indexes.
+        Score summaries may come from legacy ``0_any`` score-only samples or
+        from newer explicit-type pose samples that also store
+        ``pred_grasp_type_prob``.
+    """
+    object_ids = set()
+    score_records_by_object = {}
+    score_candidate_records_by_object = {}
+    pose_records_by_object_and_type = {}
+
+    for record in sample_records:
+        base_object_id = base_object_id_from_sequence(record["object_id"])
+        object_ids.add(base_object_id)
+        score_candidate_records_by_object.setdefault(base_object_id, []).append(record)
+        sample_group = str(record.get("sample_group", ""))
+        grasp_type_id = sample_group_to_grasp_type_id(sample_group)
+        if grasp_type_id is None:
+            continue
+
+        if grasp_type_id == 0:
+            score_records_by_object.setdefault(base_object_id, []).append(record)
+            continue
+
+        pose_records_by_object_and_type.setdefault(base_object_id, {}).setdefault(grasp_type_id, []).append(record)
+
+    return {
+        "records": sample_records,
+        "object_ids": tuple(sorted(object_ids, key=natural_sort_key)),
+        "score_records_by_object": score_records_by_object,
+        "score_candidate_records_by_object": score_candidate_records_by_object,
+        "pose_records_by_object_and_type": pose_records_by_object_and_type,
+        "grasp_type_names": tuple(grasp_type_names),
+        "score_summary_cache": {},
+    }
+
+
+def human_object_score_summary(human_index, object_id: str, scene_path_resolver):
+    """Aggregate human feasibility/type-score outputs for one object.
+
+    Args:
+        human_index: Human visualization index from
+            ``build_human_visualization_index``.
+        object_id: Canonical object id.
+        scene_path_resolver: Resolver used to hydrate saved human scene paths.
+
+    Returns:
+        Dictionary containing averaged score vector and representative records,
+        or ``None`` when no compatible score sample exists for the object.
+    """
+    object_id = base_object_id_from_sequence(object_id)
+    cached = human_index["score_summary_cache"].get(object_id)
+    if cached is not None:
+        return cached
+
+    dedicated_score_records = human_index["score_records_by_object"].get(object_id, [])
+    fallback_score_records = human_index["score_candidate_records_by_object"].get(object_id, [])
+    if not dedicated_score_records and not fallback_score_records:
+        return None
+
+    score_vectors = []
+    scored_records = []
+    representative_record = None
+    representative_data = None
+    seen_paths = set()
+    candidate_groups = [dedicated_score_records]
+    if not dedicated_score_records:
+        candidate_groups.append(fallback_score_records)
+    else:
+        # Keep a fallback for mixed output directories where 0_any exists but
+        # does not carry the latest score field.
+        candidate_groups.append(fallback_score_records)
+
+    for candidate_records in candidate_groups:
+        records_to_scan = list(candidate_records)
+        if len(records_to_scan) > HUMAN_SCORE_SUMMARY_MAX_RECORDS:
+            records_to_scan = random.sample(records_to_scan, k=HUMAN_SCORE_SUMMARY_MAX_RECORDS)
+        for record in records_to_scan:
+            sample_file = record.get("sample_file")
+            if sample_file in seen_paths:
+                continue
+            seen_paths.add(sample_file)
+            load_visualization_record_payload(
+                record,
+                scene_path_resolver=scene_path_resolver,
+                load_scene_cfg=False,
+            )
+            data = record.get("data") or {}
+            scores = get_human_score_vector_from_data(data, human_index["grasp_type_names"])
+            if scores is None:
+                continue
+            if representative_record is None:
+                representative_record = record
+                representative_data = data
+            score_vectors.append(scores)
+            scored_records.append(record)
+        if score_vectors:
+            break
+
+    if not score_vectors:
+        return None
+
+    mean_scores = np.mean(np.stack(score_vectors, axis=0), axis=0)
+    summary = {
+        "object_id": object_id,
+        "scores": mean_scores,
+        "score_records": scored_records,
+        "representative_record": representative_record,
+        "representative_data": representative_data,
+    }
+    human_index["score_summary_cache"][object_id] = summary
+    return summary
+
+
+def format_score_vector_text(scores: np.ndarray, grasp_type_names) -> str:
+    """Format one score vector into compact per-type text.
+
+    Args:
+        scores: Real-type score vector aligned with type ids ``1..5``.
+        grasp_type_names: Ordered grasp type names including ``0_any``.
+
+    Returns:
+        Compact text such as ``1:0.91 2:0.02 3:1.00 4:0.00 5:0.14``.
+    """
+    parts = []
+    for idx, score in enumerate(np.asarray(scores).reshape(-1), start=1):
+        short_name = str(grasp_type_names[idx]).split("_", 1)[0]
+        parts.append(f"{short_name}:{float(score):.2f}")
+    return " ".join(parts)
+
+
+def format_score_array_text(scores: np.ndarray) -> str:
+    """Format ordered feasibility scores as a compact array string.
+
+    Args:
+        scores: Real-type score vector aligned with type ids ``1..5``.
+
+    Returns:
+        Ordered score text such as ``[1.00, 0.00, 1.00, 0.00, 0.00]``.
+    """
+    score_values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    return "[" + ", ".join(f"{score:.2f}" for score in score_values) + "]"
+
+
+def top_scoring_type_text(scores: np.ndarray, grasp_type_names, top_k: int = 3) -> str:
+    """Format the top-scoring human grasp types for one object.
+
+    Args:
+        scores: Real-type score vector aligned with type ids ``1..5``.
+        grasp_type_names: Ordered grasp type names including ``0_any``.
+        top_k: Maximum number of ranked types to format.
+
+    Returns:
+        Compact ranked text such as ``3_right_full=1.00, 5_both_full=0.98``.
+    """
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    ranked = np.argsort(-scores)[: max(0, int(top_k))]
+    parts = []
+    for rank_idx in ranked:
+        type_id = rank_idx + 1
+        parts.append(f"{grasp_type_names[type_id]}={scores[rank_idx]:.2f}")
+    return ", ".join(parts)
+
+
+def compact_human_label_caption(
+    mode: str,
+    object_id: str,
+    grasp_type_id: int,
+    score_summary,
+    sample_rank: int = None,
+    grasp_error: float = None,
+):
+    """Build concise default 3D label text for one human visualization scene.
+
+    Args:
+        object_id: Canonical object id displayed in this scene.
+        grasp_type_id: Grasp type id shown in this scene. ``0`` means score-only.
+        score_summary: Optional aggregated score summary for the object.
+        sample_rank: Optional 1-based sample rank inside the current object/type block.
+        grasp_error: Optional grasp error value from the saved sample.
+
+    Returns:
+        Short multi-field caption string suitable for default 3D labels.
+    """
+    del object_id, sample_rank, grasp_error
+    mode = normalize_visualize_mode(mode)
+    if score_summary is None:
+        return ""
+    if mode == "random_objects":
+        return format_score_array_text(score_summary["scores"])
+
+    if 1 <= int(grasp_type_id) < len(GRASP_TYPES):
+        score = float(score_summary["scores"][int(grasp_type_id) - 1])
+        return f"{GRASP_TYPES[int(grasp_type_id)]} | {score:.2f}"
+    return ""
+
+
+def sample_human_random_object_records(
+    human_index,
+    grasp_type_id: int,
+    max_objects: int,
+    fixed_object_ids=None,
+):
+    """Select object-level human records for ``random_objects`` mode.
+
+    Args:
+        human_index: Human visualization index.
+        grasp_type_id: Target grasp type id. ``0`` selects score-only records.
+        max_objects: Maximum number of objects/scenes to show.
+        fixed_object_ids: Optional ordered object ids to keep the same batch
+            while switching grasp types.
+
+    Returns:
+        List of dictionaries describing selected objects and representative
+        score/pose records.
+    """
+    candidates = []
+    object_ids = tuple(fixed_object_ids) if fixed_object_ids is not None else human_index["object_ids"]
+    for object_id in object_ids:
+        score_summary = human_object_score_summary(human_index, object_id, resolve_human_dataset_path)
+        if grasp_type_id == 0:
+            if score_summary is None or score_summary["representative_record"] is None:
+                continue
+            candidates.append(
+                {
+                    "object_id": object_id,
+                    "score_summary": score_summary,
+                    "record": random.choice(score_summary["score_records"]),
+                    "grasp_type_id": 0,
+                }
+            )
+            continue
+
+        pose_records = human_index["pose_records_by_object_and_type"].get(object_id, {}).get(int(grasp_type_id), [])
+        if not pose_records:
+            continue
+        candidates.append(
+            {
+                "object_id": object_id,
+                "score_summary": score_summary,
+                "record": random.choice(pose_records),
+                "grasp_type_id": int(grasp_type_id),
+            }
+        )
+
+    if not candidates:
+        return []
+    if fixed_object_ids is None:
+        selected = randomize_records(candidates, max_objects)
+    else:
+        selected = candidates[: max_objects if max_objects > 0 else None]
+    for idx, item in enumerate(selected):
+        item["scene_label"] = f"{idx:02d} | {item['object_id']}"
+    return selected
+
+
+def sample_human_one_object_records(
+    human_index,
+    object_id: str,
+    per_type_grasps: int = 5,
+    batch_index: int = 0,
+):
+    """Select one object's 5-type visualization bundle.
+
+    Args:
+        human_index: Human visualization index.
+        object_id: Target canonical object id.
+        per_type_grasps: Number of pose samples to show for each real grasp type.
+        batch_index: Zero-based batch index used to page within each grasp type.
+
+    Returns:
+        List of dictionaries describing selected pose records ordered by grasp type.
+    """
+    object_id = base_object_id_from_sequence(object_id)
+    score_summary = human_object_score_summary(human_index, object_id, resolve_human_dataset_path)
+    selected = []
+    for grasp_type_id in range(1, len(human_index["grasp_type_names"])):
+        pose_records = sorted(
+            human_index["pose_records_by_object_and_type"].get(object_id, {}).get(grasp_type_id, []),
+            key=lambda record: record["sample_file"],
+        )
+        if not pose_records:
+            continue
+        pose_records = slice_records_batch(
+            pose_records,
+            max(0, int(per_type_grasps)),
+            batch_index,
+        )
+        for sample_rank, record in enumerate(pose_records, start=1):
+            selected.append(
+                {
+                    "object_id": object_id,
+                    "score_summary": score_summary,
+                    "record": record,
+                    "grasp_type_id": grasp_type_id,
+                    "sample_rank": sample_rank,
+                    "scene_label": f"{GRASP_TYPES[grasp_type_id]} | {sample_rank}",
+                }
+            )
+    return selected
+
+
 def task_visualize_human(config: DictConfig) -> None:
     import torch
     from pytorch3d.transforms import matrix_to_axis_angle
     from manopth.manolayer import ManoLayer
     from mr_utils.utils_calc import posQuat2Isometry3d, quatWXYZ2XYZW
 
-    from dexlearn.dataset import GRASP_TYPES
     from dexlearn.utils.human_hand import get_wrist_translation_from_target, normalize_hand_pos_source
     from dexlearn.utils.logger import Logger
     from dexlearn.utils.util import set_seed
@@ -1737,115 +2163,261 @@ def task_visualize_human(config: DictConfig) -> None:
     if not all_sample_records:
         raise RuntimeError(f"No saved grasp files found in {output_dir}")
 
-    def build_human_scene_records(sample_records):
+    human_index = build_human_visualization_index(all_sample_records, GRASP_TYPES)
+    random_object_scene_count = 25
+    one_object_per_type = 5
+
+    def load_human_visualization_point_cloud(data, scene_cfg, scene_path, sample_file):
+        """Load one visualization point cloud in the world frame when needed.
+
+        Args:
+            data: Saved sample payload.
+            scene_cfg: Loaded scene config.
+            scene_path: Scene config path.
+            sample_file: Saved sample file path.
+
+        Returns:
+            Subsampled point cloud used for visualization.
+        """
+        if bool(OmegaConf.select(config, "test_data.human")):
+            _, obj_scale_xyz, obj_rot, obj_trans = extract_object_meta(scene_cfg, scene_path)
+            pc_path = resolve_human_dataset_path(data["pc_path"])
+            raw_pc = np.load(pc_path, allow_pickle=True)
+            idx = np.random.choice(raw_pc.shape[0], config.data.num_points, replace=True)
+            return transform_complete_pc(raw_pc[idx], obj_scale_xyz, obj_rot, obj_trans)
+
+        pc_path = resolve_human_dataset_path(data["pc_path"])
+        raw_pc = np.load(pc_path, allow_pickle=True)
+        idx = np.random.choice(raw_pc.shape[0], config.data.num_points, replace=True)
+        pc = raw_pc[idx]
+        if pc_source == "complete":
+            _, obj_scale_xyz, obj_rot, obj_trans = extract_object_meta(scene_cfg, scene_path)
+            pc = transform_complete_pc(pc, obj_scale_xyz, obj_rot, obj_trans)
+        return pc
+
+    def build_human_scene_records(entry_records, mode: str):
+        """Build human visualization scene records for the selected entries.
+
+        Args:
+            entry_records: Human visualization entries from one selection mode.
+            mode: Human visualization mode.
+
+        Returns:
+            Scene records consumed by ``show_scenes_with_viser`` or ``trimesh``.
+        """
         scene_records = []
-        record_iter = progress_iter(sample_records, desc="Building human visualization scenes", total=len(sample_records))
-        for sample_record in record_iter:
+        record_iter = progress_iter(entry_records, desc="Building human visualization scenes", total=len(entry_records))
+        for entry in record_iter:
+            sample_record = entry["record"]
+            grasp_type_id = int(entry["grasp_type_id"])
+            object_id = str(entry["object_id"])
+            score_summary = entry.get("score_summary")
+
             load_visualization_record_payload(sample_record, scene_path_resolver=resolve_human_dataset_path)
             sample_file = sample_record["sample_file"]
-
             data = sample_record["data"]
-            grasp_pose = data["grasp_pose"]
             scene_path = sample_record["scene_path"]
             scene_cfg = sample_record["scene_cfg"]
             if not scene_cfg:
                 raise RuntimeError(f"Scene config is unavailable for sample: {sample_file}")
 
-            grasp_type_str = ""
-            if "grasp_type_id" in data:
-                gt_type_id = int(data["grasp_type_id"])
-                grasp_type_str += f" | Given: {GRASP_TYPES[gt_type_id]}"
-            if "pred_grasp_type_id" in data:
-                pred_type_id = int(data["pred_grasp_type_id"])
-                grasp_type_str += f" | Pred: {GRASP_TYPES[pred_type_id]}"
-            if "pred_grasp_type_prob" in data:
-                pred_grasp_type_prob = np.asarray(data["pred_grasp_type_prob"]).reshape(-1)
-                prob_str = ", ".join([f"{p:.3f}" for p in pred_grasp_type_prob.tolist()])
-                grasp_type_str += f" | pred_grasp_type_prob=[{prob_str}]"
             grasp_pos_source = normalize_hand_pos_source(data.get("grasp_pos_source", "wrist"))
-            grasp_type_str += f" | Pos: {grasp_pos_source}"
-            grasp_type_str += f" | PC: {infer_pc_source_from_sample_file(sample_file)}"
-
-            if bool(OmegaConf.select(config, "test_data.human")):
-                _, obj_scale_xyz, obj_rot, obj_trans = extract_object_meta(scene_cfg, scene_path)
-                pc_path = resolve_human_dataset_path(data["pc_path"])
-                raw_pc = np.load(pc_path, allow_pickle=True)
-                idx = np.random.choice(raw_pc.shape[0], config.data.num_points, replace=True)
-                pc = transform_complete_pc(raw_pc[idx], obj_scale_xyz, obj_rot, obj_trans)
-            else:
-                pc_path = resolve_human_dataset_path(data["pc_path"])
-                raw_pc = np.load(pc_path, allow_pickle=True)
-                idx = np.random.choice(raw_pc.shape[0], config.data.num_points, replace=True)
-                pc = raw_pc[idx]
-                if pc_source == "complete":
-                    _, obj_scale_xyz, obj_rot, obj_trans = extract_object_meta(scene_cfg, scene_path)
-                    pc = transform_complete_pc(pc, obj_scale_xyz, obj_rot, obj_trans)
+            pc = load_human_visualization_point_cloud(data, scene_cfg, scene_path, sample_file)
 
             scene_elements = []
-            poses = np.split(grasp_pose, len(grasp_pose) // 7)
-            side_names = ["right", "left"]
-            colors = [
-                [180, 200, 255, 220],
-                [210, 190, 250, 220],
-            ]
+            if grasp_type_id > 0 and "grasp_pose" in data:
+                grasp_pose = data["grasp_pose"]
+                poses = np.split(grasp_pose, len(grasp_pose) // 7)
+                side_names = ["right", "left"]
+                colors = [
+                    [180, 200, 255, 220],
+                    [210, 190, 250, 220],
+                ]
 
-            for i, p in enumerate(poses):
-                if np.allclose(p, 0, atol=1e-3):
-                    continue
+                for i, p in enumerate(poses):
+                    if np.allclose(p, 0, atol=1e-3):
+                        continue
 
-                hand_pose_np = posQuat2Isometry3d(p[:3], quatWXYZ2XYZW(p[3:7]))
-                side = side_names[i]
-                m_layer = mano_layers[side]
-                hand_target_pos = torch.from_numpy(p[:3]).to(config.device).float()
-                hand_rot_mat = torch.from_numpy(hand_pose_np[:3, :3]).to(config.device).unsqueeze(0).float()
+                    hand_pose_np = posQuat2Isometry3d(p[:3], quatWXYZ2XYZW(p[3:7]))
+                    side = side_names[i]
+                    m_layer = mano_layers[side]
+                    hand_target_pos = torch.from_numpy(p[:3]).to(config.device).float()
+                    hand_rot_mat = torch.from_numpy(hand_pose_np[:3, :3]).to(config.device).unsqueeze(0).float()
 
-                mano_params = torch.cat(
-                    [matrix_to_axis_angle(hand_rot_mat), torch.zeros((1, 45), device=config.device)], dim=-1
-                )
-                verts, joints = m_layer(mano_params, th_betas=torch.zeros((1, 10), device=config.device))
-                wrist_trans = get_wrist_translation_from_target(hand_target_pos, joints[0], grasp_pos_source)
-
-                hand_pose_np[:3, 3] = wrist_trans.cpu().numpy()
-                scene_elements.append(trimesh.creation.axis(transform=hand_pose_np, origin_size=0.01))
-
-                v_np = ((verts[0] / 1000.0) + wrist_trans).cpu().numpy()
-                f_np = m_layer.th_faces.cpu().numpy()
-                scene_elements.extend(visualize_with_trimesh(v_np, f_np, None, color=colors[i]))
-                if grasp_pos_source == "index_mcp":
-                    mcp_pose = np.eye(4)
-                    mcp_pose[:3, :3] = hand_rot_mat[0].cpu().numpy()
-                    mcp_pose[:3, 3] = hand_target_pos.cpu().numpy()
-                    scene_elements.append(
-                        trimesh.creation.axis(
-                            transform=mcp_pose,
-                            origin_size=0.008,
-                            axis_radius=0.003,
-                            axis_length=0.08,
-                        )
+                    mano_params = torch.cat(
+                        [matrix_to_axis_angle(hand_rot_mat), torch.zeros((1, 45), device=config.device)], dim=-1
                     )
+                    verts, joints = m_layer(mano_params, th_betas=torch.zeros((1, 10), device=config.device))
+                    wrist_trans = get_wrist_translation_from_target(hand_target_pos, joints[0], grasp_pos_source)
+
+                    hand_pose_np[:3, 3] = wrist_trans.cpu().numpy()
+                    scene_elements.append(trimesh.creation.axis(transform=hand_pose_np, origin_size=0.01))
+
+                    v_np = ((verts[0] / 1000.0) + wrist_trans).cpu().numpy()
+                    f_np = m_layer.th_faces.cpu().numpy()
+                    scene_elements.extend(visualize_with_trimesh(v_np, f_np, None, color=colors[i]))
+                    if grasp_pos_source == "index_mcp":
+                        mcp_pose = np.eye(4)
+                        mcp_pose[:3, :3] = hand_rot_mat[0].cpu().numpy()
+                        mcp_pose[:3, 3] = hand_target_pos.cpu().numpy()
+                        scene_elements.append(
+                            trimesh.creation.axis(
+                                transform=mcp_pose,
+                                origin_size=0.008,
+                                axis_radius=0.003,
+                                axis_length=0.08,
+                            )
+                        )
 
             scene_elements.append(trimesh.points.PointCloud(pc, colors=[255, 0, 0, 255]))
             scene_elements.append(trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3))
-            caption = prefix_caption_with_viser_label(sample_record, f"{os.path.basename(sample_file)}{grasp_type_str}")
+            if grasp_type_id == 0:
+                full_caption = (
+                    f"{entry['scene_label']} | file={os.path.basename(sample_file)} | "
+                    f"scores={format_score_array_text(score_summary['scores'])} | "
+                    f"PC: {infer_pc_source_from_sample_file(sample_file)}"
+                )
+                label_caption = compact_human_label_caption(
+                    mode,
+                    object_id,
+                    0,
+                    score_summary,
+                )
+            else:
+                grasp_error = float(data["grasp_error"]) if "grasp_error" in data else None
+                type_score = None if score_summary is None else float(score_summary["scores"][grasp_type_id - 1])
+                full_caption = (
+                    f"{entry['scene_label']} | file={os.path.basename(sample_file)} | "
+                    f"type={GRASP_TYPES[grasp_type_id]} | "
+                )
+                if type_score is not None:
+                    full_caption += f"type_score={type_score:.4f} | "
+                if grasp_error is not None:
+                    full_caption += f"err={grasp_error:.4f} | "
+                full_caption += f"Pos: {grasp_pos_source} | PC: {infer_pc_source_from_sample_file(sample_file)}"
+                label_caption = compact_human_label_caption(
+                    mode,
+                    object_id,
+                    grasp_type_id,
+                    score_summary,
+                    sample_rank=entry.get("sample_rank"),
+                    grasp_error=grasp_error,
+                )
             scene_record = {
                 "elements": scene_elements,
-                "caption": caption,
+                "caption": full_caption,
+                "label_caption": label_caption,
+                "viser_all_label": entry["scene_label"],
             }
-            copy_viser_record_metadata(sample_record, scene_record)
-            if visualizer == "trimesh":
-                show_scenes_with_trimesh([scene_record])
-            else:
-                scene_records.append(scene_record)
+            if entry.get("spatial_group"):
+                scene_record["viser_spatial_group"] = entry["spatial_group"]
+            elif mode == "one_object" and grasp_type_id > 0:
+                scene_record["viser_grid_row"] = grasp_type_id - 1
+                scene_record["viser_grid_col"] = max(0, int(entry.get("sample_rank", 1)) - 1)
+                scene_record["viser_grid_rows"] = len(GRASP_TYPES) - 1
+                scene_record["viser_grid_cols"] = one_object_per_type
+            scene_records.append(scene_record)
         return scene_records
 
+    def build_human_selection_controls():
+        """Build human-specific viser selection controls for the new sample semantics."""
+        initial_mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_objects"))
+        if initial_mode not in HUMAN_VISER_MODE_OPTIONS:
+            initial_mode = "random_objects"
+
+        object_options = human_index["object_ids"] or ("",)
+        grasp_type_options = tuple(format_grasp_type_option(idx, GRASP_TYPES) for idx in range(len(GRASP_TYPES)))
+        initial_object = pick_initial_object_option(object_options, get_task_value(config, "object_id", None))
+        initial_grasp_type = pick_initial_option(grasp_type_options, get_task_value(config, "target_grasp_type_id", 0))
+        batch_state = {"key": None, "index": 0}
+        random_object_state = {"pool": None}
+
+        def build_random_object_pool():
+            if random_object_state["pool"] is not None:
+                return random_object_state["pool"]
+            object_pool = []
+            for object_id in human_index["object_ids"]:
+                if human_object_score_summary(human_index, object_id, resolve_human_dataset_path) is not None:
+                    object_pool.append(object_id)
+            random.shuffle(object_pool)
+            random_object_state["pool"] = tuple(object_pool)
+            return random_object_state["pool"]
+
+        def select_random_object_batch(batch_index: int, reshuffle: bool = False):
+            if reshuffle or random_object_state["pool"] is None:
+                random_object_state["pool"] = None
+            object_pool = build_random_object_pool()
+            if not object_pool:
+                return ()
+            return tuple(
+                slice_records_batch(
+                    object_pool,
+                    random_object_scene_count,
+                    batch_index,
+                )
+            )
+
+        def load_scene_records(mode, object_id, grasp_type_option, advance_batch=False):
+            mode = normalize_visualize_mode(mode)
+            grasp_type_id = parse_grasp_type_option(grasp_type_option) if grasp_type_option else 0
+            selection_key = (mode,) if mode == "random_objects" else (mode, str(object_id))
+            selection_changed = selection_key != batch_state["key"]
+            if selection_key != batch_state["key"]:
+                batch_state["key"] = selection_key
+                batch_state["index"] = 0
+            elif advance_batch:
+                batch_state["index"] += 1
+            elif not advance_batch and mode != "random_objects":
+                batch_state["index"] = 0
+
+            if mode == "random_objects":
+                batch_object_ids = select_random_object_batch(
+                    batch_state["index"],
+                    reshuffle=selection_changed,
+                )
+                entry_records = sample_human_random_object_records(
+                    human_index,
+                    grasp_type_id=grasp_type_id,
+                    max_objects=random_object_scene_count,
+                    fixed_object_ids=batch_object_ids,
+                )
+            elif mode == "one_object":
+                entry_records = sample_human_one_object_records(
+                    human_index,
+                    object_id=object_id,
+                    per_type_grasps=one_object_per_type,
+                    batch_index=batch_state["index"],
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported human visualize_mode={mode}. Expected one of {list(HUMAN_VISER_MODE_OPTIONS)}."
+                )
+
+            if not entry_records:
+                raise RuntimeError(
+                    f"No human visualization entries matched mode={mode}, object_id={object_id}, "
+                    f"grasp_type_id={grasp_type_id}."
+                )
+            return build_human_scene_records(entry_records, mode)
+
+        return {
+            "mode_options": HUMAN_VISER_MODE_OPTIONS,
+            "initial_mode": initial_mode,
+            "object_options": object_options,
+            "base_object_options": object_options,
+            "initial_object": initial_object,
+            "grasp_type_options": grasp_type_options,
+            "initial_grasp_type": initial_grasp_type,
+            "load_scene_records": load_scene_records,
+            "batch_state": batch_state,
+            "object_options_for_mode": lambda mode: object_options,
+            "disable_object_for_mode": lambda mode: normalize_visualize_mode(mode) == "random_objects",
+            "disable_grasp_type_for_mode": lambda mode: normalize_visualize_mode(mode) == "one_object",
+            "disable_next_batch_for_mode": lambda mode: False,
+        }
+
     if visualizer == "viser":
-        selection_controls = build_viser_selection_controls(
-            all_sample_records,
-            config,
-            build_human_scene_records,
-            grasp_type_names=GRASP_TYPES,
-            is_our_human_grasp_format=is_our_human_grasp_format,
-        )
+        selection_controls = build_human_selection_controls()
         scene_records = selection_controls["load_scene_records"](
             selection_controls["initial_mode"],
             selection_controls["initial_object"],
@@ -1861,15 +2433,21 @@ def task_visualize_human(config: DictConfig) -> None:
             selection_controls=selection_controls,
         )
     else:
-        initial_sample_records = select_visualization_records(
-            all_sample_records,
-            get_task_value(config, "visualize_mode", "random_object"),
-            int(get_task_value(config, "max_grasps", 20)),
-            get_task_value(config, "object_id", None),
-            get_task_value(config, "target_grasp_type_id", None),
-            is_our_human_grasp_format=is_our_human_grasp_format,
-        )
-        build_human_scene_records(initial_sample_records)
+        initial_mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_objects"))
+        initial_grasp_type_id = int(get_task_value(config, "target_grasp_type_id", 0))
+        if initial_mode == "one_object":
+            entry_records = sample_human_one_object_records(
+                human_index,
+                object_id=get_task_value(config, "object_id", None),
+                per_type_grasps=one_object_per_type,
+            )
+        else:
+            entry_records = sample_human_random_object_records(
+                human_index,
+                grasp_type_id=initial_grasp_type_id,
+                max_objects=random_object_scene_count,
+            )
+        show_scenes_with_trimesh(build_human_scene_records(entry_records, initial_mode))
 
 
 def build_robot_components(config: DictConfig):
@@ -2111,7 +2689,7 @@ def task_visualize_robot(config: DictConfig) -> None:
     else:
         initial_sample_records = select_visualization_records(
             all_sample_records,
-            get_task_value(config, "visualize_mode", "random_object"),
+            get_task_value(config, "visualize_mode", "random_objects"),
             int(get_task_value(config, "max_grasps", 20)),
             get_task_value(config, "object_id", None),
             get_task_value(config, "target_grasp_type_id", None),

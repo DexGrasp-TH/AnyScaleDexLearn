@@ -21,14 +21,9 @@ BASE_OVERRIDES=(
   device=cuda:0
 )
 
-# RUN_SPECS=(
-#   "0|debug_scale_off|model_registry.key_features=baseline_20k_scale_off data.augmentation.scale.enabled=false"
-#   "1|debug_scale_on|model_registry.key_features=scale_aug_0.75_1.25 data.augmentation.scale.enabled=true data.augmentation.scale.min=0.75 data.augmentation.scale.max=1.25"
-# )
-
 RUN_SPECS=(
-  "3|debug10|"
-  "4|debug11|data.point_cloud.random_pc_across_sequences=true"
+  "1|debug25|algo.model.type_objective=ce data.sampling.train_unit=record_uniform"
+  "2|debug26|algo.model.type_objective=ce data.sampling.train_unit=object_uniform"
 )
 
 PIDS=()

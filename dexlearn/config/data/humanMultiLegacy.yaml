@@ -1,11 +1,6 @@
 human: true
 dataset_type: HumanMultiDexDataset
 
-available_views:
-  record: true
-  sequence: true
-  object: true
-
 runtime:
   num_workers: 10
 
@@ -20,12 +15,6 @@ point_cloud:
   # If true, one grasp can condition on any point cloud from the same canonical object.
   # If false, the point cloud must match the grasp sequence id.
   random_pc_across_sequences: false
-
-sampling:
-  # record_uniform matches the empirical record distribution. object_uniform
-  # first samples canonical objects uniformly, then records within each object.
-  # Neither mode directly reweights grasp types.
-  train_unit: record_uniform
 
 augmentation:
   pc_centering: true
@@ -44,6 +33,24 @@ augmentation:
   pc_noise:
     enabled: true
     scale: 0.001
+
+feasibility:
+  enabled: false
+  label_mode: open_world_positive_only
+
+type_balancing:
+  # Analyze the real train split and use it for mild grasp-type balancing.
+  enabled: true
+  sampler:
+    enabled: true
+    # q(type) is proportional to count(type)^alpha. 1.0 keeps the data distribution; 0.0 is type-uniform.
+    alpha: 0.5
+    object_uniform: true
+  loss_weight:
+    enabled: true
+    # Keep this weak when sampler balancing is enabled to avoid double-counting rare types.
+    beta: 0.25
+    reference: sampler # sampler or data
 
 human_hand:
   position_source: index_mcp # wrist or index_mcp

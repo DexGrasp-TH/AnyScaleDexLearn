@@ -1,0 +1,37 @@
+name: obj_human_prior_export
+
+# Export every configured object split. DGN assets provide train/test splits; using
+# both here covers the full object asset set used by downstream BODex synthesis.
+object_splits:
+  - all
+
+# One score pass predicts the 5 real grasp-type budget scores for each scene.
+score_grasp_types:
+  - 0_any
+
+# One fixed-type pose pass generates unsorted wrist samples for each real type.
+pose_grasp_types:
+  - 1_right_two
+  - 2_right_three
+  - 3_right_full
+  - 4_both_three
+  - 5_both_full
+
+samples_per_type: 20
+output_dir:
+quat_norm_tol: 0.001
+
+# Reusing completed scene files is important for long exports that may be
+# interrupted. A scene is skipped only when its existing .npy file passes the
+# current shape, field, and quaternion checks.
+skip_existing: true
+
+# Keep the default export focused on the BODex-facing prior. If the trained
+# human model uses hand_pos_source=index_mcp, the export stores index_mcp_pos
+# directly and does not run MANO to infer wrist_pos.
+include_log_prob: false
+include_grasp_pose: false
+
+# Throughput is controlled by the global dataloader/model overrides. Increase
+# algo.batch_size until GPU memory is close to full; then raise num_workers if
+# point-cloud loading becomes the bottleneck.

@@ -77,6 +77,12 @@ class RobotMultiDexDataset(Dataset):
 
         if self.config.mini_test:
             self.obj_id_lst = self.obj_id_lst[:10]
+        self.obj_id_lst = self._subsample_test_items(
+            self.obj_id_lst,
+            max_count=int(getattr(self.config, "test_object_num", 0)),
+            seed=int(getattr(self.config, "test_subset_seed", 0)),
+            item_name="object",
+        )
 
         scene_patterns = (
             [self.config.test_scene_cfg] if isinstance(self.config.test_scene_cfg, str) else self.config.test_scene_cfg
@@ -88,12 +94,38 @@ class RobotMultiDexDataset(Dataset):
             for pattern in scene_patterns:
                 test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
 
-        self.test_cfg_lst = sorted(test_cfg_set)
+        self.test_cfg_lst = self._subsample_test_items(
+            sorted(test_cfg_set),
+            max_count=int(getattr(self.config, "test_scene_num", 0)),
+            seed=int(getattr(self.config, "test_subset_seed", 0)) + 1,
+            item_name="scene",
+        )
         self.data_num = self.grasp_type_num * len(self.test_cfg_lst)  # TO BE CHECKED
+        display_grasp_type_lst = getattr(self.config, "display_grasp_type_lst", self.grasp_type_lst)
         print(
-            f"Test split: {split_name}, grasp type list: {self.grasp_type_lst}, "
+            f"Test split: {split_name}, grasp type list: {display_grasp_type_lst}, "
             f"object cfg num: {len(self.test_cfg_lst)}"
         )
+
+    def _subsample_test_items(self, items, max_count, seed, item_name):
+        """Randomly subsample test objects or scenes for faster evaluation sampling.
+
+        Args:
+            items: Ordered object ids or scene config paths.
+            max_count: Maximum number of items to keep. Values <= 0 keep all items.
+            seed: Deterministic seed for the local sampler.
+            item_name: Human-readable item name used in logs.
+
+        Returns:
+            Sorted list containing either all items or a deterministic random subset.
+        """
+        items = list(items)
+        if max_count <= 0 or max_count >= len(items):
+            return items
+        sampler = random.Random(seed)
+        selected = sorted(sampler.sample(items, max_count))
+        print(f"Randomly selected {len(selected)}/{len(items)} test {item_name}s with seed={seed}.")
+        return selected
 
     def _scene_id_from_grasp_path(self, grasp_path, obj_id):
         relative_path = os.path.relpath(grasp_path, self.config.grasp_path)

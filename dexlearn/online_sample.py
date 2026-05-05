@@ -13,12 +13,13 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.logger import Logger
 from dexlearn.utils.util import set_seed
-from dexlearn.utils.config import flatten_multidex_data_config
+from dexlearn.utils.config import flatten_multidex_data_config, resolve_type_supervision_config
 from dexlearn.dataset import create_test_dataloader
 from dexlearn.dataset import minkowski_collate_fn
 from dexlearn.network.models import *
 
 def main_func(config: DictConfig) -> None:
+    resolve_type_supervision_config(config)
     set_seed(config.seed)
     flatten_multidex_data_config(config.data)
     config.wandb.mode = "disabled"
@@ -81,7 +82,22 @@ def main_func(config: DictConfig) -> None:
 
     # model inference
     with torch.no_grad():
-        robot_pose, log_prob = model.sample(data, config.algo.test_grasp_num)
+        result = model.sample(data, config.algo.test_grasp_num)
+        if isinstance(result, dict):
+            pred_grasp_type_prob = result["pred_grasp_type_prob"]
+            pred_grasp_type_id = result.get("pred_grasp_type_id")
+            save_dict = {
+                "pred_grasp_type_prob": pred_grasp_type_prob.detach().cpu().numpy(),
+            }
+            if pred_grasp_type_id is not None:
+                save_dict["pred_grasp_type_id"] = pred_grasp_type_id.detach().cpu().numpy()
+
+            save_dir = "output/test"
+            os.makedirs(save_dir, exist_ok=True)
+            np.save(os.path.join(save_dir, "test.npy"), save_dict)
+            return
+
+        robot_pose, log_prob = result
         # select top k predictions with higher log_prob
         topk_indices = torch.topk(log_prob, config.algo.test_topk, dim=1).indices
         batch_indices = (

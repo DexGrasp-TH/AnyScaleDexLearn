@@ -1,0 +1,59 @@
+# Human model evaluation over already saved samples.
+
+# Evaluation never runs sampling. It reads:
+# <output_folder>/<wandb.id>/tests/<ckpt_step>/<test_data.name>/**/*.npy
+
+# Set >0 for a quick partial evaluation.
+max_sample_files: 0
+
+# auto: require score samples for feasibility models only.
+# true/false can force or disable the check.
+require_score_samples: auto
+
+# Fixed-type pose samples are needed for pose NN, diversity, and bbox sanity.
+require_pose_samples: true
+
+# Empty means write to <sample_output_dir>/evaluation_report.md.
+report_md:
+
+# Feasibility thresholds for converting 5 type scores into BODex candidate sets.
+# ``score_threshold`` is kept as the default single-point threshold for quick reads.
+score_threshold: 0.5
+score_thresholds: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+coverage_top_k: [1, 2, 3, 5]
+
+# Rule-based sanity checks for predicted feasible type sets. Thresholds are in meters.
+large_dim_min_m: 0.15
+small_dim_max_m: 0.05
+tiny_dim_max_m: 0.03
+ordinal_margin: 0.0
+
+# Normalize translation and rotation before combining them into the NN score.
+trans_ref_m: 0.02
+rot_ref_deg: 10.0
+
+# Rows under both thresholds are counted as near-copies.
+near_copy_trans_m: 0.01
+near_copy_rot_deg: 5.0
+
+# Object-specific NN novelty analysis. Leave object ids empty to automatically
+# analyze the sampled objects with the largest number of generated grasps.
+object_analysis_object_id: ""
+object_analysis_object_ids: []
+object_analysis_top_k: 5
+object_analysis_same_type_only: False
+
+# A generated grasp is counted as object-level novel when either threshold is met.
+object_novel_trans_m: 0.03
+object_novel_rot_deg: 15.0
+
+# Empty means write to <sample_output_dir>/evaluation_object_specific_nn.csv.
+object_analysis_output_csv:
+
+# Diversity uses pairwise distances inside each object/type group. This cap avoids
+# quadratic blowups for large sample sets.
+diversity_max_poses_per_group: 50
+
+# Set >0 to cap bbox geometry analysis independently of max_sample_files.
+geometry_max_sample_files: 0
+bbox_outlier_threshold_m: 0.2

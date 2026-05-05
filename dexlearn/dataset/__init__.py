@@ -5,7 +5,7 @@ import torch.utils
 from torch.utils.data import DataLoader
 import torch.utils.data
 from torch.utils.data._utils.collate import default_collate
-from omegaconf import DictConfig, ListConfig, open_dict
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 import MinkowskiEngine as ME
 import torch
 from copy import deepcopy
@@ -17,7 +17,12 @@ from .human_dex import HumanDexDataset
 from .human_bidex import HumanBiDexDataset
 from .human_multidex import HumanMultiDexDataset
 from .robot_multidex import RobotMultiDexDataset
-from dexlearn.utils.config import cfg_get, flatten_multidex_data_config
+from dexlearn.utils.config import (
+    apply_type_supervision_to_data_config,
+    cfg_get,
+    flatten_multidex_data_config,
+    resolve_type_supervision_config,
+)
 
 
 def _natural_sort_key(value):
@@ -191,22 +196,33 @@ def _prepare_training_distribution_balance(train_dataset, config):
     Returns:
         Distribution analysis dictionary saved to the output folder.
     """
+    resolve_type_supervision_config(config)
     analysis = _merge_distribution_analyses(train_dataset)
     type_counts = analysis["type_counts"]
     data_total = float(sum(int(v) for v in type_counts.values()))
     data_probs = {str(type_id): (int(type_counts[str(type_id)]) / data_total if data_total > 0 else 0.0) for type_id in type_counts}
 
-    sampler_enabled = bool(getattr(config.data, "type_balancing_enabled", False)) and bool(
-        getattr(config.data, "type_sampler_enabled", False)
-    )
-    sampler_alpha = float(getattr(config.data, "type_sampler_alpha", 1.0))
-    sampler_probs = _compute_tempered_type_probabilities(type_counts, sampler_alpha if sampler_enabled else 1.0)
+    balancing_cfg = OmegaConf.select(config, "algo.supervision.balancing")
+    if balancing_cfg is not None:
+        balancing_enabled = bool(cfg_get(balancing_cfg, "enabled", default=False))
+        sampler_cfg = cfg_get(balancing_cfg, "sampler", default=None)
+        loss_weight_cfg = cfg_get(balancing_cfg, "loss_weight", default=None)
+        sampler_enabled = balancing_enabled and bool(cfg_get(sampler_cfg, "enabled", default=True))
+        sampler_alpha = float(cfg_get(sampler_cfg, "alpha", default=1.0))
+        sampler_object_uniform = bool(cfg_get(sampler_cfg, "object_uniform", default=True))
+        loss_weight_enabled = balancing_enabled and bool(cfg_get(loss_weight_cfg, "enabled", default=False))
+        loss_weight_beta = float(cfg_get(loss_weight_cfg, "beta", default=0.0))
+        reference_name = str(cfg_get(loss_weight_cfg, "reference", default="sampler")).lower()
+    else:
+        balancing_enabled = bool(getattr(config.data, "type_balancing_enabled", False))
+        sampler_enabled = balancing_enabled and bool(getattr(config.data, "type_sampler_enabled", False))
+        sampler_alpha = float(getattr(config.data, "type_sampler_alpha", 1.0))
+        sampler_object_uniform = bool(getattr(config.data, "type_sampler_object_uniform", True))
+        loss_weight_enabled = balancing_enabled and bool(getattr(config.data, "type_loss_weight_enabled", False))
+        loss_weight_beta = float(getattr(config.data, "type_loss_weight_beta", 0.0))
+        reference_name = str(getattr(config.data, "type_loss_weight_reference", "sampler")).lower()
 
-    loss_weight_enabled = bool(getattr(config.data, "type_balancing_enabled", False)) and bool(
-        getattr(config.data, "type_loss_weight_enabled", False)
-    )
-    loss_weight_beta = float(getattr(config.data, "type_loss_weight_beta", 0.0))
-    reference_name = str(getattr(config.data, "type_loss_weight_reference", "sampler")).lower()
+    sampler_probs = _compute_tempered_type_probabilities(type_counts, sampler_alpha if sampler_enabled else 1.0)
     reference_probs = sampler_probs if reference_name == "sampler" else data_probs
     type_loss_weights = (
         _compute_type_loss_weights(type_counts, reference_probs, loss_weight_beta) if loss_weight_enabled else None
@@ -215,10 +231,10 @@ def _prepare_training_distribution_balance(train_dataset, config):
     analysis["type_probabilities"] = {"data": data_probs, "sampler": sampler_probs}
     analysis["type_loss_weights"] = type_loss_weights
     analysis["type_balancing"] = {
-        "enabled": bool(getattr(config.data, "type_balancing_enabled", False)),
+        "enabled": balancing_enabled,
         "sampler_enabled": sampler_enabled,
         "sampler_alpha": sampler_alpha,
-        "sampler_object_uniform": bool(getattr(config.data, "type_sampler_object_uniform", True)),
+        "sampler_object_uniform": sampler_object_uniform,
         "loss_weight_enabled": loss_weight_enabled,
         "loss_weight_beta": loss_weight_beta,
         "loss_weight_reference": reference_name,
@@ -236,10 +252,12 @@ def _prepare_training_distribution_balance(train_dataset, config):
 
 
 def create_dataset(config, mode):
+    resolve_type_supervision_config(config)
     sp_voxel_size = config.algo.model.backbone.voxel_size if "MinkUNet" in config.algo.model.backbone.name else None
 
-    data_config = config.data if mode != "test" else config.test_data
+    data_config = deepcopy(config.data if mode != "test" else config.test_data)
     flatten_multidex_data_config(data_config)
+    apply_type_supervision_to_data_config(config, data_config, mode)
 
     object_path = cfg_get(data_config, "object_path", "paths.object_path")
     if isinstance(object_path, ListConfig):

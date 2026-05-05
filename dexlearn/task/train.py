@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import textwrap
 from datetime import datetime
 
 import torch
@@ -11,6 +12,7 @@ from tqdm import trange
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.logger import Logger
+from dexlearn.utils.config import resolve_type_supervision_config
 from dexlearn.utils.util import set_seed
 from dexlearn.dataset import create_train_dataloader
 from dexlearn.network.models import *
@@ -21,22 +23,22 @@ def _maybe_cuda_sync(device: str, enabled: bool):
         torch.cuda.synchronize(device)
 
 
-def _markdown_cell(value) -> str:
-    """Escape a value for safe use inside a markdown table cell.
+def _markdown_text(value) -> str:
+    """Escape a value for safe use inside the markdown registry.
 
     Args:
-        value: Object to stringify and place into one table cell.
+        value: Object to stringify and place into the markdown registry.
 
     Returns:
-        A single-line markdown-safe string.
+        A markdown-safe string.
     """
     if value is None:
         return ""
-    return str(value).replace("\n", " ").replace("|", "\\|")
+    return str(value).replace("\n", " ").replace("|", "\\|").strip()
 
 
 def _summarize_model_features(config: DictConfig) -> str:
-    """Build a compact feature summary for the model registry table.
+    """Build a compact feature summary for the model registry.
 
     Args:
         config: Full Hydra config for the current training run.
@@ -61,15 +63,66 @@ def _summarize_model_features(config: DictConfig) -> str:
         scale_min = OmegaConf.select(config, "data.augmentation.scale.min")
         scale_max = OmegaConf.select(config, "data.augmentation.scale.max")
         parts.append(f"scale_aug={bool(scale_enabled)}[{scale_min},{scale_max}]")
-    type_balance_enabled = OmegaConf.select(config, "data.type_balancing.enabled")
+    train_sampling_unit = OmegaConf.select(config, "data.sampling.train_unit")
+    if train_sampling_unit is not None:
+        parts.append(f"train_sampling_unit={train_sampling_unit}")
+    type_objective = OmegaConf.select(config, "algo.model.type_objective")
+    if type_objective is not None:
+        scope = OmegaConf.select(config, "algo.supervision.scope")
+        negative_policy = OmegaConf.select(config, "algo.supervision.negative_policy")
+        parts.append(f"type_objective={type_objective}[scope={scope},negative={negative_policy}]")
+    type_balance_enabled = OmegaConf.select(config, "algo.supervision.balancing.enabled")
     if type_balance_enabled is not None:
-        sampler_alpha = OmegaConf.select(config, "data.type_balancing.sampler.alpha")
-        loss_beta = OmegaConf.select(config, "data.type_balancing.loss_weight.beta")
+        sampler_alpha = OmegaConf.select(config, "algo.supervision.balancing.sampler.alpha")
+        loss_beta = OmegaConf.select(config, "algo.supervision.balancing.loss_weight.beta")
         parts.append(
             f"type_balancing={bool(type_balance_enabled)}"
             f"[sampler_alpha={sampler_alpha},loss_beta={loss_beta}]"
         )
     return "; ".join(parts)
+
+
+def _format_feature_lines(summary: str, width: int = 76) -> list[str]:
+    """Format a feature summary as short markdown bullet lines."""
+    items = [part.strip() for part in str(summary).split(";") if part.strip()]
+    if not items:
+        return ["- Key Features:", "  -"]
+
+    lines = ["- Key Features:"]
+    for item in items:
+        wrapped = textwrap.wrap(
+            _markdown_text(item),
+            width=width,
+            initial_indent="  - ",
+            subsequent_indent="    ",
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        lines.extend(wrapped or ["  -"])
+    return lines
+
+
+def _build_model_registry_entry(
+    exp_name: str,
+    timestamp: str,
+    data_name: str,
+    algo_name: str,
+    max_iter,
+    feature_summary: str,
+    notes: str = "",
+) -> str:
+    """Build one markdown registry entry with wrapped lines."""
+    lines = [
+        f"## {_markdown_text(exp_name)}",
+        f"- Timestamp: `{_markdown_text(timestamp)}`",
+        f"- Data: `{_markdown_text(data_name)}`",
+        f"- Algo: `{_markdown_text(algo_name)}`",
+        f"- Max Iter: `{_markdown_text(max_iter)}`",
+        *_format_feature_lines(feature_summary),
+        f"- Notes: {_markdown_text(notes)}",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def _resolve_model_registry_path(config: DictConfig) -> str:
@@ -110,11 +163,9 @@ def _append_model_registry_entry(config: DictConfig) -> None:
         os.makedirs(registry_dir, exist_ok=True)
     header = (
         "# Trained Models\n\n"
-        "This table is appended automatically by `task=train` when "
-        "`model_registry.enabled=true`. Use `model_registry.key_features` "
+        "This registry is appended automatically by `task=train` when\n"
+        "`model_registry.enabled=true`. Use `model_registry.key_features`\n"
         "to describe intentional differences from previous runs.\n\n"
-        "| Exp Name | Timestamp | Data | Algo | Max Iter | Key Features / Differences | Notes |\n"
-        "| --- | --- | --- | --- | --- | --- | --- |\n"
     )
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         with open(path, "w", encoding="utf-8") as f:
@@ -123,24 +174,25 @@ def _append_model_registry_entry(config: DictConfig) -> None:
     exp_name = str(config.wandb.id)
     with open(path, "r", encoding="utf-8") as f:
         existing = f.read()
-    if f"| {exp_name} |" in existing:
+    if f"| {exp_name} |" in existing or f"## {exp_name}\n" in existing:
         return
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = "| {} | {} | {} | {} | {} | {} | {} |\n".format(
-        _markdown_cell(exp_name),
-        _markdown_cell(timestamp),
-        _markdown_cell(config.data_name),
-        _markdown_cell(config.algo_name),
-        _markdown_cell(config.algo.max_iter),
-        _markdown_cell(_summarize_model_features(config)),
-        "",
+    entry = _build_model_registry_entry(
+        exp_name=exp_name,
+        timestamp=timestamp,
+        data_name=config.data_name,
+        algo_name=config.algo_name,
+        max_iter=config.algo.max_iter,
+        feature_summary=_summarize_model_features(config),
+        notes="",
     )
     with open(path, "a", encoding="utf-8") as f:
-        f.write(row)
+        f.write(entry)
 
 
 def task_train(config: DictConfig):
+    resolve_type_supervision_config(config)
     set_seed(config.seed)
     logger = Logger(config)
     _append_model_registry_entry(config)
