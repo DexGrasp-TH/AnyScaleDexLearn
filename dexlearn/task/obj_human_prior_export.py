@@ -1,7 +1,6 @@
 import copy
 import json
 import os
-import re
 import sys
 from glob import glob
 from os.path import join as pjoin
@@ -270,10 +269,12 @@ def scene_file_path(scene_dir: str, scene_id: str) -> str:
         Path to the per-scene export file.
     """
     relative_scene_id = str(scene_id).strip("/")
-    safe_parts = [safe_scene_id(part) for part in relative_scene_id.split("/") if part]
-    if not safe_parts:
+    scene_parts = [part for part in relative_scene_id.split("/") if part]
+    if not scene_parts:
         raise ValueError(f"Cannot build export path from empty scene_id={scene_id!r}")
-    return pjoin(scene_dir, *safe_parts) + ".npy"
+    if any(part in (".", "..") for part in scene_parts):
+        raise ValueError(f"Cannot build export path from unsafe scene_id={scene_id!r}")
+    return pjoin(scene_dir, *scene_parts) + ".npy"
 
 
 def extract_real_type_scores(pred_grasp_type_prob: torch.Tensor | np.ndarray) -> np.ndarray:
@@ -802,18 +803,6 @@ def sample_fixed_type_wrist_poses(
                     raise ValueError(f"Duplicate pose record for scene_id={scene_id}, grasp_type_id={grasp_type_id}")
                 pose_records[scene_id][grasp_type_id] = wrist_record
     return pose_records
-
-
-def safe_scene_id(scene_id: str) -> str:
-    """Convert a scene id into a filesystem-safe stem.
-
-    Args:
-        scene_id: Original scene id, usually containing path separators.
-
-    Returns:
-        Filesystem-safe file stem.
-    """
-    return re.sub(r"[^A-Za-z0-9_.-]+", "__", str(scene_id).strip("/"))
 
 
 def resolve_output_dir(config: DictConfig, checkpoint_iter: int | None) -> str:
