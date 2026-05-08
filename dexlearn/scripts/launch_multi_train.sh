@@ -22,8 +22,9 @@ BASE_OVERRIDES=(
 )
 
 RUN_SPECS=(
-  "1|debug25|algo.model.type_objective=ce data.sampling.train_unit=record_uniform"
-  "2|debug26|algo.model.type_objective=ce data.sampling.train_unit=object_uniform"
+  # "1|debug25|algo.model.type_objective=ce data.sampling.train_unit=record_uniform"
+  # "2|debug26|algo.model.type_objective=ce data.sampling.train_unit=object_uniform"
+  "3|debug27|algo.model.type_objective=ce data.sampling.train_unit=object_uniform data.point_cloud.random_pc_across_sequences=true"
 )
 
 PIDS=()

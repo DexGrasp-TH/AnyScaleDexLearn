@@ -1,18 +1,25 @@
 import csv
 import json
+import math
 import os
 import re
 from copy import deepcopy
 from glob import glob
+from typing import Any
 
 import numpy as np
+from scipy.spatial import ConvexHull, QhullError
 from scipy.spatial.transform import Rotation as SciR
 
 try:
+    import hydra
+    from omegaconf import ListConfig
+
     from dexlearn.dataset.grasp_types import GRASP_TYPES
     from dexlearn.utils.config import cfg_get, flatten_multidex_data_config, resolve_type_supervision_config
-    from omegaconf import ListConfig
 except ModuleNotFoundError:
+    hydra = None
+    ListConfig = list
     GRASP_TYPES = [
         "0_any",
         "1_right_two",
@@ -21,18 +28,17 @@ except ModuleNotFoundError:
         "4_both_three",
         "5_both_full",
     ]
-    ListConfig = list
 
     def cfg_get(config, *keys, default=None):
-        """Read the first available flat or dotted key without OmegaConf.
+        """Read a nested config value without requiring OmegaConf.
 
         Args:
-            config: Object or dictionary-like config.
-            *keys: Candidate keys, including dotted nested keys.
-            default: Value returned when no key exists.
+            config: Dictionary-like or object-like config.
+            *keys: Candidate dotted keys.
+            default: Fallback value when no key exists.
 
         Returns:
-            First matched value or ``default``.
+            First matched value, otherwise ``default``.
         """
         for key in keys:
             current = config
@@ -50,10 +56,10 @@ except ModuleNotFoundError:
         return default
 
     def flatten_multidex_data_config(config):
-        """No-op fallback used only when OmegaConf is unavailable.
+        """Fallback no-op for local smoke tests.
 
         Args:
-            config: Data config object.
+            config: Data config.
 
         Returns:
             The original config.
@@ -61,47 +67,88 @@ except ModuleNotFoundError:
         return config
 
     def resolve_type_supervision_config(config):
-        """No-op fallback used only when OmegaConf is unavailable."""
+        """Fallback no-op for local smoke tests.
+
+        Args:
+            config: Full config.
+
+        Returns:
+            The original config.
+        """
         return config
 
 
-MIRROR = np.diag([-1.0, 1.0, 1.0]).astype(np.float32)
-FIXED_LEFT_HAND_TRANS = np.array([0.0, 0.0, -0.5], dtype=np.float32)
-FIXED_LEFT_HAND_ROT = np.eye(3, dtype=np.float32)
-VALID_HAND_POS_SOURCES = {"wrist", "index_mcp"}
-TARGET_GRASP_TYPE_IDS = (1, 2, 3, 4, 5)
-DEXLEARN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REPO_ROOT = os.path.dirname(DEXLEARN_ROOT)
-FIXED_TYPE_SAMPLE_LIST = ",".join(GRASP_TYPES[1:])
+EPS = 1e-12
+REAL_TYPE_IDS = tuple(range(1, len(GRASP_TYPES)))
+SCALE_FEATURES = ("xy_long", "xy_short", "z_height")
 
 
-def resolve_existing_path(path: str):
-    """Resolve a possibly relative saved metadata path.
+def _as_list(value: Any) -> list:
+    """Convert scalar or list-like config values to a Python list.
 
     Args:
-        path: Path saved in a sample file.
+        value: Scalar, list, tuple, ``ListConfig``, or ``None``.
 
     Returns:
-        Existing filesystem path, or the original path when no candidate exists.
+        Plain list. ``None`` returns an empty list.
     """
-    if not path:
-        return path
-    path = str(path)
-    if os.path.isabs(path) or os.path.exists(path):
-        return path
-    candidates = [
-        os.path.join(REPO_ROOT, path),
-        os.path.join(os.getcwd(), path),
-        os.path.abspath(path),
-    ]
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-    return path
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, ListConfig)):
+        return list(value)
+    return [value]
 
 
-def load_json(path: str):
-    """Load a JSON file.
+def _natural_sort_key(value: Any) -> list:
+    """Build a natural sort key for ids containing numbers.
+
+    Args:
+        value: Object id, scene id, path, or other sortable value.
+
+    Returns:
+        List of text and integer chunks.
+    """
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(value))]
+
+
+def _original_cwd() -> str:
+    """Return Hydra's original cwd when available.
+
+    Args:
+        None.
+
+    Returns:
+        Filesystem directory used to resolve relative paths.
+    """
+    if hydra is not None:
+        try:
+            return hydra.utils.get_original_cwd()
+        except Exception:
+            pass
+    return os.getcwd()
+
+
+def _abs_path(path: Any) -> str:
+    """Resolve one filesystem path.
+
+    Args:
+        path: Absolute or relative path-like value.
+
+    Returns:
+        Absolute path. Empty values return an empty string.
+    """
+    if path is None:
+        return ""
+    text = str(path)
+    if not text:
+        return ""
+    if os.path.isabs(text):
+        return text
+    return os.path.abspath(os.path.join(_original_cwd(), text))
+
+
+def _load_json(path: str) -> Any:
+    """Load one JSON file.
 
     Args:
         path: JSON file path.
@@ -109,865 +156,499 @@ def load_json(path: str):
     Returns:
         Parsed JSON content.
     """
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def normalize_hand_pos_source(value, default: str = "wrist") -> str:
-    """Normalize the configured human hand position source.
+def _write_csv(rows: list[dict], path: str) -> None:
+    """Write dictionaries to CSV.
 
     Args:
-        value: Raw config value.
-        default: Fallback source when ``value`` is unset.
+        rows: Row dictionaries.
+        path: Output CSV path.
 
     Returns:
-        ``wrist`` or ``index_mcp``.
+        None.
     """
-    hand_pos_source = str(value if value is not None else default).lower()
-    if hand_pos_source not in VALID_HAND_POS_SOURCES:
-        raise ValueError(
-            f"Unsupported hand_pos_source={hand_pos_source}. "
-            f"Expected one of {sorted(VALID_HAND_POS_SOURCES)}."
-        )
-    return hand_pos_source
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not rows:
+        open(path, "w", encoding="utf-8").close()
+        return
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def resolve_ckpt_path(config) -> str:
-    """Resolve the checkpoint path used to derive the sampled-output directory.
+def _json_default(value: Any) -> Any:
+    """Convert NumPy objects to JSON-compatible values.
 
     Args:
-        config: Hydra config with ``ckpt``, ``output_folder``, and ``wandb.id`` fields.
+        value: Value passed by the JSON encoder.
 
     Returns:
-        Absolute or relative checkpoint path that exists or is expected under the run
-        checkpoint directory.
+        JSON-serializable value.
     """
-    if config.ckpt is not None and os.path.exists(str(config.ckpt)):
-        return str(config.ckpt)
-
-    ckpt_dir = os.path.join(config.output_folder, config.wandb.id, "ckpts")
-    if config.ckpt is None:
-        all_ckpts = sorted(glob(os.path.join(ckpt_dir, "step_**.pth")))
-        if not all_ckpts:
-            raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
-        return all_ckpts[-1]
-
-    return os.path.join(ckpt_dir, f"step_{config.ckpt}.pth")
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-def get_sample_output_dir(config) -> str:
-    """Build the directory containing saved sampled grasp ``.npy`` files.
+def _write_json(data: Any, path: str) -> None:
+    """Write compact JSON for machine-readable summaries.
 
     Args:
-        config: Hydra config with checkpoint and ``test_data.name`` fields.
+        data: JSON-serializable content.
+        path: Output JSON path.
 
     Returns:
-        Sample output directory corresponding to the resolved checkpoint.
+        None.
     """
-    ckpt_path = resolve_ckpt_path(config)
-    return os.path.join(ckpt_path.replace("ckpts", "tests").replace(".pth", ""), config.test_data.name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, default=_json_default)
 
 
-def iter_data_configs(data_config):
-    """Iterate over one or more data configs after applying flat compatibility keys.
+def canonical_object_id(object_name: Any) -> str:
+    """Normalize an object id by dropping common sequence suffixes.
 
     Args:
-        data_config: Hydra data config. ``object_path`` may be a string or a list.
+        object_name: Raw object name or path-like id.
 
     Returns:
-        Generator yielding one normalized config per object root.
+        Canonical object id.
     """
-    flatten_multidex_data_config(data_config)
-    object_path = cfg_get(data_config, "object_path", "paths.object_path")
-    if isinstance(object_path, ListConfig):
-        for path in object_path:
-            single_config = deepcopy(data_config)
-            single_config.object_path = path
-            flatten_multidex_data_config(single_config)
-            yield single_config
-    else:
-        yield data_config
+    text = str(object_name).strip().replace("\\", "/").strip("/")
+    parts = [part for part in text.split("/") if part]
+    base = parts[-2] if len(parts) >= 2 and re.match(r"^seq[_-]?\d+.*$", parts[-1]) else os.path.basename(text)
+    return re.sub(r"([_-]seq[_-]?\d+.*)$", "", base)
 
 
-def canonical_object_id(object_name: str) -> str:
-    """Infer a stable object id by removing common sequence suffixes.
+def normalize_sequence_id(sequence_id: Any) -> str:
+    """Normalize a sequence id into a stable path-like string.
 
     Args:
-        object_name: Object or sequence name such as ``obj_0_seq_3`` or
-            ``obj_0/seq_3``.
+        sequence_id: Raw sequence id.
 
     Returns:
-        Canonical object id, for example ``obj_0`` for ``obj_0_seq_3``.
-    """
-    normalized_name = str(object_name).strip().replace("\\", "/").strip("/")
-    parts = [part for part in normalized_name.split("/") if part]
-    if len(parts) >= 2 and re.match(r"^seq[_-]?\d+.*$", parts[-1]):
-        base_name = parts[-2]
-    else:
-        base_name = os.path.basename(normalized_name)
-    return re.sub(r"([_-]seq[_-]?\d+.*)$", "", base_name)
-
-
-def normalize_sequence_id(sequence_id) -> str:
-    """Normalize a sequence id into a stable string.
-
-    Args:
-        sequence_id: Raw sequence id from scene or grasp metadata.
-
-    Returns:
-        Normalized sequence id, or an empty string when unavailable.
+        Normalized sequence id, or an empty string.
     """
     if sequence_id is None:
         return ""
     return str(sequence_id).strip().replace("\\", "/").strip("/")
 
 
-def scene_id_from_object_sequence(object_id: str, sequence_id: str) -> str:
-    """Build the canonical human scene id used by formatted human data.
+def scene_key(object_id: Any, sequence_or_scene_id: Any) -> str:
+    """Build a stable scene key used for score-label joins.
 
     Args:
         object_id: Canonical object id.
-        sequence_id: Sequence id such as ``seq_3``.
+        sequence_or_scene_id: Sequence id or scene id.
 
     Returns:
-        Scene id in ``object_id/sequence_id`` form when a sequence is available.
-    """
-    sequence_id = normalize_sequence_id(sequence_id)
-    if not sequence_id:
-        return str(object_id)
-    return f"{object_id}/{sequence_id}"
-
-
-def scene_key(object_id: str, scene_id: str) -> str:
-    """Build a stable key for joining saved scores with human scene labels.
-
-    Args:
-        object_id: Canonical object id.
-        scene_id: Scene id, optionally including the object id.
-
-    Returns:
-        Join key combining object and sequence-level scene identity.
+        ``object_id/sequence`` when a sequence exists, otherwise ``object_id``.
     """
     object_id = canonical_object_id(object_id)
-    normalized_scene = normalize_sequence_id(scene_id)
-    if normalized_scene.startswith(f"{object_id}/"):
-        return normalized_scene
-    if normalized_scene:
-        return scene_id_from_object_sequence(object_id, os.path.basename(normalized_scene))
-    return object_id
+    scene_id = normalize_sequence_id(sequence_or_scene_id)
+    if not scene_id:
+        return object_id
+    if scene_id == object_id or scene_id.startswith(f"{object_id}/"):
+        return scene_id
+    return f"{object_id}/{os.path.basename(scene_id)}"
 
 
-def scene_id_from_grasp_data(grasp_data: dict, grasp_path: str = "") -> str:
-    """Infer a scene id from formatted human grasp metadata.
+def sequence_id_from_grasp(grasp_data: dict, grasp_path: str = "") -> str:
+    """Read sequence id from one formatted human grasp.
 
     Args:
-        grasp_data: Loaded human grasp dictionary.
-        grasp_path: Optional path used as a fallback for old data.
+        grasp_data: Loaded grasp dictionary.
+        grasp_path: Optional fallback path.
 
     Returns:
-        Scene id such as ``obj_173/seq_3``.
+        Sequence id such as ``seq_3``.
     """
     object_data = grasp_data.get("object", {})
-    object_id = canonical_object_id(object_data.get("name", ""))
-    sequence_id = normalize_sequence_id(object_data.get("sequence_id", ""))
-    if not sequence_id and object_data.get("source_scene") is not None:
-        source_scene = str(object_data.get("source_scene"))
-        match = re.search(r"(seq[_-]?\d+.*)$", source_scene)
-        sequence_id = normalize_sequence_id(match.group(1)) if match else ""
-    if not sequence_id and grasp_path:
-        sequence_id = os.path.splitext(os.path.basename(grasp_path))[0]
-    return scene_id_from_object_sequence(object_id, sequence_id)
-
-
-def scene_id_from_scene_cfg(scene_cfg: dict, scene_path: str = "") -> str:
-    """Infer a scene id from a saved scene config.
-
-    Args:
-        scene_cfg: Loaded scene config dictionary.
-        scene_path: Optional path used as a fallback.
-
-    Returns:
-        Scene id string.
-    """
-    if scene_cfg.get("scene_id") is not None:
-        return normalize_sequence_id(scene_cfg.get("scene_id"))
-    if "object" in scene_cfg:
-        object_data = scene_cfg["object"]
-        object_id = canonical_object_id(object_data.get("name", ""))
-        sequence_id = normalize_sequence_id(object_data.get("sequence_id", ""))
-        if sequence_id:
-            return scene_id_from_object_sequence(object_id, sequence_id)
-    if scene_path:
-        return os.path.splitext(os.path.basename(scene_path))[0]
+    sequence_id = object_data.get("sequence_id")
+    if sequence_id is not None:
+        return normalize_sequence_id(sequence_id)
+    source_scene = object_data.get("source_scene")
+    if source_scene is not None:
+        match = re.search(r"(seq[_-]?\d+.*)$", str(source_scene))
+        if match:
+            return normalize_sequence_id(match.group(1))
+    if grasp_path:
+        return os.path.splitext(os.path.basename(grasp_path))[0]
     return ""
 
 
 def human_grasp_type_id(grasp_data: dict) -> int:
-    """Match ``HumanMultiDexDataset`` grasp-type inference for one raw grasp.
+    """Infer the five-way human grasp type id for one record.
 
     Args:
-        grasp_data: Raw human grasp dictionary loaded from a training ``.npy`` file.
+        grasp_data: Loaded human grasp dictionary.
 
     Returns:
         Grasp type id in ``1..5``.
     """
-    l_contacts = grasp_data["hand"]["left"]["contacts"] if grasp_data["hand"]["left"] else [False] * 5
-    r_contacts = grasp_data["hand"]["right"]["contacts"] if grasp_data["hand"]["right"] else [False] * 5
-    has_l, has_r = any(l_contacts), any(r_contacts)
-    l_count, r_count = sum(l_contacts), sum(r_contacts)
-
-    if not (has_l or has_r):
-        raise ValueError("Grasp data has no active contacts.")
-    if has_l and has_r:
-        return 5 if (l_count > 3 or r_count > 3) else 4
-    count = l_count if has_l else r_count
-    if count <= 2:
+    hand_data = grasp_data.get("hand", {})
+    left = hand_data.get("left")
+    right = hand_data.get("right")
+    left_contacts = left.get("contacts", [False] * 5) if left else [False] * 5
+    right_contacts = right.get("contacts", [False] * 5) if right else [False] * 5
+    has_left = any(left_contacts)
+    has_right = any(right_contacts)
+    left_count = int(sum(left_contacts))
+    right_count = int(sum(right_contacts))
+    if not (has_left or has_right):
+        raise ValueError("Human grasp record has no active contacts.")
+    if has_left and has_right:
+        return 5 if (left_count > 3 or right_count > 3) else 4
+    active_count = left_count if has_left else right_count
+    if active_count <= 2:
         return 1
-    if count == 3:
+    if active_count == 3:
         return 2
     return 3
 
 
-def hand_translation(hand_data: dict, hand_pos_source: str) -> np.ndarray:
-    """Read the hand target position used by the trained human model.
+def object_pose_matrix(grasp_data: dict) -> np.ndarray:
+    """Read object pose matrix from a human grasp record.
 
     Args:
-        hand_data: Per-hand dictionary from a raw training grasp.
-        hand_pos_source: ``wrist`` or ``index_mcp``.
+        grasp_data: Loaded human grasp dictionary.
 
     Returns:
-        Three-dimensional hand target position.
+        Homogeneous object pose. Missing poses fall back to identity.
     """
-    if hand_pos_source == "wrist":
-        return np.asarray(hand_data["trans"], dtype=np.float32)
-    if "index_mcp_pos" not in hand_data:
-        raise KeyError("Missing hand['index_mcp_pos']; run human_preprocess or use hand_pos_source=wrist.")
-    return np.asarray(hand_data["index_mcp_pos"], dtype=np.float32)
+    pose = grasp_data.get("object", {}).get("pose")
+    if pose is None:
+        return np.eye(4, dtype=np.float64)
+    pose = np.asarray(pose, dtype=np.float64)
+    if pose.shape != (4, 4):
+        raise ValueError(f"Unsupported object pose shape: {pose.shape}")
+    return pose
 
 
-def hand_rotation_matrix(hand_data: dict) -> np.ndarray:
-    """Read one hand axis-angle rotation as a single ``3x3`` matrix."""
-    rotvec = np.asarray(hand_data["rot"], dtype=np.float32).reshape(-1, 3)[0]
-    return SciR.from_rotvec(rotvec).as_matrix().astype(np.float32)
-
-
-def training_pose_record(grasp_path: str, hand_pos_source: str) -> dict:
-    """Convert one raw training grasp into the pose representation used for comparison.
+def scale_points(points: np.ndarray, scale: Any) -> np.ndarray:
+    """Apply scalar or XYZ object scale to point coordinates.
 
     Args:
-        grasp_path: Path to one training grasp ``.npy`` file.
-        hand_pos_source: ``wrist`` or ``index_mcp`` position convention.
+        points: Point cloud shaped ``(N, 3)``.
+        scale: Scalar or three-dimensional scale.
 
     Returns:
-        Dictionary containing object ids, grasp type, right/left translations, and
-        right/left rotation matrices.
+        Scaled point cloud.
     """
-    grasp_data = np.load(grasp_path, allow_pickle=True).item()
-    grasp_type_id = human_grasp_type_id(grasp_data)
-    object_name = str(grasp_data["object"]["name"])
-    object_id = canonical_object_id(object_name)
-    grasp_scene_id = scene_id_from_grasp_data(grasp_data, grasp_path)
-    left_data = grasp_data["hand"]["left"]
-    right_data = grasp_data["hand"]["right"]
-    has_left = bool(left_data) and any(left_data["contacts"])
-    has_right = bool(right_data) and any(right_data["contacts"])
-
-    if has_left and not has_right:
-        left_trans = hand_translation(left_data, hand_pos_source)
-        left_rot = hand_rotation_matrix(left_data)
-        right_trans = MIRROR @ left_trans
-        right_rot = MIRROR @ left_rot @ MIRROR
-        left_trans = FIXED_LEFT_HAND_TRANS.astype(np.float32)
-        left_rot = FIXED_LEFT_HAND_ROT.astype(np.float32)
-    else:
-        if has_right:
-            right_trans = hand_translation(right_data, hand_pos_source)
-            right_rot = hand_rotation_matrix(right_data)
-        else:
-            right_trans = np.zeros(3, dtype=np.float32)
-            right_rot = np.eye(3, dtype=np.float32)
-
-        if has_left:
-            left_trans = hand_translation(left_data, hand_pos_source)
-            left_rot = hand_rotation_matrix(left_data)
-        else:
-            left_trans = FIXED_LEFT_HAND_TRANS.astype(np.float32)
-            left_rot = FIXED_LEFT_HAND_ROT.astype(np.float32)
-
-    return {
-        "path": grasp_path,
-        "object_name": object_name,
-        "canonical_object_id": object_id,
-        "scene_id": grasp_scene_id,
-        "scene_key": scene_key(object_id, grasp_scene_id),
-        "grasp_type_id": grasp_type_id,
-        "right_trans": np.asarray(right_trans, dtype=np.float32),
-        "right_rot": np.asarray(right_rot, dtype=np.float32),
-        "left_trans": np.asarray(left_trans, dtype=np.float32),
-        "left_rot": np.asarray(left_rot, dtype=np.float32),
-    }
+    scale_array = np.asarray(scale, dtype=np.float64).reshape(-1)
+    if scale_array.size == 0:
+        return points
+    if scale_array.size == 1:
+        return points * float(scale_array[0])
+    if scale_array.size == 3:
+        return points * scale_array.reshape(1, 3)
+    raise ValueError(f"Unsupported object scale shape: {scale_array.shape}")
 
 
-def load_training_records(config) -> list:
-    """Load all human training grasp pose records from configured train splits.
+def transform_points(points: np.ndarray, pose: np.ndarray) -> np.ndarray:
+    """Transform object-frame points into world frame.
 
     Args:
-        config: Hydra config with ``data`` pointing to ``HumanMultiDexDataset`` roots.
+        points: Point cloud shaped ``(N, 3)``.
+        pose: Homogeneous transform shaped ``(4, 4)``.
 
     Returns:
-        List of comparable training pose records.
+        Transformed point cloud.
     """
-    records = []
-    hand_pos_source = normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist"))
-    for data_config in iter_data_configs(config.data):
-        if data_config.dataset_type != "HumanMultiDexDataset":
-            raise NotImplementedError(f"Only HumanMultiDexDataset is supported, got {data_config.dataset_type}")
-        split_path = os.path.join(data_config.object_path, data_config.split_path, "train.json")
-        for obj_id in load_json(split_path):
-            grasp_paths = sorted(glob(os.path.join(data_config.grasp_path, obj_id, "**/*.npy"), recursive=True))
-            for grasp_path in grasp_paths:
-                records.append(training_pose_record(grasp_path, hand_pos_source))
-    if not records:
-        raise RuntimeError("No training grasp records found.")
-    return records
+    pose = np.asarray(pose, dtype=np.float64)
+    if pose.shape != (4, 4):
+        return points
+    return points @ pose[:3, :3].T + pose[:3, 3].reshape(1, 3)
 
 
-def resolve_sample_object_name(sample_data: dict) -> str:
-    """Resolve the object name associated with a saved sampled result.
+def line_like_xy_extents(xy: np.ndarray) -> tuple[float, float]:
+    """Compute XY long/short extents for degenerate point sets.
 
     Args:
-        sample_data: Saved sampled grasp dictionary from ``task=sample``.
+        xy: Centered XY points shaped ``(N, 2)``.
 
     Returns:
-        Object name from the sample scene config, falling back to saved paths when
-        scene metadata is unavailable.
+        Tuple ``(xy_long, xy_short)``.
     """
-    scene_path = str(sample_data.get("scene_path", ""))
-    if scene_path:
-        try:
-            scene_cfg = np.load(resolve_existing_path(scene_path), allow_pickle=True).item()
-            if "object" in scene_cfg and "name" in scene_cfg["object"]:
-                return str(scene_cfg["object"]["name"])
-            task_obj_name = scene_cfg.get("task", {}).get("obj_name")
-            if task_obj_name is not None:
-                return str(task_obj_name)
-        except Exception as exc:
-            print(f"[evaluate] Could not load scene config {scene_path}: {exc}")
-
-    pc_path = str(sample_data.get("pc_path", ""))
-    return os.path.basename(os.path.dirname(pc_path)) if pc_path else ""
+    if xy.shape[0] < 2:
+        return EPS, EPS
+    _, singular_values, vh = np.linalg.svd(xy, full_matrices=False)
+    if singular_values.size == 0 or float(singular_values[0]) < EPS:
+        return EPS, EPS
+    primary = vh[0]
+    secondary = np.asarray([-primary[1], primary[0]], dtype=np.float64)
+    extents = np.maximum(np.ptp(xy @ np.stack([primary, secondary], axis=1), axis=0), EPS)
+    long_value, short_value = np.sort(extents)[::-1]
+    return float(long_value), float(short_value)
 
 
-def resolve_sample_scene_metadata(sample_data: dict) -> dict:
-    """Resolve object and scene identifiers from a saved sample.
+def yaw_free_xy_extents(points: np.ndarray) -> tuple[float, float]:
+    """Compute yaw-invariant XY bounding-box long and short sides.
 
     Args:
-        sample_data: Saved sample dictionary from ``task=sample``.
+        points: Point cloud shaped ``(N, 3)`` or XY array shaped ``(N, 2)``.
 
     Returns:
-        Dictionary with ``object_name``, ``canonical_object_id``, ``scene_id``,
-        and ``scene_key``.
+        Tuple ``(xy_long, xy_short)``.
     """
-    scene_id = ""
-    object_name = ""
-    scene_path = str(sample_data.get("scene_path", ""))
-    if scene_path:
-        try:
-            scene_cfg = np.load(resolve_existing_path(scene_path), allow_pickle=True).item()
-            scene_id = scene_id_from_scene_cfg(scene_cfg, scene_path)
-            if "object" in scene_cfg and "name" in scene_cfg["object"]:
-                object_name = str(scene_cfg["object"]["name"])
-            else:
-                task_obj_name = scene_cfg.get("task", {}).get("obj_name")
-                if task_obj_name is not None:
-                    object_name = str(task_obj_name)
-        except Exception as exc:
-            print(f"[evaluate] Could not load scene metadata {scene_path}: {exc}")
+    xy = np.asarray(points, dtype=np.float64)
+    if xy.ndim != 2:
+        raise ValueError(f"Expected points with two dimensions, got {xy.shape}")
+    if xy.shape[1] == 3:
+        xy = xy[:, :2]
+    if xy.shape[1] != 2:
+        raise ValueError(f"Expected XY coordinates, got {xy.shape}")
+    xy = xy - xy.mean(axis=0, keepdims=True)
+    if xy.shape[0] < 3 or np.linalg.matrix_rank(xy, tol=EPS) < 2:
+        return line_like_xy_extents(xy)
+    try:
+        hull_points = xy[ConvexHull(xy).vertices]
+    except QhullError:
+        return line_like_xy_extents(xy)
+    edges = np.roll(hull_points, shift=-1, axis=0) - hull_points
+    edge_lengths = np.linalg.norm(edges, axis=1)
+    edges = edges[edge_lengths > EPS]
+    if edges.size == 0:
+        return line_like_xy_extents(xy)
+    angles = np.unique(np.round(np.mod(np.arctan2(edges[:, 1], edges[:, 0]), math.pi / 2.0), decimals=12))
+    best_area = float("inf")
+    best_extents = None
+    for angle in angles:
+        c, s = math.cos(float(angle)), math.sin(float(angle))
+        axes = np.asarray([[c, -s], [s, c]], dtype=np.float64)
+        extents = np.maximum(np.ptp(hull_points @ axes, axis=0), EPS)
+        area = float(extents[0] * extents[1])
+        if area < best_area:
+            best_area = area
+            best_extents = extents
+    if best_extents is None:
+        return line_like_xy_extents(xy)
+    long_value, short_value = np.sort(best_extents)[::-1]
+    return float(long_value), float(short_value)
 
-    if not object_name:
-        object_name = resolve_sample_object_name(sample_data)
-    object_id = canonical_object_id(object_name)
-    return {
-        "object_name": object_name,
-        "canonical_object_id": object_id,
-        "scene_id": scene_id,
-        "scene_key": scene_key(object_id, scene_id),
-    }
 
-
-def quat_wxyz_to_matrix(quat: np.ndarray) -> np.ndarray:
-    """Convert a WXYZ quaternion to a rotation matrix.
+def scale_descriptor(points: np.ndarray) -> np.ndarray:
+    """Compute the three-dimensional scale descriptor.
 
     Args:
-        quat: Quaternion in PyTorch3D / saved sample order ``[w, x, y, z]``.
+        points: Canonical or posed point cloud shaped ``(N, 3)``.
 
     Returns:
-        A ``3x3`` rotation matrix.
+        Array ``[xy_long, xy_short, z_height]``.
     """
-    quat = np.asarray(quat, dtype=np.float64).reshape(4)
-    norm = np.linalg.norm(quat)
-    if norm < 1e-8:
-        return np.eye(3, dtype=np.float32)
-    quat = quat / norm
-    return SciR.from_quat([quat[1], quat[2], quat[3], quat[0]]).as_matrix().astype(np.float32)
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Expected point cloud shape (N, 3), got {points.shape}")
+    xy_long, xy_short = yaw_free_xy_extents(points)
+    z_height = float(max(np.ptp(points[:, 2]), EPS))
+    return np.asarray([xy_long, xy_short, z_height], dtype=np.float64)
 
 
-def sample_pose_records(sample_path: str) -> list:
-    """Convert one saved sampled result file into comparable pose records.
+def load_point_cloud_descriptor(pc_path: str, max_points: int, cache: dict) -> np.ndarray:
+    """Load a point cloud and compute its canonical scale descriptor.
 
     Args:
-        sample_path: Path to one saved sample ``.npy`` file.
+        pc_path: Point-cloud ``.npy`` path.
+        max_points: Deterministic cap for descriptor computation.
+        cache: Mutable path-to-descriptor cache.
 
     Returns:
-        List with one record for the file; empty if the file has no human
-        ``grasp_pose`` field.
+        Three-dimensional descriptor ``[xy_long, xy_short, z_height]``.
     """
-    sample_data = np.load(sample_path, allow_pickle=True).item()
-    if "grasp_pose" not in sample_data:
-        return []
-
-    pose = np.asarray(sample_data["grasp_pose"], dtype=np.float32).reshape(-1)
-    if pose.size < 7:
-        return []
-    if pose.size < 14:
-        pose = np.concatenate([pose[:7], np.zeros(7, dtype=np.float32)], axis=0)
-
-    grasp_type_source = sample_data.get("pred_grasp_type_id", sample_data.get("grasp_type_id", 0))
-    grasp_type_id = int(np.asarray(grasp_type_source).reshape(-1)[0])
-    metadata = resolve_sample_scene_metadata(sample_data)
-    return [
-        {
-            "path": sample_path,
-            "object_name": metadata["object_name"],
-            "canonical_object_id": metadata["canonical_object_id"],
-            "scene_id": metadata["scene_id"],
-            "scene_key": metadata["scene_key"],
-            "grasp_type_id": grasp_type_id,
-            "right_trans": pose[0:3],
-            "right_rot": quat_wxyz_to_matrix(pose[3:7]),
-            "left_trans": pose[7:10],
-            "left_rot": quat_wxyz_to_matrix(pose[10:14]),
-        }
-    ]
+    pc_path = _abs_path(pc_path)
+    if pc_path in cache:
+        return cache[pc_path]
+    points = np.asarray(np.load(pc_path, allow_pickle=True), dtype=np.float64).reshape(-1, 3)
+    if max_points > 0 and points.shape[0] > max_points:
+        indices = np.linspace(0, points.shape[0] - 1, num=max_points, dtype=np.int64)
+        points = points[indices]
+    descriptor = scale_descriptor(points)
+    cache[pc_path] = descriptor
+    return descriptor
 
 
-def load_sample_records(sample_files: list) -> list:
-    """Load all comparable sampled pose records from saved sample files.
+def normalize_score_vector(scores: Any) -> np.ndarray:
+    """Convert a five-dimensional score vector into a probability distribution.
 
     Args:
-        sample_files: List of saved sample ``.npy`` paths.
+        scores: Real-type scores or probabilities for types ``1..5``.
 
     Returns:
-        List of comparable sampled pose records. Files without ``grasp_pose`` are
-        skipped because this task is specific to human sampled grasps.
+        Probability vector summing to one.
     """
-    records = []
-    for sample_file in sample_files:
-        records.extend(sample_pose_records(sample_file))
-    return records
+    values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if values.size == len(REAL_TYPE_IDS) + 1:
+        values = values[1:]
+    if values.size != len(REAL_TYPE_IDS):
+        raise ValueError(f"Expected {len(REAL_TYPE_IDS)} real-type scores, got {values.shape}")
+    if np.all(np.isfinite(values)) and float(values.min()) >= 0.0 and float(values.sum()) > EPS:
+        return values / float(values.sum())
+    shifted = values - float(np.max(values))
+    exp_values = np.exp(shifted)
+    return exp_values / max(float(exp_values.sum()), EPS)
 
 
-def active_sides(grasp_type_id: int) -> tuple:
-    """Return sides that should contribute to pose distance.
-
-    Args:
-        grasp_type_id: Human multi-grasp type id.
-
-    Returns:
-        Tuple of active side names. Types 4 and 5 use both hands; types 1..3 use
-        the right hand only.
-    """
-    return ("right", "left") if int(grasp_type_id) >= 4 else ("right",)
-
-
-def rotation_distance_deg(rot_a: np.ndarray, rot_b: np.ndarray) -> float:
-    """Compute geodesic rotation distance in degrees.
+def rankdata(values: np.ndarray) -> np.ndarray:
+    """Compute average ranks for a small numeric vector.
 
     Args:
-        rot_a: First ``3x3`` rotation matrix.
-        rot_b: Second ``3x3`` rotation matrix.
+        values: Numeric vector.
 
     Returns:
-        Angular distance in degrees.
-    """
-    rel = np.asarray(rot_a, dtype=np.float64).T @ np.asarray(rot_b, dtype=np.float64)
-    cos_angle = np.clip((np.trace(rel) - 1.0) * 0.5, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cos_angle)))
-
-
-def pose_distance(sample_record: dict, train_record: dict, trans_ref_m: float, rot_ref_deg: float) -> dict:
-    """Measure pose distance between one sampled grasp and one training grasp.
-
-    Args:
-        sample_record: Comparable sampled pose record.
-        train_record: Comparable training pose record.
-        trans_ref_m: Translation scale used to normalize nearest-neighbor score.
-        rot_ref_deg: Rotation scale used to normalize nearest-neighbor score.
-
-    Returns:
-        Distance dictionary with translation, rotation, normalized score, and active
-        side list.
-    """
-    sides = active_sides(sample_record["grasp_type_id"])
-    trans_distances = []
-    rot_distances = []
-    for side in sides:
-        trans_distances.append(
-            float(np.linalg.norm(sample_record[f"{side}_trans"] - train_record[f"{side}_trans"]))
-        )
-        rot_distances.append(rotation_distance_deg(sample_record[f"{side}_rot"], train_record[f"{side}_rot"]))
-
-    trans_m = float(np.mean(trans_distances))
-    rot_deg = float(np.mean(rot_distances))
-    score = trans_m / max(trans_ref_m, 1e-8) + rot_deg / max(rot_ref_deg, 1e-8)
-    return {"trans_m": trans_m, "rot_deg": rot_deg, "score": score, "sides": "+".join(sides)}
-
-
-def nearest_train_record(sample_record: dict, candidates: list, trans_ref_m: float, rot_ref_deg: float) -> dict:
-    """Find the closest training pose for one sampled pose.
-
-    Args:
-        sample_record: Comparable sampled pose record.
-        candidates: Training pose records to search.
-        trans_ref_m: Translation scale used to normalize nearest-neighbor score.
-        rot_ref_deg: Rotation scale used to normalize nearest-neighbor score.
-
-    Returns:
-        Joined sample/training nearest-neighbor result row.
-    """
-    best_record = None
-    best_distance = None
-    for train_record in candidates:
-        distance = pose_distance(sample_record, train_record, trans_ref_m, rot_ref_deg)
-        if best_distance is None or distance["score"] < best_distance["score"]:
-            best_distance = distance
-            best_record = train_record
-
-    return {
-        "sample_path": sample_record["path"],
-        "sample_object_name": sample_record["object_name"],
-        "sample_canonical_object_id": sample_record["canonical_object_id"],
-        "sample_grasp_type_id": sample_record["grasp_type_id"],
-        "nearest_train_path": best_record["path"],
-        "nearest_train_object_name": best_record["object_name"],
-        "nearest_train_canonical_object_id": best_record["canonical_object_id"],
-        "nearest_train_grasp_type_id": best_record["grasp_type_id"],
-        "active_sides": best_distance["sides"],
-        "trans_m": best_distance["trans_m"],
-        "rot_deg": best_distance["rot_deg"],
-        "score": best_distance["score"],
-    }
-
-
-def records_by_canonical_object(records: list) -> dict:
-    """Group comparable records by canonical object id.
-
-    Args:
-        records: Training or sampled pose records.
-
-    Returns:
-        Mapping from canonical object id to records.
-    """
-    groups = {}
-    for record in records:
-        groups.setdefault(record["canonical_object_id"], []).append(record)
-    return groups
-
-
-def count_grasp_types_by_object(records: list) -> dict:
-    """Count grasp types for each canonical object.
-
-    Args:
-        records: Comparable human records with ``canonical_object_id`` and
-            ``grasp_type_id`` fields.
-
-    Returns:
-        Mapping ``canonical_object_id -> dict-like counter``.
-    """
-    grouped_counts = {}
-    for record in records:
-        object_id = record["canonical_object_id"]
-        grasp_type_id = int(record["grasp_type_id"])
-        object_counts = grouped_counts.setdefault(object_id, {})
-        object_counts[grasp_type_id] = object_counts.get(grasp_type_id, 0) + 1
-    return grouped_counts
-
-
-def parse_object_id_list(value) -> list:
-    """Normalize object-id config values into a list.
-
-    Args:
-        value: String, list-like value, or ``None`` from Hydra config.
-
-    Returns:
-        List of non-empty canonical object ids.
-    """
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, ListConfig)):
-        raw_values = value
-    else:
-        raw_values = str(value).split(",")
-    return [canonical_object_id(item) for item in raw_values if str(item).strip()]
-
-
-def select_object_analysis_ids(train_records: list, sample_records: list, task_cfg) -> list:
-    """Select canonical object ids for object-specific NN analysis.
-
-    Args:
-        train_records: Comparable training records.
-        sample_records: Comparable sampled records.
-        task_cfg: Hydra task config with optional object-analysis settings.
-
-    Returns:
-        Canonical object ids to analyze. Explicit config values are used first;
-        otherwise the objects with the most sampled records are selected.
-    """
-    object_ids = []
-    object_ids.extend(parse_object_id_list(getattr(task_cfg, "object_analysis_object_id", "")))
-    object_ids.extend(parse_object_id_list(getattr(task_cfg, "object_analysis_object_ids", [])))
-    if object_ids:
-        return list(dict.fromkeys(object_ids))
-
-    train_groups = records_by_canonical_object(train_records)
-    sample_groups = records_by_canonical_object(sample_records)
-    common_ids = sorted(set(train_groups) & set(sample_groups))
-    top_k = int(getattr(task_cfg, "object_analysis_top_k", 5))
-    ranked_ids = sorted(
-        common_ids,
-        key=lambda object_id: (len(sample_groups[object_id]), len(train_groups[object_id]), object_id),
-        reverse=True,
-    )
-    return ranked_ids[: max(0, top_k)]
-
-
-def nearest_training_distance_for_object(
-    sample_record: dict,
-    train_records: list,
-    trans_ref_m: float,
-    rot_ref_deg: float,
-    same_type_only: bool,
-) -> dict:
-    """Find a sample's nearest training grasp inside one canonical object.
-
-    Args:
-        sample_record: One sampled pose record.
-        train_records: Training pose records from the same canonical object.
-        trans_ref_m: Translation scale used to normalize the score.
-        rot_ref_deg: Rotation scale used to normalize the score.
-        same_type_only: Whether to search only training grasps with the same
-            grasp type as the sampled grasp.
-
-    Returns:
-        Joined nearest-neighbor row for object-specific analysis.
-    """
-    candidates = train_records
-    if same_type_only:
-        same_type_candidates = [
-            record for record in train_records if int(record["grasp_type_id"]) == int(sample_record["grasp_type_id"])
-        ]
-        if same_type_candidates:
-            candidates = same_type_candidates
-
-    row = nearest_train_record(sample_record, candidates, trans_ref_m, rot_ref_deg)
-    row["same_type_only"] = bool(same_type_only)
-    row["used_same_type_candidates"] = bool(
-        same_type_only and int(row["sample_grasp_type_id"]) == int(row["nearest_train_grasp_type_id"])
-    )
-    return row
-
-
-def percentile_summary(values: np.ndarray) -> dict:
-    """Compute compact percentiles for a one-dimensional numeric array.
-
-    Args:
-        values: Numeric values.
-
-    Returns:
-        Dictionary with mean and selected percentiles.
+        Average ranks starting from one.
     """
     values = np.asarray(values, dtype=np.float64)
-    return {
-        "mean": float(values.mean()),
-        "p05": float(np.percentile(values, 5)),
-        "p25": float(np.percentile(values, 25)),
-        "p50": float(np.percentile(values, 50)),
-        "p75": float(np.percentile(values, 75)),
-        "p95": float(np.percentile(values, 95)),
-    }
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    start = 0
+    while start < values.size:
+        end = start + 1
+        while end < values.size and values[order[end]] == values[order[start]]:
+            end += 1
+        ranks[order[start:end]] = (start + 1 + end) / 2.0
+        start = end
+    return ranks
 
 
-def print_object_specific_summary(
-    object_id: str,
-    object_rows: list,
-    train_count: int,
-    sample_count: int,
-    near_copy_trans_m: float,
-    near_copy_rot_deg: float,
-    novel_trans_m: float,
-    novel_rot_deg: float,
-) -> None:
-    """Print object-specific NN overfit and novelty statistics.
+def pearson_corr(x: np.ndarray, y: np.ndarray) -> float | None:
+    """Compute Pearson correlation with constant-input handling.
 
     Args:
-        object_id: Canonical object id being analyzed.
-        object_rows: Per-sample nearest-neighbor rows for this object.
-        train_count: Number of training grasps for this object.
-        sample_count: Number of sampled grasps for this object.
-        near_copy_trans_m: Translation threshold for near-copy classification.
-        near_copy_rot_deg: Rotation threshold for near-copy classification.
-        novel_trans_m: Translation threshold for novel classification.
-        novel_rot_deg: Rotation threshold for novel classification.
+        x: First vector.
+        y: Second vector.
 
     Returns:
-        None.
+        Correlation coefficient or ``None``.
     """
-    print(f"\nObject-specific NN analysis: {object_id}")
-    print(f"  Training grasps: {train_count}")
-    print(f"  Sampled grasps: {sample_count}")
-    if not object_rows:
-        print("  No comparable sampled rows for this object.")
-        return
-
-    trans_values = np.asarray([row["trans_m"] for row in object_rows], dtype=np.float64)
-    rot_values = np.asarray([row["rot_deg"] for row in object_rows], dtype=np.float64)
-    near_copy_rows = [
-        row for row in object_rows if row["trans_m"] <= near_copy_trans_m and row["rot_deg"] <= near_copy_rot_deg
-    ]
-    novel_rows = [row for row in object_rows if row["trans_m"] >= novel_trans_m or row["rot_deg"] >= novel_rot_deg]
-
-    print(
-        f"  Near-copy rows: {len(near_copy_rows)}/{len(object_rows)} "
-        f"({len(near_copy_rows) / len(object_rows) * 100.0:.1f}%) "
-        f"with trans <= {near_copy_trans_m:.4f} m and rot <= {near_copy_rot_deg:.2f} deg"
-    )
-    print(
-        f"  Novel rows: {len(novel_rows)}/{len(object_rows)} "
-        f"({len(novel_rows) / len(object_rows) * 100.0:.1f}%) "
-        f"with trans >= {novel_trans_m:.4f} m or rot >= {novel_rot_deg:.2f} deg"
-    )
-
-    trans_stats = percentile_summary(trans_values)
-    rot_stats = percentile_summary(rot_values)
-    print(
-        "  Translation NN distance (m): "
-        f"mean={trans_stats['mean']:.4f}, p05={trans_stats['p05']:.4f}, "
-        f"p25={trans_stats['p25']:.4f}, p50={trans_stats['p50']:.4f}, "
-        f"p75={trans_stats['p75']:.4f}, p95={trans_stats['p95']:.4f}"
-    )
-    print(
-        "  Rotation NN distance (deg): "
-        f"mean={rot_stats['mean']:.2f}, p05={rot_stats['p05']:.2f}, "
-        f"p25={rot_stats['p25']:.2f}, p50={rot_stats['p50']:.2f}, "
-        f"p75={rot_stats['p75']:.2f}, p95={rot_stats['p95']:.2f}"
-    )
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.size < 2 or y.size < 2 or float(np.std(x)) < EPS or float(np.std(y)) < EPS:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
 
 
-def write_object_analysis_csv(rows: list, csv_path: str) -> None:
-    """Write object-specific nearest-neighbor rows to a CSV file.
+def spearman_corr(x: np.ndarray, y: np.ndarray) -> float | None:
+    """Compute Spearman rank correlation.
 
     Args:
-        rows: Per-sample object-specific nearest-neighbor rows.
-        csv_path: Destination CSV path.
+        x: First vector.
+        y: Second vector.
 
     Returns:
-        None.
+        Spearman coefficient or ``None``.
     """
-    if not rows:
-        print("[evaluate] No object-specific rows to write.")
-        return
-    csv_dir = os.path.dirname(csv_path)
-    if csv_dir:
-        os.makedirs(csv_dir, exist_ok=True)
-    fieldnames = list(rows[0].keys())
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"\n[evaluate] Wrote object-specific NN rows to {csv_path}")
+    return pearson_corr(rankdata(np.asarray(x, dtype=np.float64)), rankdata(np.asarray(y, dtype=np.float64)))
 
 
-def run_object_specific_nn_analysis(
-    train_records: list,
-    sample_records: list,
-    task_cfg,
-    sample_dir: str,
-) -> list:
-    """Analyze whether selected objects generate grasps different from training.
+def kendall_tau_b(x: np.ndarray, y: np.ndarray) -> float | None:
+    """Compute Kendall tau-b for five-type rank agreement.
 
     Args:
-        train_records: Comparable training pose records.
-        sample_records: Comparable sampled pose records.
-        task_cfg: Hydra task config containing object-analysis settings.
-        sample_dir: Directory containing saved sample results.
+        x: First ranking score vector.
+        y: Second ranking score vector.
 
     Returns:
-        Object-specific nearest-neighbor rows for all analyzed objects.
+        Kendall tau-b or ``None`` when all pairs are tied.
     """
-    object_ids = select_object_analysis_ids(train_records, sample_records, task_cfg)
-    print("\nObject-specific NN overfit analysis:")
-    if not object_ids:
-        print("  No common train/sample objects selected.")
-        return []
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    concordant = discordant = tie_x = tie_y = 0
+    for i in range(x.size):
+        for j in range(i + 1, x.size):
+            dx = np.sign(x[i] - x[j])
+            dy = np.sign(y[i] - y[j])
+            if dx == 0 and dy == 0:
+                continue
+            if dx == 0:
+                tie_x += 1
+            elif dy == 0:
+                tie_y += 1
+            elif dx == dy:
+                concordant += 1
+            else:
+                discordant += 1
+    denom = math.sqrt((concordant + discordant + tie_x) * (concordant + discordant + tie_y))
+    if denom <= EPS:
+        return None
+    return float((concordant - discordant) / denom)
 
-    train_groups = records_by_canonical_object(train_records)
-    sample_groups = records_by_canonical_object(sample_records)
-    trans_ref_m = float(getattr(task_cfg, "trans_ref_m", 0.02))
-    rot_ref_deg = float(getattr(task_cfg, "rot_ref_deg", 10.0))
-    near_copy_trans_m = float(getattr(task_cfg, "near_copy_trans_m", 0.01))
-    near_copy_rot_deg = float(getattr(task_cfg, "near_copy_rot_deg", 5.0))
-    novel_trans_m = float(getattr(task_cfg, "object_novel_trans_m", 0.03))
-    novel_rot_deg = float(getattr(task_cfg, "object_novel_rot_deg", 15.0))
-    same_type_only = bool(getattr(task_cfg, "object_analysis_same_type_only", False))
-    rows = []
 
-    print(f"  Analyze objects: {', '.join(object_ids)}")
-    print(f"  Same-type-only NN search: {same_type_only}")
-    for object_id in object_ids:
-        object_train_records = train_groups.get(object_id, [])
-        object_sample_records = sample_groups.get(object_id, [])
-        object_rows = []
-        if object_train_records and object_sample_records:
-            for sample_record in object_sample_records:
-                row = nearest_training_distance_for_object(
-                    sample_record,
-                    object_train_records,
-                    trans_ref_m=trans_ref_m,
-                    rot_ref_deg=rot_ref_deg,
-                    same_type_only=same_type_only,
-                )
-                row["analysis_canonical_object_id"] = object_id
-                row["is_near_copy"] = row["trans_m"] <= near_copy_trans_m and row["rot_deg"] <= near_copy_rot_deg
-                row["is_novel"] = row["trans_m"] >= novel_trans_m or row["rot_deg"] >= novel_rot_deg
-                object_rows.append(row)
-        print_object_specific_summary(
-            object_id,
-            object_rows,
-            train_count=len(object_train_records),
-            sample_count=len(object_sample_records),
-            near_copy_trans_m=near_copy_trans_m,
-            near_copy_rot_deg=near_copy_rot_deg,
-            novel_trans_m=novel_trans_m,
-            novel_rot_deg=novel_rot_deg,
-        )
-        rows.extend(object_rows)
+def top_k_indices(values: np.ndarray, k: int) -> set[int]:
+    """Return the ids of the top-k real types.
 
-    output_csv_value = getattr(task_cfg, "object_analysis_output_csv", "")
-    output_csv = "" if output_csv_value is None else str(output_csv_value)
-    if not output_csv:
-        output_csv = os.path.join(sample_dir, "evaluation_object_specific_nn.csv")
-    write_object_analysis_csv(rows, output_csv)
-    return rows
+    Args:
+        values: Five-dimensional score vector.
+        k: Number of entries to select.
+
+    Returns:
+        Set of type ids in ``1..5``.
+    """
+    order = np.argsort(-np.asarray(values, dtype=np.float64), kind="mergesort")
+    return {int(REAL_TYPE_IDS[idx]) for idx in order[: min(k, len(order))]}
+
+
+def js_divergence(q: np.ndarray, p: np.ndarray) -> float:
+    """Compute Jensen-Shannon divergence using natural logarithms.
+
+    Args:
+        q: Reference probability distribution.
+        p: Predicted probability distribution.
+
+    Returns:
+        JS divergence.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    m = 0.5 * (q + p)
+    return float(0.5 * np.sum(q * (np.log(np.clip(q, EPS, None)) - np.log(np.clip(m, EPS, None)))) + 0.5 * np.sum(p * (np.log(np.clip(p, EPS, None)) - np.log(np.clip(m, EPS, None)))))
+
+
+def metric_mean(rows: list[dict], key: str) -> float | None:
+    """Average a metric key while ignoring missing values.
+
+    Args:
+        rows: Metric rows.
+        key: Metric key.
+
+    Returns:
+        Mean value or ``None``.
+    """
+    values = [float(row[key]) for row in rows if row.get(key) is not None and row.get(key) != ""]
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
+def format_float(value: Any, digits: int = 4) -> str:
+    """Format optional floats for markdown.
+
+    Args:
+        value: Numeric value or ``None``.
+        digits: Decimal digits.
+
+    Returns:
+        Formatted value or ``NA``.
+    """
+    if value is None:
+        return "NA"
+    return f"{float(value):.{digits}f}"
 
 
 class MarkdownReport:
-    """Small helper that writes an evaluation report after each completed stage."""
+    """Incremental Chinese markdown report writer."""
 
     def __init__(self, path: str, title: str):
-        """Create an incremental markdown report.
+        """Create the report writer.
 
         Args:
-            path: Destination markdown path.
+            path: Markdown output path.
             title: Report title.
 
         Returns:
@@ -975,14 +656,14 @@ class MarkdownReport:
         """
         self.path = path
         self.title = title
-        self.sections = []
+        self.sections: list[tuple[str, list[str]]] = []
 
-    def add_section(self, title: str, lines: list) -> None:
-        """Append a section and flush the report to disk.
+    def add_section(self, title: str, lines: list[str]) -> None:
+        """Append and flush one report section.
 
         Args:
-            title: Markdown section title.
-            lines: Section body lines.
+            title: Section title.
+            lines: Section lines.
 
         Returns:
             None.
@@ -991,7 +672,7 @@ class MarkdownReport:
         self.write()
 
     def write(self) -> None:
-        """Write the current report content.
+        """Write the full markdown report.
 
         Args:
             None.
@@ -1000,7 +681,7 @@ class MarkdownReport:
             None.
         """
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w") as f:
+        with open(self.path, "w", encoding="utf-8") as f:
             f.write(f"# {self.title}\n\n")
             for title, lines in self.sections:
                 f.write(f"## {title}\n\n")
@@ -1009,1588 +690,1598 @@ class MarkdownReport:
                 f.write("\n")
 
 
-def write_generic_csv(rows: list, csv_path: str) -> None:
-    """Write arbitrary row dictionaries to CSV.
+def checkpoint_step_name(config) -> str | None:
+    """Resolve the step directory name used by saved outputs.
 
     Args:
-        rows: Row dictionaries with a shared key set.
-        csv_path: Destination CSV path.
+        config: Full Hydra config.
 
     Returns:
-        None.
+        Step directory name such as ``step_010000``, or ``None``.
     """
-    if not rows:
-        return
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    fieldnames = list(rows[0].keys())
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def step_id_from_ckpt_path(ckpt_path: str) -> str:
-    """Extract a Hydra-friendly checkpoint id from a resolved checkpoint path.
-
-    Args:
-        ckpt_path: Resolved checkpoint path.
-
-    Returns:
-        Checkpoint id such as ``010000`` when possible, otherwise the raw path.
-    """
-    basename = os.path.basename(str(ckpt_path))
-    match = re.match(r"step_(\d+)\.pth$", basename)
+    ckpt = getattr(config, "ckpt", None)
+    if ckpt is None:
+        return None
+    text = os.path.basename(str(ckpt))
+    match = re.match(r"step_(\d+)(?:\.pth)?$", text)
     if match:
-        return match.group(1)
-    return str(ckpt_path)
+        return f"step_{match.group(1)}"
+    if text.isdigit():
+        return f"step_{text.zfill(6)}"
+    return os.path.splitext(text)[0]
 
 
-def sample_command(config, grasp_type_list: str) -> str:
-    """Build the command the user should run before evaluation.
-
-    Args:
-        config: Full Hydra config.
-        grasp_type_list: Comma-separated grasp type list for Hydra override.
-
-    Returns:
-        Shell command string.
-    """
-    ckpt_value = step_id_from_ckpt_path(resolve_ckpt_path(config))
-    return (
-        "python dexlearn/main.py "
-        f"task=sample data={config.data_name} algo={config.algo_name} "
-        f"test_data={config.test_data_name} exp_name={config.exp_name} "
-        f"ckpt={ckpt_value} test_data.grasp_type_lst='[{grasp_type_list}]'"
-    )
-
-
-def raise_missing_samples(config, sample_dir: str, reason: str, grasp_type_list: str) -> None:
-    """Raise a sample-missing error with a concrete sample command.
-
-    Args:
-        config: Full Hydra config.
-        sample_dir: Expected sample output directory.
-        reason: Human-readable missing sample description.
-        grasp_type_list: Grasp types needed by the sample command.
-
-    Returns:
-        None.
-    """
-    command = sample_command(config, grasp_type_list)
-    raise RuntimeError(
-        f"{reason}\nExpected sample directory: {sample_dir}\n"
-        f"Evaluation does not run sampling. Please generate samples first:\n{command}"
-    )
-
-
-def collect_sample_files(config, sample_dir: str) -> list:
-    """Collect saved sample files and enforce that sampling has already run.
-
-    Args:
-        config: Full Hydra config.
-        sample_dir: Expected sample output directory.
-
-    Returns:
-        Sorted sample file paths.
-    """
-    task_cfg = config.task
-    sample_files = sorted(glob(os.path.join(sample_dir, "**/*.npy"), recursive=True))
-    if not sample_files:
-        raise_missing_samples(config, sample_dir, "No saved sample files were found.", "0_any")
-
-    max_sample_files = int(getattr(task_cfg, "max_sample_files", 0))
-    if max_sample_files > 0:
-        sample_files = sample_files[:max_sample_files]
-    return sample_files
-
-
-def inspect_sample_file_types(sample_files: list) -> dict:
-    """Split sample files by the metadata they contain.
-
-    Args:
-        sample_files: Saved ``.npy`` sample files.
-
-    Returns:
-        Dictionary with ``pose_files``, ``score_files``, and ``score_only_files``.
-    """
-    pose_files = []
-    score_files = []
-    score_only_files = []
-    for sample_file in sample_files:
-        sample_data = np.load(sample_file, allow_pickle=True).item()
-        has_pose = "grasp_pose" in sample_data
-        has_scores = "pred_grasp_type_prob" in sample_data
-        if has_pose:
-            pose_files.append(sample_file)
-        if has_scores:
-            score_files.append(sample_file)
-        if has_scores and not has_pose:
-            score_only_files.append(sample_file)
-    return {
-        "pose_files": pose_files,
-        "score_files": score_files,
-        "score_only_files": score_only_files,
-    }
-
-
-def is_feasibility_model(config) -> bool:
-    """Check whether the configured model uses the new feasibility head.
+def default_tests_step_dir(config) -> str:
+    """Find the default ``tests/step_*`` directory for this run.
 
     Args:
         config: Full Hydra config.
 
     Returns:
-        ``True`` for feasibility-style human models.
+        Step directory under ``output/<wandb.id>/tests`` when resolvable,
+        otherwise an empty string.
     """
-    objective = str(cfg_get(config.algo.model, "type_objective", default="")).lower()
-    if objective in {"ce", "object_bce", "scene_ranking"}:
-        return True
-    model_name = str(cfg_get(config.algo.model, "name", default=""))
-    return "Feasibility" in model_name or "TypeObjective" in model_name
+    base_dir = _abs_path(os.path.join(str(config.output_folder), str(config.wandb.id), "tests"))
+    step_name = checkpoint_step_name(config)
+    if step_name:
+        candidate = os.path.join(base_dir, step_name)
+        if os.path.isdir(candidate):
+            return candidate
+    candidates = sorted(glob(os.path.join(base_dir, "step_*")), key=_natural_sort_key)
+    candidates = [path for path in candidates if os.path.isdir(path)]
+    return candidates[-1] if candidates else ""
 
 
-def load_human_records_for_split(config, split_name: str) -> list:
-    """Load human grasp records from a configured split.
+def default_test_result_dir(config, dataset_name: str) -> str:
+    """Find the default saved sample directory for one test dataset.
 
     Args:
         config: Full Hydra config.
-        split_name: Split name such as ``train`` or ``test``.
+        dataset_name: Dataset folder name under ``tests/step_*``.
 
     Returns:
-        Comparable human pose records.
+        Directory path such as ``tests/step_010000/DGNMulti``.
     """
-    records = []
-    hand_pos_source = normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist"))
-    for data_config in iter_data_configs(config.data):
-        if cfg_get(data_config, "dataset_type", default="") != "HumanMultiDexDataset":
+    step_dir = default_tests_step_dir(config)
+    if not step_dir or not dataset_name:
+        return ""
+    return os.path.join(step_dir, str(dataset_name))
+
+
+def resolve_test_result_dir(config, field_name: str, dataset_name: str) -> str:
+    """Resolve a configured or default saved sample directory.
+
+    Args:
+        config: Full Hydra config.
+        field_name: Task config field name such as ``human_results_dir``.
+        dataset_name: Dataset folder name used by the default path.
+
+    Returns:
+        Absolute result directory path, or an empty string.
+    """
+    value = getattr(config.task, field_name, "")
+    if value:
+        return _abs_path(value)
+    return default_test_result_dir(config, dataset_name)
+
+
+def default_score_jsonl(config) -> str:
+    """Find the default obj_human_prior score JSONL for this run.
+
+    Args:
+        config: Full Hydra config.
+
+    Returns:
+        Path to ``scene_budget_scores.jsonl`` when resolvable, otherwise empty.
+    """
+    base_dir = _abs_path(os.path.join(str(config.output_folder), str(config.wandb.id), "obj_human_prior"))
+    step_name = checkpoint_step_name(config)
+    if step_name:
+        candidate = os.path.join(base_dir, step_name, "scene_budget_scores.jsonl")
+        if os.path.isfile(candidate):
+            return candidate
+    candidates = sorted(glob(os.path.join(base_dir, "step_*", "scene_budget_scores.jsonl")), key=_natural_sort_key)
+    return candidates[-1] if candidates else ""
+
+
+def resolve_score_jsonl(config, field_name: str, fallback: str = "") -> str:
+    """Resolve a configured score JSONL path.
+
+    Args:
+        config: Full Hydra config.
+        field_name: Task config field name.
+        fallback: Fallback path.
+
+    Returns:
+        Existing or intended score JSONL path, or an empty string.
+    """
+    value = getattr(config.task, field_name, "")
+    if value:
+        return _abs_path(value)
+    if fallback:
+        return fallback
+    return ""
+
+
+def _path_after_marker(path: str, marker: str) -> str:
+    """Return the path segment after a named directory marker.
+
+    Args:
+        path: Path-like string.
+        marker: Directory marker such as ``scene_cfg``.
+
+    Returns:
+        Relative path after the marker, without a file extension when present.
+    """
+    parts = [part for part in str(path).replace("\\", "/").split("/") if part]
+    if marker not in parts:
+        return ""
+    index = parts.index(marker)
+    rel = "/".join(parts[index + 1 :])
+    return os.path.splitext(rel)[0]
+
+
+def scene_parts_from_result(sample: dict, sample_path: str, results_dir: str) -> tuple[str, str]:
+    """Infer canonical object id and scene id from one saved test result.
+
+    Args:
+        sample: Loaded saved-sample dictionary.
+        sample_path: Saved ``.npy`` result path.
+        results_dir: Dataset result directory, e.g. ``tests/step_010000/DGNMulti``.
+
+    Returns:
+        Tuple ``(object_id, scene_id)`` suitable for ``scene_key``.
+    """
+    scene_path = str(sample.get("scene_path", ""))
+    rel_scene = _path_after_marker(scene_path, "scene_cfg")
+    if rel_scene:
+        parts = [part for part in rel_scene.split("/") if part]
+        if parts:
+            return canonical_object_id(parts[0]), "/".join(parts)
+
+    rel = os.path.relpath(sample_path, results_dir).replace("\\", "/")
+    parts = [part for part in rel.split("/") if part]
+    if parts and parts[0] in GRASP_TYPES:
+        parts = parts[1:]
+    if len(parts) >= 2:
+        return canonical_object_id(parts[0]), "/".join(parts[:-1])
+    if parts:
+        return canonical_object_id(parts[0]), os.path.splitext(parts[0])[0]
+    return "", ""
+
+
+def human_split_lookup(config) -> dict[str, str]:
+    """Build an object-id to split lookup for human result rows.
+
+    Args:
+        config: Full Hydra config.
+
+    Returns:
+        Mapping from canonical object id to split name when known.
+    """
+    lookup: dict[str, str] = {}
+    try:
+        data_config = deepcopy(config.data)
+        flatten_multidex_data_config(data_config)
+        split_path = str(cfg_get(data_config, "split_path", "paths.split_path", default="valid_split"))
+        splits = [str(split) for split in _as_list(getattr(config.task, "human_splits", ["train", "test"]))]
+        for _, object_root in iter_human_roots(data_config):
+            for split in splits:
+                split_json = os.path.join(object_root, split_path, f"{split}.json")
+                if not os.path.isfile(split_json):
+                    continue
+                for object_id in _load_json(split_json):
+                    lookup.setdefault(canonical_object_id(object_id), split)
+    except Exception as exc:
+        print(f"[evaluate] Could not build human split lookup: {type(exc).__name__}: {exc}")
+    return lookup
+
+
+def score_result_root(results_dir: str, score_grasp_type: str) -> str:
+    """Select the subdirectory containing score-bearing saved samples.
+
+    Args:
+        results_dir: Dataset result directory.
+        score_grasp_type: Grasp-type folder to read, usually ``0_any``.
+
+    Returns:
+        Directory to scan recursively.
+    """
+    if not results_dir:
+        return ""
+    base_name = os.path.basename(os.path.normpath(results_dir))
+    if base_name in GRASP_TYPES:
+        return results_dir
+    candidate = os.path.join(results_dir, str(score_grasp_type))
+    return candidate if os.path.isdir(candidate) else results_dir
+
+
+def load_test_result_scores(
+    results_dir: str,
+    max_rows: int = 0,
+    split_lookup: dict[str, str] | None = None,
+    score_grasp_type: str = "0_any",
+) -> list[dict]:
+    """Load Human Prior scores from saved ``task=sample`` test results.
+
+    Args:
+        results_dir: Dataset result directory under ``tests/step_*``.
+        max_rows: Optional cap on aggregated scene rows for quick evaluation.
+        split_lookup: Optional human object-id to split mapping.
+        score_grasp_type: Grasp-type folder used as score source.
+
+    Returns:
+        One averaged score row per scene.
+    """
+    if not results_dir or not os.path.isdir(results_dir):
+        return []
+    root = score_result_root(results_dir, score_grasp_type)
+    if not root or not os.path.isdir(root):
+        return []
+    sample_paths = sorted(glob(os.path.join(root, "**", "*.npy"), recursive=True), key=_natural_sort_key)
+    groups: dict[tuple[str, str], list[dict]] = {}
+    first_rows: dict[tuple[str, str], dict] = {}
+    split_lookup = split_lookup or {}
+
+    for sample_path in sample_paths:
+        try:
+            sample = np.load(sample_path, allow_pickle=True).item()
+            if "pred_grasp_type_prob" not in sample:
+                continue
+            object_id, scene_id = scene_parts_from_result(sample, sample_path, results_dir)
+            if not object_id:
+                continue
+            split = split_lookup.get(object_id, "")
+            key_text = scene_key(object_id, scene_id)
+            key = (split, key_text)
+            score = normalize_score_vector(sample["pred_grasp_type_prob"])
+        except Exception as exc:
+            print(f"[evaluate] Skip unreadable result {sample_path}: {type(exc).__name__}: {exc}")
             continue
-        object_path = cfg_get(data_config, "object_path", "paths.object_path")
-        split_path = cfg_get(data_config, "split_path", "paths.split_path")
-        grasp_path_root = cfg_get(data_config, "grasp_path", "paths.grasp_path")
-        split_file = os.path.join(object_path, split_path, f"{split_name}.json")
-        if not os.path.exists(split_file):
-            continue
-        for obj_id in load_json(split_file):
-            grasp_paths = sorted(glob(os.path.join(grasp_path_root, obj_id, "**/*.npy"), recursive=True))
-            for grasp_path in grasp_paths:
-                records.append(training_pose_record(grasp_path, hand_pos_source))
-    return records
 
+        groups.setdefault(key, []).append({"scores": score})
+        if key not in first_rows:
+            first_rows[key] = {
+                "scene_id": key_text,
+                "scene_key": key_text,
+                "object_id": object_id,
+                "split": split,
+                "scene_path": str(sample.get("scene_path", "")),
+                "pc_path": str(sample.get("pc_path", "")),
+                "score_semantics": "saved_test_pred_grasp_type_prob",
+                "source_results_dir": results_dir,
+                "score_grasp_type": score_grasp_type,
+            }
+        if max_rows > 0 and len(groups) >= max_rows:
+            break
 
-def build_human_object_labels(config) -> tuple:
-    """Build object-level feasibility labels for the sampled human split.
-
-    Args:
-        config: Full Hydra config.
-
-    Returns:
-        Tuple ``(label_by_object, split_records)``.
-    """
-    split_name = str(cfg_get(config.test_data, "test_split", "test.split", default="test"))
-    split_records = load_human_records_for_split(config, split_name)
-    negative_policy = str(cfg_get(config.algo, "supervision.negative_policy", default="")).lower()
-    label_mode = "closed_world_object_complete" if negative_policy == "object_closed_world" else str(
-        cfg_get(
-            config.data,
-            "feasibility_label_mode",
-            "feasibility.label_mode",
-            default="open_world_positive_only",
-        )
-    )
-
-    object_counts = count_grasp_types_by_object(split_records)
-    labels = {}
-    for object_id, counter in object_counts.items():
-        feasible = np.asarray(
-            [1.0 if int(counter.get(type_id, 0)) > 0 else 0.0 for type_id in TARGET_GRASP_TYPE_IDS],
-            dtype=np.float32,
-        )
-        if label_mode == "closed_world_object_complete":
-            tested = np.ones_like(feasible, dtype=np.float32)
-        else:
-            tested = feasible.copy()
-        labels[object_id] = {
-            "feasible": feasible,
-            "tested": tested,
-            "counts": counter,
-            "label_mode": label_mode,
-        }
-    return labels, split_records
-
-
-def build_human_scene_labels(config) -> tuple:
-    """Build scene-level labels with positive, strong-negative, and unknown types.
-
-    Args:
-        config: Full Hydra config.
-
-    Returns:
-        Tuple ``(label_by_scene_key, split_records)``. Labels use current-scene
-        observed types as positives, types never observed for the same canonical
-        object as strong negatives, and same-object other observed types as unknown.
-    """
-    split_name = str(cfg_get(config.test_data, "test_split", "test.split", default="test"))
-    split_records = load_human_records_for_split(config, split_name)
-    object_positive_types = {}
-    scene_positive_types = {}
-    scene_object_ids = {}
-
-    for record in split_records:
-        object_id = record["canonical_object_id"]
-        key = record["scene_key"]
-        type_id = int(record["grasp_type_id"])
-        object_positive_types.setdefault(object_id, set()).add(type_id)
-        scene_positive_types.setdefault(key, set()).add(type_id)
-        scene_object_ids[key] = object_id
-
-    labels = {}
-    all_types = set(TARGET_GRASP_TYPE_IDS)
-    for key, positive_types in scene_positive_types.items():
-        object_id = scene_object_ids[key]
-        object_types = object_positive_types.get(object_id, set())
-        strong_negative_types = all_types - object_types
-        unknown_types = object_types - positive_types
-        y = np.zeros(len(TARGET_GRASP_TYPE_IDS), dtype=np.float32)
-        mask = np.zeros(len(TARGET_GRASP_TYPE_IDS), dtype=np.float32)
-        for idx, type_id in enumerate(TARGET_GRASP_TYPE_IDS):
-            if type_id in positive_types:
-                y[idx] = 1.0
-                mask[idx] = 1.0
-            elif type_id in strong_negative_types:
-                y[idx] = 0.0
-                mask[idx] = 1.0
-        labels[key] = {
-            "canonical_object_id": object_id,
-            "scene_key": key,
-            "positive_types": sorted(positive_types),
-            "strong_negative_types": sorted(strong_negative_types),
-            "unknown_types": sorted(unknown_types),
-            "y": y,
-            "mask": mask,
-        }
-    return labels, split_records
-
-
-def score_vector_from_sample(sample_data: dict):
-    """Read real-type score vector from one sample dictionary.
-
-    Args:
-        sample_data: Saved sample dictionary.
-
-    Returns:
-        Five-dimensional score vector for types ``1..5``, or ``None``.
-    """
-    if "pred_grasp_type_prob" not in sample_data:
-        return None
-    scores = np.asarray(sample_data["pred_grasp_type_prob"], dtype=np.float64).reshape(-1)
-    if scores.size == len(TARGET_GRASP_TYPE_IDS) + 1:
-        scores = scores[1:]
-    elif scores.size != len(TARGET_GRASP_TYPE_IDS):
-        return None
-    return scores.astype(np.float64)
-
-
-def load_score_records(sample_files: list) -> list:
-    """Load score records from sample files.
-
-    Args:
-        sample_files: Saved sample files containing ``pred_grasp_type_prob``.
-
-    Returns:
-        List of object-level score records.
-    """
-    records = []
-    for sample_file in sample_files:
-        sample_data = np.load(sample_file, allow_pickle=True).item()
-        scores = score_vector_from_sample(sample_data)
-        if scores is None:
-            continue
-        metadata = resolve_sample_scene_metadata(sample_data)
-        records.append(
+    rows = []
+    for key in sorted(groups, key=lambda item: (item[0], _natural_sort_key(item[1]))):
+        score_stack = np.stack([item["scores"] for item in groups[key]], axis=0)
+        rows.append(
             {
-                "path": sample_file,
-                "object_name": metadata["object_name"],
-                "canonical_object_id": metadata["canonical_object_id"],
-                "scene_id": metadata["scene_id"],
-                "scene_key": metadata["scene_key"],
-                "scores": scores,
+                **first_rows[key],
+                "scores": score_stack.mean(axis=0),
+                "score_row_count": int(score_stack.shape[0]),
             }
         )
-    return records
+    return rows
 
 
-def aggregate_scores_by_object(score_records: list) -> dict:
-    """Average repeated score samples by canonical object id.
+def load_score_jsonl(path: str, max_rows: int = 0) -> list[dict]:
+    """Load obj_human_prior score rows.
 
     Args:
-        score_records: Per-file score records.
+        path: ``scene_budget_scores.jsonl`` path.
+        max_rows: Optional cap for quick evaluation.
 
     Returns:
-        Mapping from canonical object id to mean score vector and count.
+        List of normalized score rows.
     """
-    grouped = {}
-    for record in score_records:
-        grouped.setdefault(record["canonical_object_id"], []).append(record["scores"])
+    if not path or not os.path.isfile(path):
+        return []
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if max_rows > 0 and len(rows) >= max_rows:
+                break
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            object_id = canonical_object_id(raw.get("object_id", ""))
+            key = scene_key(object_id, raw.get("scene_id", ""))
+            rows.append(
+                {
+                    "scene_id": str(raw.get("scene_id", "")),
+                    "scene_key": key,
+                    "object_id": object_id,
+                    "split": str(raw.get("split", "")),
+                    "scene_path": str(raw.get("scene_path", "")),
+                    "pc_path": str(raw.get("pc_path", "")),
+                    "scores": normalize_score_vector(raw.get("budget_scores", raw.get("scores", []))),
+                    "score_semantics": str(raw.get("score_semantics", "")),
+                }
+            )
+    return rows
 
-    return {
-        object_id: {
-            "scores": np.mean(np.stack(scores, axis=0), axis=0),
-            "sample_count": len(scores),
+
+def aggregate_score_rows_by_scene(rows: list[dict]) -> dict[tuple[str, str], dict]:
+    """Average repeated score rows by split and scene key.
+
+    Args:
+        rows: Score rows from ``load_score_jsonl``.
+
+    Returns:
+        Mapping ``(split, scene_key) -> score record``.
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        groups.setdefault((str(row.get("split", "")), str(row["scene_key"])), []).append(row)
+    aggregated = {}
+    for key, group in groups.items():
+        scores = np.stack([row["scores"] for row in group], axis=0)
+        aggregated[key] = {
+            **group[0],
+            "scores": scores.mean(axis=0),
+            "score_row_count": int(len(group)),
         }
-        for object_id, scores in grouped.items()
-    }
+    return aggregated
 
 
-def aggregate_scores_by_scene(score_records: list) -> dict:
-    """Average repeated score samples by scene key.
+def find_score_for_scene(score_by_scene: dict, split: str, scene_key_value: str) -> dict | None:
+    """Find a score row for one split/scene key.
 
     Args:
-        score_records: Per-file score records.
+        score_by_scene: Aggregated score mapping.
+        split: Requested split.
+        scene_key_value: Scene key.
 
     Returns:
-        Mapping from scene key to mean score vector and metadata.
+        Score row or ``None``.
     """
-    grouped = {}
-    for record in score_records:
-        grouped.setdefault(record["scene_key"], []).append(record)
+    return score_by_scene.get((split, scene_key_value)) or score_by_scene.get(("", scene_key_value))
 
-    scene_scores = {}
-    for key, records in grouped.items():
-        scores = [record["scores"] for record in records]
-        scene_scores[key] = {
-            "scores": np.mean(np.stack(scores, axis=0), axis=0),
-            "sample_count": len(scores),
-            "canonical_object_id": records[0]["canonical_object_id"],
-            "scene_id": records[0]["scene_id"],
-            "paths": [record["path"] for record in records],
+
+def pointcloud_matches_sequence(pc_path: str, sequence_id: str) -> bool:
+    """Check whether a point-cloud path appears to match a sequence id.
+
+    Args:
+        pc_path: Candidate point-cloud path.
+        sequence_id: Sequence id.
+
+    Returns:
+        True when the filename or a path component contains the sequence id.
+    """
+    sequence_id = normalize_sequence_id(sequence_id)
+    if not sequence_id:
+        return False
+    base_name = os.path.splitext(os.path.basename(pc_path))[0]
+    return base_name == sequence_id or base_name.startswith(f"{sequence_id}_") or sequence_id in pc_path.split(os.sep)
+
+
+def select_human_pointcloud(object_root: str, pc_rel_path: str, object_id: str, sequence_id: str) -> str:
+    """Select a deterministic canonical point cloud for one human scene.
+
+    Args:
+        object_root: Human object root.
+        pc_rel_path: Point-cloud subdirectory relative to object root.
+        object_id: Object id.
+        sequence_id: Sequence id.
+
+    Returns:
+        Point-cloud path.
+    """
+    pc_root = os.path.join(object_root, pc_rel_path, object_id)
+    candidates = sorted(glob(os.path.join(pc_root, "**", "*.npy"), recursive=True), key=_natural_sort_key)
+    if not candidates:
+        raise FileNotFoundError(f"No point clouds found under {pc_root}")
+    matched = [path for path in candidates if pointcloud_matches_sequence(path, sequence_id)]
+    return matched[0] if matched else candidates[0]
+
+
+def iter_human_roots(data_config) -> list[tuple[str, str]]:
+    """Resolve human grasp and object roots from the data config.
+
+    Args:
+        data_config: Hydra data config for ``HumanMultiDexDataset``.
+
+    Returns:
+        List of ``(grasp_root, object_root)`` pairs.
+    """
+    data_config = deepcopy(data_config)
+    flatten_multidex_data_config(data_config)
+    grasp_paths = [_abs_path(path) for path in _as_list(cfg_get(data_config, "grasp_path", "paths.grasp_path"))]
+    object_paths = [_abs_path(path) for path in _as_list(cfg_get(data_config, "object_path", "paths.object_path"))]
+    if len(grasp_paths) == 1 and len(object_paths) > 1:
+        grasp_paths = grasp_paths * len(object_paths)
+    if len(object_paths) == 1 and len(grasp_paths) > 1:
+        object_paths = object_paths * len(grasp_paths)
+    if len(grasp_paths) != len(object_paths):
+        raise ValueError("grasp_path and object_path must have matching lengths")
+    return list(zip(grasp_paths, object_paths))
+
+
+def yaw_rotation_matrix(yaw_rad: float) -> np.ndarray:
+    """Build a global-Z yaw rotation matrix.
+
+    Args:
+        yaw_rad: Yaw angle in radians.
+
+    Returns:
+        Rotation matrix shaped ``(3, 3)``.
+    """
+    c, s = math.cos(float(yaw_rad)), math.sin(float(yaw_rad))
+    return np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def wrap_angle_rad(angle: float) -> float:
+    """Wrap an angle to ``[-pi, pi)``.
+
+    Args:
+        angle: Raw angle in radians.
+
+    Returns:
+        Wrapped angle.
+    """
+    return float((float(angle) + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def optimal_left_yaw(rot_a: np.ndarray, rot_b: np.ndarray) -> float:
+    """Find global-Z yaw that best aligns ``yaw @ rot_b`` to ``rot_a``.
+
+    Args:
+        rot_a: Target rotation matrix.
+        rot_b: Source rotation matrix.
+
+    Returns:
+        Yaw angle in radians.
+    """
+    matrix = np.asarray(rot_b, dtype=np.float64) @ np.asarray(rot_a, dtype=np.float64).T
+    return wrap_angle_rad(math.atan2(matrix[0, 1] - matrix[1, 0], matrix[0, 0] + matrix[1, 1]))
+
+
+def rotation_distance_deg(rot_a: np.ndarray, rot_b: np.ndarray) -> float:
+    """Compute geodesic rotation distance in degrees.
+
+    Args:
+        rot_a: First rotation matrix.
+        rot_b: Second rotation matrix.
+
+    Returns:
+        Angular distance in degrees.
+    """
+    relative = np.asarray(rot_a, dtype=np.float64).T @ np.asarray(rot_b, dtype=np.float64)
+    return float(np.rad2deg(SciR.from_matrix(relative).magnitude()))
+
+
+def pose_class_rotation_residual(scene: dict, representative: dict) -> tuple[float, float, float]:
+    """Compare object poses modulo global yaw and local-Z 180-degree symmetry.
+
+    Args:
+        scene: Candidate scene dictionary.
+        representative: Representative scene dictionary.
+
+    Returns:
+        Tuple ``(residual_deg, yaw_deg, local_z_symmetry_deg)``.
+    """
+    scene_rot = np.asarray(scene["object_pose"], dtype=np.float64)[:3, :3]
+    rep_rot = np.asarray(representative["object_pose"], dtype=np.float64)[:3, :3]
+    best = (float("inf"), 0.0, 0.0)
+    for local_z in (0.0, math.pi):
+        candidate = scene_rot @ yaw_rotation_matrix(local_z)
+        yaw = optimal_left_yaw(rep_rot, candidate)
+        aligned = yaw_rotation_matrix(yaw) @ candidate
+        residual = rotation_distance_deg(rep_rot, aligned)
+        if residual < best[0]:
+            best = (float(residual), float(np.rad2deg(yaw)), float(np.rad2deg(local_z)))
+    return best
+
+
+def bbox_proportion_distance(scene: dict, representative: dict) -> float:
+    """Compare yaw-free bbox proportions between two posed scenes.
+
+    Args:
+        scene: Candidate scene dictionary.
+        representative: Representative scene dictionary.
+
+    Returns:
+        Maximum relative difference over normalized descriptor axes.
+    """
+    a = np.maximum(np.asarray(scene["posed_descriptor"], dtype=np.float64), EPS)
+    b = np.maximum(np.asarray(representative["posed_descriptor"], dtype=np.float64), EPS)
+    a = a / max(float(np.linalg.norm(a)), EPS)
+    b = b / max(float(np.linalg.norm(b)), EPS)
+    denominator = np.maximum(np.maximum(a, b), EPS)
+    return float(np.max(np.abs(a - b) / denominator))
+
+
+def assign_pose_classes(scenes: list[dict], rotation_threshold_deg: float, bbox_threshold: float) -> dict[tuple, dict]:
+    """Assign human object scenes to pose classes.
+
+    Args:
+        scenes: Human scene dictionaries.
+        rotation_threshold_deg: Rotation residual threshold.
+        bbox_threshold: Bbox proportion fallback threshold.
+
+    Returns:
+        Mapping from ``(component_idx, split, scene_key)`` to pose-class metadata.
+    """
+    representatives_by_object: dict[tuple[int, str, str], list[dict]] = {}
+    assignments = {}
+    for scene in scenes:
+        object_key = (int(scene["component_idx"]), str(scene["split"]), str(scene["object_id"]))
+        representatives = representatives_by_object.setdefault(object_key, [])
+        best_rotation = None
+        best_bbox = None
+        for pose_class_id, representative in enumerate(representatives):
+            residual, yaw_deg, local_z_deg = pose_class_rotation_residual(scene, representative)
+            bbox_distance = bbox_proportion_distance(scene, representative)
+            candidate = {
+                "pose_class_id": int(pose_class_id),
+                "pose_class_rotation_residual_deg": float(residual),
+                "pose_class_yaw_to_representative_deg": float(yaw_deg),
+                "pose_class_local_z_symmetry_deg": float(local_z_deg),
+                "pose_class_bbox_proportion_distance": float(bbox_distance),
+            }
+            if residual <= rotation_threshold_deg:
+                if best_rotation is None or residual < best_rotation["pose_class_rotation_residual_deg"]:
+                    best_rotation = candidate
+            elif bbox_distance <= bbox_threshold:
+                if best_bbox is None or bbox_distance < best_bbox["pose_class_bbox_proportion_distance"]:
+                    best_bbox = candidate
+
+        if best_rotation is not None:
+            selected = best_rotation
+            selected["pose_class_match_method"] = "rotation"
+        elif best_bbox is not None:
+            selected = best_bbox
+            selected["pose_class_match_method"] = "bbox_proportion"
+        else:
+            selected = {
+                "pose_class_id": int(len(representatives)),
+                "pose_class_rotation_residual_deg": 0.0,
+                "pose_class_yaw_to_representative_deg": 0.0,
+                "pose_class_local_z_symmetry_deg": 0.0,
+                "pose_class_bbox_proportion_distance": 0.0,
+                "pose_class_match_method": "new",
+            }
+            representatives.append(scene)
+
+        representative = representatives[int(selected["pose_class_id"])]
+        assignments[(int(scene["component_idx"]), str(scene["split"]), str(scene["scene_key"]))] = {
+            **selected,
+            "pose_class_key": f"{scene['object_id']}/pose_{int(selected['pose_class_id']):03d}",
+            "pose_class_representative_scene_key": str(representative["scene_key"]),
         }
-    return scene_scores
+    return assignments
 
 
-def parse_thresholds(task_cfg) -> list:
-    """Read feasibility thresholds from config.
-
-    Args:
-        task_cfg: Evaluation task config.
-
-    Returns:
-        Sorted unique threshold values.
-    """
-    threshold_values = getattr(task_cfg, "score_thresholds", None)
-    if threshold_values is None:
-        threshold_values = [getattr(task_cfg, "score_threshold", 0.5)]
-    elif isinstance(threshold_values, (str, bytes)):
-        threshold_values = [value for value in str(threshold_values).split(",") if value.strip()]
-    elif not isinstance(threshold_values, (list, tuple, ListConfig)):
-        threshold_values = [threshold_values]
-    elif len(threshold_values) == 0:
-        threshold_values = [getattr(task_cfg, "score_threshold", 0.5)]
-    thresholds = sorted({float(value) for value in threshold_values})
-    return thresholds
-
-
-def selected_types_for_threshold(scores: np.ndarray, threshold: float) -> list:
-    """Convert one score vector into a thresholded feasible type list.
+def build_human_scene_table(config) -> list[dict]:
+    """Build human scene records with grasp type counts and geometry.
 
     Args:
-        scores: Five-dimensional score vector for real types ``1..5``.
-        threshold: Feasibility threshold.
+        config: Full Hydra config.
 
     Returns:
-        Selected grasp type ids.
+        Scene dictionaries before pose-class aggregation.
     """
-    return [type_id for type_id, score in zip(TARGET_GRASP_TYPE_IDS, scores) if float(score) >= threshold]
+    data_config = deepcopy(config.data)
+    flatten_multidex_data_config(data_config)
+    splits = [str(split) for split in _as_list(getattr(config.task, "human_splits", ["train", "test"]))]
+    split_path = str(cfg_get(data_config, "split_path", "paths.split_path", default="valid_split"))
+    pc_rel_path = str(cfg_get(data_config, "pc_path", "paths.pc_path", default="vision_data/complete_pc"))
+    max_points = int(getattr(config.task, "scale_max_points", 8192))
+    scene_map: dict[tuple[int, str, str], dict] = {}
+    descriptor_cache: dict[tuple[str, str, str], tuple[str, np.ndarray, np.ndarray]] = {}
+
+    for component_idx, (grasp_root, object_root) in enumerate(iter_human_roots(data_config)):
+        for split in splits:
+            split_json = os.path.join(object_root, split_path, f"{split}.json")
+            if not os.path.isfile(split_json):
+                print(f"[evaluate] Skip missing split file: {split_json}")
+                continue
+            for object_id_raw in sorted(_load_json(split_json), key=_natural_sort_key):
+                object_id = canonical_object_id(object_id_raw)
+                grasp_paths = sorted(glob(os.path.join(grasp_root, str(object_id_raw), "**", "*.npy"), recursive=True), key=_natural_sort_key)
+                for grasp_path in grasp_paths:
+                    grasp_data = np.load(grasp_path, allow_pickle=True).item()
+                    sequence_id = sequence_id_from_grasp(grasp_data, grasp_path)
+                    key = (component_idx, split, scene_key(object_id, sequence_id))
+                    scene = scene_map.get(key)
+                    if scene is None:
+                        pc_path = select_human_pointcloud(object_root, pc_rel_path, str(object_id_raw), sequence_id)
+                        descriptor_key = (pc_path, json.dumps(np.asarray(grasp_data.get("object", {}).get("rel_scale", 1.0)).reshape(-1).tolist()), json.dumps(object_pose_matrix(grasp_data).reshape(-1).tolist()))
+                        if descriptor_key in descriptor_cache:
+                            pc_path, canonical_descriptor, posed_descriptor = descriptor_cache[descriptor_key]
+                        else:
+                            points = np.asarray(np.load(pc_path, allow_pickle=True), dtype=np.float64).reshape(-1, 3)
+                            if max_points > 0 and points.shape[0] > max_points:
+                                indices = np.linspace(0, points.shape[0] - 1, num=max_points, dtype=np.int64)
+                                points = points[indices]
+                            scaled = scale_points(points, grasp_data.get("object", {}).get("rel_scale", 1.0))
+                            canonical_descriptor = scale_descriptor(scaled)
+                            posed_descriptor = scale_descriptor(transform_points(scaled, object_pose_matrix(grasp_data)))
+                            descriptor_cache[descriptor_key] = (pc_path, canonical_descriptor, posed_descriptor)
+                        scene = {
+                            "component_idx": component_idx,
+                            "split": split,
+                            "object_id": object_id,
+                            "sequence_id": sequence_id,
+                            "scene_key": key[2],
+                            "pc_path": pc_path,
+                            "object_pose": object_pose_matrix(grasp_data),
+                            "scale_descriptor": canonical_descriptor,
+                            "posed_descriptor": posed_descriptor,
+                            "type_counts": {type_id: 0 for type_id in REAL_TYPE_IDS},
+                            "grasp_paths": [],
+                        }
+                        scene_map[key] = scene
+                    type_id = human_grasp_type_id(grasp_data)
+                    if type_id in scene["type_counts"]:
+                        scene["type_counts"][type_id] += 1
+                    scene["grasp_paths"].append(os.path.abspath(grasp_path))
+
+    scenes = list(scene_map.values())
+    scenes.sort(key=lambda item: (item["component_idx"], item["split"], _natural_sort_key(item["object_id"]), _natural_sort_key(item["scene_key"])))
+    return scenes
 
 
-def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Compute binary metrics for thresholded feasibility labels.
+def build_pose_class_labels(config, score_rows: list[dict]) -> tuple[list[dict], dict]:
+    """Recompute pose-class grasp-type count labels independently.
 
     Args:
-        y_true: Binary labels.
-        y_pred: Binary predictions.
+        config: Full Hydra config.
+        score_rows: Human score rows used for joining predictions.
 
     Returns:
-        Dictionary with confusion counts and common rates.
+        Tuple ``(label_rows, summary)``.
     """
-    y_true = np.asarray(y_true, dtype=np.int32)
-    y_pred = np.asarray(y_pred, dtype=np.int32)
-    tp = int(((y_pred == 1) & (y_true == 1)).sum())
-    fp = int(((y_pred == 1) & (y_true == 0)).sum())
-    tn = int(((y_pred == 0) & (y_true == 0)).sum())
-    fn = int(((y_pred == 0) & (y_true == 1)).sum())
-    precision = tp / (tp + fp) if (tp + fp) > 0 else None
-    recall = tp / (tp + fn) if (tp + fn) > 0 else None
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else None
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else None
-    f1 = (
-        2.0 * precision * recall / (precision + recall)
-        if precision is not None and recall is not None and (precision + recall) > 0
-        else None
-    )
-    balanced_accuracy = (
-        0.5 * (recall + specificity) if recall is not None and specificity is not None else None
-    )
-    return {
-        "tp": tp,
-        "fp": fp,
-        "tn": tn,
-        "fn": fn,
-        "precision": precision,
-        "recall": recall,
-        "specificity": specificity,
-        "fpr": fpr,
-        "f1": f1,
-        "balanced_accuracy": balanced_accuracy,
+    scenes = build_human_scene_table(config)
+    rotation_threshold = float(getattr(config.task, "pose_class_rotation_threshold_deg", 45.0))
+    bbox_threshold = float(getattr(config.task, "pose_class_bbox_proportion_threshold", 0.2))
+    assignments = assign_pose_classes(scenes, rotation_threshold, bbox_threshold)
+    score_by_scene = aggregate_score_rows_by_scene(score_rows)
+
+    grouped: dict[tuple[int, str, str, int], list[dict]] = {}
+    for scene in scenes:
+        assignment = assignments[(int(scene["component_idx"]), str(scene["split"]), str(scene["scene_key"]))]
+        key = (int(scene["component_idx"]), str(scene["split"]), str(scene["object_id"]), int(assignment["pose_class_id"]))
+        scene = dict(scene)
+        scene.update(assignment)
+        grouped.setdefault(key, []).append(scene)
+
+    rows = []
+    for key, member_scenes in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1], _natural_sort_key(item[0][2]), item[0][3])):
+        component_idx, split, object_id, pose_class_id = key
+        counts = np.zeros(len(REAL_TYPE_IDS), dtype=np.float64)
+        member_scene_keys = []
+        score_vectors = []
+        score_scene_keys = []
+        descriptors = []
+        for scene in member_scenes:
+            member_scene_keys.append(scene["scene_key"])
+            descriptors.append(np.asarray(scene["scale_descriptor"], dtype=np.float64))
+            for idx, type_id in enumerate(REAL_TYPE_IDS):
+                counts[idx] += int(scene["type_counts"].get(type_id, 0))
+            score_row = find_score_for_scene(score_by_scene, split, scene["scene_key"])
+            if score_row is not None:
+                score_vectors.append(np.asarray(score_row["scores"], dtype=np.float64))
+                score_scene_keys.append(scene["scene_key"])
+        if float(counts.sum()) <= 0.0:
+            continue
+        q = counts / float(counts.sum())
+        p = np.mean(np.stack(score_vectors, axis=0), axis=0) if score_vectors else None
+        descriptor = np.mean(np.stack(descriptors, axis=0), axis=0)
+        first = member_scenes[0]
+        row = {
+            "component_idx": int(component_idx),
+            "split": split,
+            "canonical_object_id": object_id,
+            "pose_class_id": int(pose_class_id),
+            "pose_class_key": str(first["pose_class_key"]),
+            "representative_scene_key": str(first["pose_class_representative_scene_key"]),
+            "member_scene_keys": ";".join(sorted(member_scene_keys, key=_natural_sort_key)),
+            "scored_scene_keys": ";".join(sorted(score_scene_keys, key=_natural_sort_key)),
+            "member_scene_num": int(len(member_scene_keys)),
+            "scored_scene_num": int(len(score_scene_keys)),
+            "record_count": int(counts.sum()),
+            "xy_long": float(descriptor[0]),
+            "xy_short": float(descriptor[1]),
+            "z_height": float(descriptor[2]),
+            "has_score": p is not None,
+        }
+        for idx, type_id in enumerate(REAL_TYPE_IDS):
+            row[f"type_{type_id}_count"] = int(counts[idx])
+            row[f"type_{type_id}_q"] = float(q[idx])
+            row[f"type_{type_id}_p"] = float(p[idx]) if p is not None else ""
+        rows.append(row)
+    summary = {
+        "scene_num": len(scenes),
+        "pose_class_num": len(rows),
+        "pose_class_rotation_threshold_deg": rotation_threshold,
+        "pose_class_bbox_proportion_threshold": bbox_threshold,
     }
+    return rows, summary
 
 
-def format_optional_float(value, precision: int = 4) -> str:
-    """Format optional numeric metrics for reports.
-
-    Args:
-        value: Numeric value or ``None``.
-        precision: Decimal precision.
-
-    Returns:
-        Formatted string or ``NA``.
-    """
-    if value is None:
-        return "NA"
-    return f"{float(value):.{precision}f}"
-
-
-def average_precision(y_true: np.ndarray, y_score: np.ndarray):
-    """Compute average precision without adding a sklearn dependency.
+def metric_row_for_pose_class(row: dict) -> dict | None:
+    """Compute one human labeled metric row.
 
     Args:
-        y_true: Binary labels.
-        y_score: Prediction scores.
+        row: Pose-class label row with q and p values.
 
     Returns:
-        Average precision, or ``None`` when positives or negatives are absent.
+        Metric row, or ``None`` when prediction is missing.
     """
-    y_true = np.asarray(y_true, dtype=np.int32)
-    y_score = np.asarray(y_score, dtype=np.float64)
-    positive_count = int(y_true.sum())
-    if positive_count == 0 or positive_count == len(y_true):
+    if not row.get("has_score", False):
         return None
-    order = np.argsort(-y_score)
-    sorted_true = y_true[order]
-    precision_at_rank = np.cumsum(sorted_true) / (np.arange(len(sorted_true)) + 1.0)
-    return float((precision_at_rank * sorted_true).sum() / positive_count)
+    q = np.asarray([float(row[f"type_{type_id}_q"]) for type_id in REAL_TYPE_IDS], dtype=np.float64)
+    p = np.asarray([float(row[f"type_{type_id}_p"]) for type_id in REAL_TYPE_IDS], dtype=np.float64)
+    positive_mask = q > 0.0
+    ce = float(-np.sum(q * np.log(np.clip(p, EPS, None))))
+    entropy = float(-np.sum(q * np.log(np.clip(q, EPS, None))))
+    l1 = float(np.sum(np.abs(p - q)))
+    p_top1 = top_k_indices(p, 1)
+    q_top1 = top_k_indices(q, 1)
+    p_top2 = top_k_indices(p, 2)
+    q_top2 = top_k_indices(q, 2)
+    out = {
+        "split": row["split"],
+        "canonical_object_id": row["canonical_object_id"],
+        "pose_class_key": row["pose_class_key"],
+        "record_count": int(row["record_count"]),
+        "positive_type_num": int(positive_mask.sum()),
+        "xy_long": float(row["xy_long"]),
+        "xy_short": float(row["xy_short"]),
+        "z_height": float(row["z_height"]),
+        "soft_label_ce": ce,
+        "kl_q_p": float(ce - entropy),
+        "distribution_l1": l1,
+        "tvd": float(0.5 * l1),
+        "js_divergence": js_divergence(q, p),
+        "positive_probability_mass": float(p[positive_mask].sum()),
+        "spearman": spearman_corr(q, p),
+        "kendall": kendall_tau_b(q, p),
+        "top1_match": float(bool(p_top1 & q_top1)),
+        "top2_overlap": float(len(p_top2 & q_top2) / 2.0),
+    }
+    for idx, type_id in enumerate(REAL_TYPE_IDS):
+        out[f"type_{type_id}_q"] = float(q[idx])
+        out[f"type_{type_id}_p"] = float(p[idx])
+        out[f"type_{type_id}_bias"] = float(p[idx] - q[idx])
+        out[f"type_{type_id}_under"] = float(max(q[idx] - p[idx], 0.0))
+        out[f"type_{type_id}_over"] = float(max(p[idx] - q[idx], 0.0))
+    return out
 
 
-def percentile_lines(title: str, values: list, unit: str = "") -> list:
-    """Format standard percentile statistics for markdown.
+def quantile_edges(values: list[float], bucket_count: int) -> np.ndarray:
+    """Compute unique quantile bucket edges.
 
     Args:
-        title: Metric title.
         values: Numeric values.
-        unit: Optional displayed unit.
+        bucket_count: Desired number of buckets.
+
+    Returns:
+        Edge array including min and max.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.asarray([], dtype=np.float64)
+    quantiles = np.linspace(0.0, 1.0, max(2, int(bucket_count) + 1))
+    edges = np.unique(np.quantile(arr, quantiles))
+    if edges.size == 1:
+        edges = np.asarray([edges[0], edges[0]], dtype=np.float64)
+    return edges
+
+
+def bucket_label(value: float, edges: np.ndarray) -> str:
+    """Assign a value to a quantile bucket.
+
+    Args:
+        value: Numeric value.
+        edges: Quantile edge array.
+
+    Returns:
+        Bucket label.
+    """
+    if edges.size < 2 or not np.isfinite(value):
+        return "all"
+    idx = int(np.searchsorted(edges[1:-1], float(value), side="right"))
+    lo = float(edges[idx])
+    hi = float(edges[idx + 1])
+    return f"q{idx + 1}[{lo:.4g},{hi:.4g}]"
+
+
+def add_scale_buckets(rows: list[dict], bucket_count: int) -> dict[str, np.ndarray]:
+    """Add per-axis quantile scale bucket labels to rows.
+
+    Args:
+        rows: Rows containing scale descriptor fields.
+        bucket_count: Number of quantile buckets.
+
+    Returns:
+        Mapping from feature name to bucket edges.
+    """
+    edges_by_feature = {
+        feature: quantile_edges([float(row[feature]) for row in rows], bucket_count)
+        for feature in SCALE_FEATURES
+    }
+    for row in rows:
+        for feature, edges in edges_by_feature.items():
+            row[f"{feature}_bucket"] = bucket_label(float(row[feature]), edges)
+    return edges_by_feature
+
+
+def summarize_metric_rows(rows: list[dict], group_name: str, group_value: str) -> dict:
+    """Summarize human metric rows for one group.
+
+    Args:
+        rows: Metric rows.
+        group_name: Grouping field name.
+        group_value: Grouping value.
+
+    Returns:
+        Summary row.
+    """
+    summary = {
+        "group_name": group_name,
+        "group_value": group_value,
+        "pose_class_num": int(len(rows)),
+        "object_num": int(len({row["canonical_object_id"] for row in rows})),
+    }
+    for metric in [
+        "soft_label_ce",
+        "kl_q_p",
+        "distribution_l1",
+        "tvd",
+        "js_divergence",
+        "positive_probability_mass",
+        "spearman",
+        "kendall",
+        "top1_match",
+        "top2_overlap",
+    ]:
+        summary[metric] = metric_mean(rows, metric)
+    for type_id in REAL_TYPE_IDS:
+        summary[f"type_{type_id}_signed_bias"] = metric_mean(rows, f"type_{type_id}_bias")
+        summary[f"type_{type_id}_mean_under"] = metric_mean(rows, f"type_{type_id}_under")
+        summary[f"type_{type_id}_mean_over"] = metric_mean(rows, f"type_{type_id}_over")
+    return summary
+
+
+def object_macro_summary(rows: list[dict], split: str) -> dict:
+    """Compute canonical-object macro averages for one split.
+
+    Args:
+        rows: Metric rows.
+        split: Split label.
+
+    Returns:
+        Summary row.
+    """
+    object_rows = []
+    for object_id in sorted({row["canonical_object_id"] for row in rows}, key=_natural_sort_key):
+        object_metric_rows = [row for row in rows if row["canonical_object_id"] == object_id]
+        object_rows.append(summarize_metric_rows(object_metric_rows, "object", object_id))
+    summary = {"group_name": "object_macro", "group_value": split, "pose_class_num": len(rows), "object_num": len(object_rows)}
+    for key in object_rows[0].keys() if object_rows else []:
+        if key in {"group_name", "group_value", "pose_class_num", "object_num"}:
+            continue
+        values = [row[key] for row in object_rows if row.get(key) is not None]
+        summary[key] = float(np.mean(values)) if values else None
+    return summary
+
+
+def build_human_metric_summaries(metric_rows: list[dict]) -> list[dict]:
+    """Build required human train/test aggregate summaries.
+
+    Args:
+        metric_rows: Per-pose-class metric rows.
+
+    Returns:
+        Summary rows.
+    """
+    summaries = []
+    for split in sorted({row["split"] for row in metric_rows}):
+        split_rows = [row for row in metric_rows if row["split"] == split]
+        summaries.append(summarize_metric_rows(split_rows, "scene_micro", split))
+        if split_rows:
+            summaries.append(object_macro_summary(split_rows, split))
+        for positive_num in sorted({row["positive_type_num"] for row in split_rows}):
+            rows = [row for row in split_rows if row["positive_type_num"] == positive_num]
+            summaries.append(summarize_metric_rows(rows, "|P(scene)|", str(positive_num)))
+        for feature in SCALE_FEATURES:
+            bucket_key = f"{feature}_bucket"
+            for bucket in sorted({row[bucket_key] for row in split_rows}):
+                rows = [row for row in split_rows if row[bucket_key] == bucket]
+                summary = summarize_metric_rows(rows, bucket_key, f"{split}:{bucket}")
+                summaries.append(summary)
+    return summaries
+
+
+def train_test_gap_rows(summaries: list[dict]) -> list[dict]:
+    """Build train-test gap rows for comparable summary groups.
+
+    Args:
+        summaries: Human summary rows.
+
+    Returns:
+        Gap rows where value equals ``test - train``.
+    """
+    by_key = {(row["group_name"], row["group_value"]): row for row in summaries}
+    gaps = []
+    for row in summaries:
+        group_name = row["group_name"]
+        value = str(row["group_value"])
+        if not value.startswith("test") and value != "test":
+            continue
+        train_value = value.replace("test", "train", 1)
+        train_row = by_key.get((group_name, train_value))
+        if train_row is None:
+            continue
+        gap = {"group_name": f"{group_name}_gap", "group_value": value, "pose_class_num": row["pose_class_num"], "object_num": row["object_num"]}
+        for key, value_item in row.items():
+            if key in gap or key in {"group_name", "group_value", "pose_class_num", "object_num"}:
+                continue
+            if value_item is None or train_row.get(key) is None:
+                gap[key] = None
+            else:
+                gap[key] = float(value_item) - float(train_row[key])
+        gaps.append(gap)
+    return gaps
+
+
+def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_rows: list[dict], output_dir: str) -> list[str]:
+    """Format the human 1A markdown section.
+
+    Args:
+        label_rows: Pose-class label rows.
+        metric_rows: Per-pose-class metric rows.
+        summary_rows: Aggregate metric rows.
+        output_dir: Directory containing CSV outputs.
 
     Returns:
         Markdown lines.
     """
-    if not values:
-        return [f"- {title}: no values"]
-    arr = np.asarray(values, dtype=np.float64)
-    suffix = f" {unit}" if unit else ""
-    return [
-        (
-            f"- {title}: mean={arr.mean():.4f}{suffix}, p50={np.percentile(arr, 50):.4f}{suffix}, "
-            f"p90={np.percentile(arr, 90):.4f}{suffix}, p95={np.percentile(arr, 95):.4f}{suffix}, "
-            f"p99={np.percentile(arr, 99):.4f}{suffix}, max={arr.max():.4f}{suffix}"
-        )
-    ]
-
-
-def run_score_sanity(score_records: list, sample_dir: str) -> list:
-    """Summarize feasibility or categorical score behavior.
-
-    Args:
-        score_records: Per-file score records.
-        sample_dir: Sample output directory.
-
-    Returns:
-        Markdown summary lines.
-    """
-    if not score_records:
-        return ["- No score records were available."]
-    rows = []
-    max_scores = []
-    entropy_values = []
-    score_sums = []
-    for record in score_records:
-        scores = np.asarray(record["scores"], dtype=np.float64)
-        score_sum = float(scores.sum())
-        probs = scores / score_sum if score_sum > 1e-8 else np.ones_like(scores) / len(scores)
-        entropy = float(-(probs * np.log(np.clip(probs, 1e-12, None))).sum())
-        max_scores.append(float(scores.max()))
-        entropy_values.append(entropy)
-        score_sums.append(score_sum)
-        row = {
-            "sample_path": record["path"],
-            "canonical_object_id": record["canonical_object_id"],
-            "max_score": float(scores.max()),
-            "score_sum": score_sum,
-            "score_entropy": entropy,
-        }
-        for type_id, score in zip(TARGET_GRASP_TYPE_IDS, scores):
-            row[f"type_{type_id}_score"] = float(score)
-        rows.append(row)
-
-    write_generic_csv(rows, os.path.join(sample_dir, "evaluation_score_sanity.csv"))
-    lines = [f"- Score records: {len(score_records)}"]
-    lines.extend(percentile_lines("max score", max_scores))
-    lines.extend(percentile_lines("score sum", score_sums))
-    lines.extend(percentile_lines("score entropy", entropy_values))
-    return lines
-
-
-def run_feasibility_evaluation(score_records: list, object_labels: dict, task_cfg, sample_dir: str) -> list:
-    """Evaluate object-level human type feasibility scores.
-
-    Args:
-        score_records: Score records loaded from saved samples.
-        object_labels: Object-level feasibility labels.
-        task_cfg: Evaluation task config.
-        sample_dir: Sample output directory.
-
-    Returns:
-        Markdown summary lines.
-    """
-    if not score_records:
-        return ["- No feasibility score samples were available."]
-
-    threshold = float(getattr(task_cfg, "score_threshold", 0.5))
-    top_k_values = [int(v) for v in getattr(task_cfg, "coverage_top_k", [1, 2, 3, 5])]
-    object_scores = aggregate_scores_by_object(score_records)
-    common_ids = sorted(set(object_scores) & set(object_labels))
-    rows = []
-    per_type_values = {type_id: {"y": [], "score": []} for type_id in TARGET_GRASP_TYPE_IDS}
-    coverage_hits = {top_k: [] for top_k in top_k_values}
-
-    for object_id in common_ids:
-        scores = object_scores[object_id]["scores"]
-        label = object_labels[object_id]
-        feasible = label["feasible"]
-        tested = label["tested"]
-        positives = set(np.nonzero(feasible > 0.5)[0] + 1)
-        ranked_types = [type_id for type_id in np.argsort(-scores) + 1]
-
-        for type_idx, type_id in enumerate(TARGET_GRASP_TYPE_IDS):
-            if tested[type_idx] <= 0.5:
-                continue
-            per_type_values[type_id]["y"].append(int(feasible[type_idx] > 0.5))
-            per_type_values[type_id]["score"].append(float(scores[type_idx]))
-
-        for top_k in top_k_values:
-            selected = set(ranked_types[: min(top_k, len(ranked_types))])
-            if positives:
-                coverage_hits[top_k].append(len(positives & selected) / len(positives))
-
-        row = {
-            "canonical_object_id": object_id,
-            "sample_count": int(object_scores[object_id]["sample_count"]),
-            "label_mode": label["label_mode"],
-            "positive_types": " ".join(str(type_id) for type_id in sorted(positives)),
-            "top_types": " ".join(str(type_id) for type_id in ranked_types),
-        }
-        for type_id, score, is_feasible, is_tested in zip(TARGET_GRASP_TYPE_IDS, scores, feasible, tested):
-            row[f"type_{type_id}_score"] = float(score)
-            row[f"type_{type_id}_label"] = int(is_feasible > 0.5)
-            row[f"type_{type_id}_tested"] = int(is_tested > 0.5)
-            row[f"type_{type_id}_pred"] = int(score >= threshold)
-        rows.append(row)
-
-    write_generic_csv(rows, os.path.join(sample_dir, "evaluation_feasibility_by_object.csv"))
     lines = [
-        f"- Score sample files: {len(score_records)}",
-        f"- Objects with scores: {len(object_scores)}",
-        f"- Objects with human labels: {len(object_labels)}",
-        f"- Common evaluated objects: {len(common_ids)}",
-        f"- Score threshold: {threshold:.3f}",
+        "- 本节实现 `Evaluation Metrics 1 / 1A`。label 由本 evaluator 从 human train/test grasp records 重新计算；没有读取或复用 `scene_budget.py` 的 `hierarchy_count` 输出。",
+        "- `q_t=count_t/sum_t count_t` 是 pose-class 内 human observed grasp type 分布，只用于 evaluation；`p_t` 是 Human Prior score 归一化后的五类分布。",
+        f"- Pose-class label rows: {len(label_rows)}；有 score 可评估的 rows: {len(metric_rows)}。",
+        f"- 明细 CSV: `{os.path.join(output_dir, 'evaluation_human_pose_class_labels.csv')}`",
+        f"- per-scene metric CSV: `{os.path.join(output_dir, 'evaluation_human_pose_class_metrics.csv')}`",
+        f"- aggregate CSV: `{os.path.join(output_dir, 'evaluation_human_metric_summary.csv')}`",
+        "",
+        "### 指标解释",
+        "- `Soft-label CE / NLL`：`-sum_t q_t log(p_t)`，衡量模型给 human observed 分布的 likelihood；越低越好。",
+        "- `KL(q||p)`：`CE-H(q)`，去掉 label 自身 entropy 后的分布偏差；越低越好。",
+        "- `Distribution L1 / TVD`：`sum_t |p_t-q_t|` 和其一半，直观表示概率质量错配量；越低越好。",
+        "- `JS divergence`：对称、有界的分布距离，对 `p_t` 很小的情况比 KL 更稳定；越低越好。",
+        "- `Positive probability mass`：`sum_{t in P(scene)} p_t`，衡量模型把多少概率放到 human observed positive types 上；越高越好。",
+        "- `Per-type signed bias / under / over`：分别统计 `p_t-q_t`、`max(q_t-p_t,0)`、`max(p_t-q_t,0)`，用于发现某一类是否系统性低估或高估。",
+        "- `Rank agreement`：Spearman、Kendall、top-1 match、top-2 overlap，衡量五类排序是否接近 `q_t`，对 top-heavy allocator 更敏感。",
+        "",
+        "### Train/Test 主汇总",
+        "| split | avg | N | CE | KL | L1 | TVD | JS | PosMass | Spearman | Kendall | Top1 | Top2 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    if not common_ids:
-        lines.append("- No common object ids between score samples and human labels.")
-        return lines
-
-    for top_k in top_k_values:
-        values = coverage_hits[top_k]
-        if values:
-            lines.append(f"- Positive type coverage@{top_k}: {np.mean(values):.4f}")
-
-    metric_rows = []
-    for type_id in TARGET_GRASP_TYPE_IDS:
-        y_true = np.asarray(per_type_values[type_id]["y"], dtype=np.int32)
-        y_score = np.asarray(per_type_values[type_id]["score"], dtype=np.float64)
-        if y_true.size == 0:
-            continue
-        y_pred = (y_score >= threshold).astype(np.int32)
-        tp = int(((y_pred == 1) & (y_true == 1)).sum())
-        fp = int(((y_pred == 1) & (y_true == 0)).sum())
-        fn = int(((y_pred == 0) & (y_true == 1)).sum())
-        precision = tp / (tp + fp) if (tp + fp) > 0 else None
-        recall = tp / (tp + fn) if (tp + fn) > 0 else None
-        f1 = (
-            2.0 * precision * recall / (precision + recall)
-            if precision is not None and recall is not None and (precision + recall) > 0
-            else None
-        )
-        ap = average_precision(y_true, y_score)
-        metric_rows.append(
-            {
-                "type_id": type_id,
-                "tested": int(y_true.size),
-                "positives": int(y_true.sum()),
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-                "average_precision": ap,
-                "mean_score": float(y_score.mean()),
-            }
-        )
-
-    write_generic_csv(metric_rows, os.path.join(sample_dir, "evaluation_feasibility_metrics.csv"))
-    for row in metric_rows:
-        precision = "NA" if row["precision"] is None else f"{row['precision']:.4f}"
-        recall = "NA" if row["recall"] is None else f"{row['recall']:.4f}"
-        f1 = "NA" if row["f1"] is None else f"{row['f1']:.4f}"
-        ap = "NA" if row["average_precision"] is None else f"{row['average_precision']:.4f}"
+    wanted = [row for row in summary_rows if row["group_name"] in {"scene_micro", "object_macro"} and row["group_value"] in {"train", "test"}]
+    for row in wanted:
         lines.append(
-            f"- Type {row['type_id']}: tested={row['tested']}, positives={row['positives']}, "
-            f"precision={precision}, recall={recall}, f1={f1}, AP={ap}, "
-            f"mean_score={row['mean_score']:.4f}"
+            f"| {row['group_value']} | {row['group_name']} | {row['pose_class_num']} | "
+            f"{format_float(row.get('soft_label_ce'))} | {format_float(row.get('kl_q_p'))} | "
+            f"{format_float(row.get('distribution_l1'))} | {format_float(row.get('tvd'))} | "
+            f"{format_float(row.get('js_divergence'))} | {format_float(row.get('positive_probability_mass'))} | "
+            f"{format_float(row.get('spearman'))} | {format_float(row.get('kendall'))} | "
+            f"{format_float(row.get('top1_match'))} | {format_float(row.get('top2_overlap'))} |"
         )
-    lines.append(
-        "- Note: AP/precision need tested negatives. In open-world positive-only labels, "
-        "negative-dependent metrics may be unavailable or weakly informative."
-    )
-    return lines
-
-
-def collect_labeled_scene_pairs(scene_scores: dict, scene_labels: dict) -> tuple:
-    """Collect positive and strong-negative scene/type pairs.
-
-    Args:
-        scene_scores: Aggregated scores keyed by scene key.
-        scene_labels: Human scene labels keyed by scene key.
-
-    Returns:
-        Tuple ``(y_true, y_score, rows)`` for labeled positive/strong-negative
-        pairs only. Unknown same-object types are intentionally excluded.
-    """
-    y_true = []
-    y_score = []
-    rows = []
-    for key in sorted(set(scene_scores) & set(scene_labels)):
-        scores = scene_scores[key]["scores"]
-        label = scene_labels[key]
-        for idx, type_id in enumerate(TARGET_GRASP_TYPE_IDS):
-            if label["mask"][idx] <= 0.5:
-                continue
-            pair_label = int(label["y"][idx] > 0.5)
-            score = float(scores[idx])
-            y_true.append(pair_label)
-            y_score.append(score)
-            rows.append(
-                {
-                    "scene_key": key,
-                    "canonical_object_id": label["canonical_object_id"],
-                    "type_id": type_id,
-                    "label": pair_label,
-                    "score": score,
-                    "label_kind": "positive" if pair_label else "strong_negative",
-                }
-            )
-    return np.asarray(y_true, dtype=np.int32), np.asarray(y_score, dtype=np.float64), rows
-
-
-def run_human_scene_feasibility(score_records: list, scene_labels: dict, task_cfg, sample_dir: str) -> list:
-    """Evaluate score ranking and PR-AUC against human scene labels.
-
-    Args:
-        score_records: Score records loaded from saved samples.
-        scene_labels: Human scene-level labels.
-        task_cfg: Evaluation task config.
-        sample_dir: Sample output directory.
-
-    Returns:
-        Markdown summary lines.
-    """
-    if not score_records:
-        return ["- No score samples were available."]
-    scene_scores = aggregate_scores_by_scene(score_records)
-    common_keys = sorted(set(scene_scores) & set(scene_labels))
-    top_k_values = [int(v) for v in getattr(task_cfg, "coverage_top_k", [1, 2, 3, 5])]
-    scene_rows = []
-    mrr_values = []
-    observed_ranks = []
-    hit_values = {top_k: [] for top_k in top_k_values}
-
-    for key in common_keys:
-        scores = scene_scores[key]["scores"]
-        label = scene_labels[key]
-        positive_types = list(label["positive_types"])
-        ranked_types = [type_id for type_id in np.argsort(-scores) + 1]
-        positive_ranks = [ranked_types.index(type_id) + 1 for type_id in positive_types if type_id in ranked_types]
-        best_rank = min(positive_ranks) if positive_ranks else None
-        if best_rank is not None:
-            observed_ranks.append(best_rank)
-            mrr_values.append(1.0 / best_rank)
-        for top_k in top_k_values:
-            selected = set(ranked_types[: min(top_k, len(ranked_types))])
-            hit_values[top_k].append(float(bool(set(positive_types) & selected)))
-        row = {
-            "scene_key": key,
-            "canonical_object_id": label["canonical_object_id"],
-            "positive_types": " ".join(str(type_id) for type_id in positive_types),
-            "strong_negative_types": " ".join(str(type_id) for type_id in label["strong_negative_types"]),
-            "unknown_types": " ".join(str(type_id) for type_id in label["unknown_types"]),
-            "top_types": " ".join(str(type_id) for type_id in ranked_types),
-            "best_positive_rank": best_rank if best_rank is not None else "",
-            "sample_count": scene_scores[key]["sample_count"],
-        }
-        for type_id, score in zip(TARGET_GRASP_TYPE_IDS, scores):
-            row[f"type_{type_id}_score"] = float(score)
-        scene_rows.append(row)
-
-    write_generic_csv(scene_rows, os.path.join(sample_dir, "evaluation_human_scene_feasibility.csv"))
-    y_true, y_score, pair_rows = collect_labeled_scene_pairs(scene_scores, scene_labels)
-    write_generic_csv(pair_rows, os.path.join(sample_dir, "evaluation_human_scene_labeled_pairs.csv"))
-    pr_auc = average_precision(y_true, y_score) if y_true.size else None
-    positive_count = int(y_true.sum()) if y_true.size else 0
-    negative_count = int(y_true.size - positive_count) if y_true.size else 0
-
-    lines = [
-        f"- Scenes with scores: {len(scene_scores)}",
-        f"- Scenes with human labels: {len(scene_labels)}",
-        f"- Common evaluated scenes: {len(common_keys)}",
-        f"- Labeled scene/type pairs: {int(y_true.size)}",
-        f"- Positive pairs: {positive_count}",
-        f"- Strong-negative pairs: {negative_count}",
-        f"- PR-AUC / Average Precision: {format_optional_float(pr_auc)}",
-    ]
-    if observed_ranks:
-        lines.append(f"- Mean observed positive rank: {np.mean(observed_ranks):.4f}")
-        lines.append(f"- MRR: {np.mean(mrr_values):.4f}")
-    for top_k in top_k_values:
-        values = hit_values[top_k]
-        if values:
-            lines.append(f"- Observed type hit@{top_k}: {np.mean(values):.4f}")
-    lines.append("- Unknown same-object types are excluded from PR-AUC and threshold precision.")
-    return lines
-
-
-def run_feasibility_threshold_sweep(
-    score_records: list,
-    scene_labels: dict,
-    task_cfg,
-    sample_dir: str,
-) -> list:
-    """Sweep thresholds that convert scores into BODex feasibility sets.
-
-    Args:
-        score_records: Score records loaded from saved samples.
-        scene_labels: Optional human scene labels.
-        task_cfg: Evaluation task config.
-        sample_dir: Sample output directory.
-
-    Returns:
-        Markdown summary lines.
-    """
-    if not score_records:
-        return ["- No score samples were available."]
-    thresholds = parse_thresholds(task_cfg)
-    rows = []
-    best_f1_row = None
-    best_pr_row = None
-    for threshold in thresholds:
-        budgets = []
-        per_type_selected = {type_id: 0 for type_id in TARGET_GRASP_TYPE_IDS}
-        y_true = []
-        y_pred = []
-        y_score = []
-        observed_recall_values = []
-        for record in score_records:
-            scores = np.asarray(record["scores"], dtype=np.float64)
-            selected = selected_types_for_threshold(scores, threshold)
-            budgets.append(len(selected))
-            for type_id in selected:
-                per_type_selected[type_id] += 1
-
-            label = scene_labels.get(record["scene_key"]) if scene_labels else None
-            if label is None:
-                continue
-            positive_types = set(label["positive_types"])
-            if positive_types:
-                observed_recall_values.append(len(positive_types & set(selected)) / len(positive_types))
-            for idx, type_id in enumerate(TARGET_GRASP_TYPE_IDS):
-                if label["mask"][idx] <= 0.5:
-                    continue
-                y_true.append(int(label["y"][idx] > 0.5))
-                y_pred.append(int(type_id in selected))
-                y_score.append(float(scores[idx]))
-
-        row = {
-            "threshold": float(threshold),
-            "score_records": len(score_records),
-            "mean_budget_size": float(np.mean(budgets)),
-            "p50_budget_size": float(np.percentile(budgets, 50)),
-            "zero_budget_rate": float(np.mean(np.asarray(budgets) == 0)),
-            "full_budget_rate": float(np.mean(np.asarray(budgets) == len(TARGET_GRASP_TYPE_IDS))),
-        }
-        for type_id in TARGET_GRASP_TYPE_IDS:
-            row[f"type_{type_id}_selection_rate"] = per_type_selected[type_id] / len(score_records)
-
-        if y_true:
-            metrics = binary_metrics(np.asarray(y_true), np.asarray(y_pred))
-            pr_auc = average_precision(np.asarray(y_true), np.asarray(y_score))
-            row.update(metrics)
-            row["pr_auc"] = pr_auc
-            row["observed_type_recall"] = float(np.mean(observed_recall_values)) if observed_recall_values else None
-            if row.get("f1") is not None and (best_f1_row is None or row["f1"] > best_f1_row["f1"]):
-                best_f1_row = row
-            if pr_auc is not None:
-                best_pr_row = row
-        rows.append(row)
-
-    write_generic_csv(rows, os.path.join(sample_dir, "evaluation_feasibility_threshold_sweep.csv"))
-    default_threshold = float(getattr(task_cfg, "score_threshold", 0.5))
-    default_row = min(rows, key=lambda row: abs(row["threshold"] - default_threshold))
-    lines = [
-        f"- Thresholds: {', '.join(f'{threshold:.2f}' for threshold in thresholds)}",
-        f"- Score records: {len(score_records)}",
-        (
-            f"- Default threshold {default_row['threshold']:.2f}: "
-            f"mean_budget={default_row['mean_budget_size']:.3f}, "
-            f"zero_budget={default_row['zero_budget_rate']:.3f}, "
-            f"full_budget={default_row['full_budget_rate']:.3f}"
-        ),
-    ]
-    if "precision" in default_row:
-        lines.append(
-            f"- Default threshold human metrics: precision={format_optional_float(default_row['precision'])}, "
-            f"recall={format_optional_float(default_row['recall'])}, "
-            f"F1={format_optional_float(default_row['f1'])}, "
-            f"FPR={format_optional_float(default_row['fpr'])}, "
-            f"PR-AUC={format_optional_float(default_row['pr_auc'])}"
-        )
-    if best_f1_row is not None:
-        lines.append(
-            f"- Best F1 threshold: {best_f1_row['threshold']:.2f} "
-            f"(F1={format_optional_float(best_f1_row['f1'])}, "
-            f"precision={format_optional_float(best_f1_row['precision'])}, "
-            f"recall={format_optional_float(best_f1_row['recall'])})"
-        )
-    if best_pr_row is not None:
-        lines.append(f"- PR-AUC is threshold-free over labeled pairs: {format_optional_float(best_pr_row['pr_auc'])}")
-    lines.append("- CSV includes budget size, per-type selection rate, and thresholded human metrics.")
-    return lines
-
-
-def run_budget_to_bodex_proxy(
-    score_records: list,
-    scene_labels: dict,
-    task_cfg,
-    sample_dir: str,
-) -> list:
-    """Summarize top-K and threshold budgets as downstream BODex proxies.
-
-    Args:
-        score_records: Score records loaded from saved samples.
-        scene_labels: Optional human scene labels.
-        task_cfg: Evaluation task config.
-        sample_dir: Sample output directory.
-
-    Returns:
-        Markdown summary lines.
-    """
-    if not score_records:
-        return ["- No score samples were available."]
-    top_k_values = [int(v) for v in getattr(task_cfg, "coverage_top_k", [1, 2, 3, 5])]
-    thresholds = parse_thresholds(task_cfg)
-    rows = []
-    for top_k in top_k_values:
-        coverages = []
-        for record in score_records:
-            label = scene_labels.get(record["scene_key"]) if scene_labels else None
-            if label is None or not label["positive_types"]:
-                continue
-            ranked_types = [type_id for type_id in np.argsort(-record["scores"]) + 1]
-            selected = set(ranked_types[: min(top_k, len(ranked_types))])
-            positives = set(label["positive_types"])
-            coverages.append(len(positives & selected) / len(positives))
-        rows.append(
-            {
-                "mode": "top_k",
-                "budget": top_k,
-                "mean_budget_size": top_k,
-                "human_positive_coverage": float(np.mean(coverages)) if coverages else None,
-            }
-        )
-    for threshold in thresholds:
-        budgets = []
-        coverages = []
-        for record in score_records:
-            selected = set(selected_types_for_threshold(record["scores"], threshold))
-            budgets.append(len(selected))
-            label = scene_labels.get(record["scene_key"]) if scene_labels else None
-            if label is None or not label["positive_types"]:
-                continue
-            positives = set(label["positive_types"])
-            coverages.append(len(positives & selected) / len(positives))
-        rows.append(
-            {
-                "mode": "threshold",
-                "budget": float(threshold),
-                "mean_budget_size": float(np.mean(budgets)),
-                "human_positive_coverage": float(np.mean(coverages)) if coverages else None,
-            }
-        )
-    write_generic_csv(rows, os.path.join(sample_dir, "evaluation_budget_to_bodex_proxy.csv"))
-
-    lines = ["- This proxy reports candidate type budget before running BODex."]
-    for row in rows:
-        if row["mode"] == "top_k":
+    lines.extend(["", "### Per-type Signed Bias（scene-micro）", "| split | type | mean(p-q) | mean under | mean over |", "|---|---:|---:|---:|---:|"])
+    for row in [item for item in summary_rows if item["group_name"] == "scene_micro" and item["group_value"] in {"train", "test"}]:
+        for type_id in REAL_TYPE_IDS:
             lines.append(
-                f"- Top-{int(row['budget'])}: mean_budget={row['mean_budget_size']:.3f}, "
-                f"human_positive_coverage={format_optional_float(row['human_positive_coverage'])}"
+                f"| {row['group_value']} | {type_id} | "
+                f"{format_float(row.get(f'type_{type_id}_signed_bias'))} | "
+                f"{format_float(row.get(f'type_{type_id}_mean_under'))} | "
+                f"{format_float(row.get(f'type_{type_id}_mean_over'))} |"
             )
-        elif float(row["budget"]) == float(getattr(task_cfg, "score_threshold", 0.5)):
-            lines.append(
-                f"- Threshold {row['budget']:.2f}: mean_budget={row['mean_budget_size']:.3f}, "
-                f"human_positive_coverage={format_optional_float(row['human_positive_coverage'])}"
-            )
+    lines.extend(["", "### 分组说明", "- aggregate CSV 额外包含 `|P(scene)|` 分组，以及 `xy_long`、`xy_short`、`z_height` 三个 canonical point-cloud scale descriptor 的分位数 bucket 分组。"])
     return lines
 
 
-def summarize_nearest_rows_markdown(rows: list, task_cfg) -> list:
-    """Summarize nearest-neighbor rows for markdown.
+def run_human_1a(config, human_score_rows: list[dict], output_dir: str) -> tuple[list[str], list[dict], list[dict]]:
+    """Run 1A human train/test labeled metrics.
 
     Args:
-        rows: Nearest-neighbor rows.
-        task_cfg: Evaluation task config.
+        config: Full Hydra config.
+        human_score_rows: Human score rows from saved test results or JSONL.
+        output_dir: Directory for CSV outputs.
 
     Returns:
-        Markdown summary lines.
+        Tuple of markdown lines, scored human metric rows, and label rows.
     """
-    if not rows:
-        return ["- No comparable pose samples were available."]
-    near_copy_trans_m = float(getattr(task_cfg, "near_copy_trans_m", 0.01))
-    near_copy_rot_deg = float(getattr(task_cfg, "near_copy_rot_deg", 5.0))
-    near_copy_rows = [
-        row for row in rows if row["trans_m"] <= near_copy_trans_m and row["rot_deg"] <= near_copy_rot_deg
-    ]
-    type_matches = [
-        row for row in rows if int(row["sample_grasp_type_id"]) == int(row["nearest_train_grasp_type_id"])
-    ]
-    lines = [
-        f"- Comparable pose samples: {len(rows)}",
-        (
-            f"- Near-copy rows: {len(near_copy_rows)} "
-            f"({len(near_copy_rows) / len(rows) * 100.0:.2f}%)"
-        ),
-        f"- Nearest type match: {len(type_matches) / len(rows) * 100.0:.2f}%",
-    ]
-    lines.extend(percentile_lines("NN translation distance", [row["trans_m"] for row in rows], "m"))
-    lines.extend(percentile_lines("NN rotation distance", [row["rot_deg"] for row in rows], "deg"))
-    return lines
+    label_rows, label_summary = build_pose_class_labels(config, human_score_rows)
+    metric_rows = [row for row in (metric_row_for_pose_class(label_row) for label_row in label_rows) if row is not None]
+    add_scale_buckets(metric_rows, int(getattr(config.task, "scale_bucket_count", 4)))
+    summary_rows = build_human_metric_summaries(metric_rows)
+    summary_rows.extend(train_test_gap_rows(summary_rows))
+    _write_csv(label_rows, os.path.join(output_dir, "evaluation_human_pose_class_labels.csv"))
+    _write_csv(metric_rows, os.path.join(output_dir, "evaluation_human_pose_class_metrics.csv"))
+    _write_csv(summary_rows, os.path.join(output_dir, "evaluation_human_metric_summary.csv"))
+    _write_json(label_summary, os.path.join(output_dir, "evaluation_human_label_summary.json"))
+    return human_report_lines(label_rows, metric_rows, summary_rows, output_dir), metric_rows, label_rows
 
 
-def run_pose_diversity_analysis(sample_records: list, task_cfg, sample_dir: str) -> list:
-    """Measure within-scene/type generated pose diversity.
+def score_rows_with_scale(score_rows: list[dict], task_cfg, output_dir: str, prefix: str) -> list[dict]:
+    """Attach canonical point-cloud scale descriptors to score rows.
 
     Args:
-        sample_records: Comparable sampled pose records.
+        score_rows: Score records.
         task_cfg: Evaluation task config.
-        sample_dir: Sample output directory.
+        output_dir: Output directory.
+        prefix: File prefix for skipped rows.
 
     Returns:
-        Markdown summary lines.
+        Rows with score and scale fields.
     """
-    max_poses = int(getattr(task_cfg, "diversity_max_poses_per_group", 50))
-    groups = {}
-    for record in sample_records:
-        key = (record["scene_key"], int(record["grasp_type_id"]))
-        groups.setdefault(key, []).append(record)
-
+    max_points = int(getattr(task_cfg, "scale_max_points", 8192))
+    cache = {}
     rows = []
-    all_trans = []
-    all_rot = []
-    for (scene_key_value, type_id), records in sorted(groups.items()):
-        if len(records) < 2:
-            continue
-        records = records[:max_poses]
-        trans_values = []
-        rot_values = []
-        for idx_a in range(len(records)):
-            for idx_b in range(idx_a + 1, len(records)):
-                distance = pose_distance(records[idx_a], records[idx_b], trans_ref_m=1.0, rot_ref_deg=1.0)
-                trans_values.append(distance["trans_m"])
-                rot_values.append(distance["rot_deg"])
-        if not trans_values:
-            continue
-        all_trans.extend(trans_values)
-        all_rot.extend(rot_values)
-        rows.append(
-            {
-                "scene_key": scene_key_value,
-                "canonical_object_id": records[0]["canonical_object_id"],
-                "grasp_type_id": type_id,
-                "sample_count": len(records),
-                "pair_count": len(trans_values),
-                "mean_pair_trans_m": float(np.mean(trans_values)),
-                "p50_pair_trans_m": float(np.percentile(trans_values, 50)),
-                "mean_pair_rot_deg": float(np.mean(rot_values)),
-                "p50_pair_rot_deg": float(np.percentile(rot_values, 50)),
-            }
-        )
-
-    write_generic_csv(rows, os.path.join(sample_dir, "evaluation_pose_diversity.csv"))
-    lines = [f"- Scene/type groups with at least two samples: {len(rows)}"]
-    lines.extend(percentile_lines("Pairwise translation diversity", all_trans, "m"))
-    lines.extend(percentile_lines("Pairwise rotation diversity", all_rot, "deg"))
-    return lines
-
-
-def normalize_object_scale(obj_scale) -> np.ndarray:
-    """Normalize scalar or vector object scale to XYZ scale.
-
-    Args:
-        obj_scale: Raw object scale from scene config.
-
-    Returns:
-        Three-dimensional scale vector.
-    """
-    scale = np.asarray(obj_scale, dtype=np.float32).reshape(-1)
-    if scale.size == 1:
-        return np.repeat(scale, 3)
-    if scale.size == 3:
-        return scale
-    raise ValueError(f"Unsupported object scale shape: {scale.shape}")
-
-
-def object_pose_to_rt(obj_pose) -> tuple:
-    """Convert object pose metadata to rotation and translation.
-
-    Args:
-        obj_pose: ``4x4`` matrix or ``[x, y, z, qw, qx, qy, qz]`` vector.
-
-    Returns:
-        Tuple ``(rotation, translation)``.
-    """
-    pose = np.asarray(obj_pose, dtype=np.float32)
-    if pose.shape == (4, 4):
-        return pose[:3, :3], pose[:3, 3]
-    pose = pose.reshape(-1)
-    if pose.size == 7:
-        rot = SciR.from_quat([pose[4], pose[5], pose[6], pose[3]]).as_matrix().astype(np.float32)
-        return rot, pose[:3]
-    raise ValueError(f"Unsupported object pose shape: {pose.shape}")
-
-
-def extract_object_meta(scene_cfg: dict) -> tuple:
-    """Extract object name, scale, and pose from supported scene config layouts.
-
-    Args:
-        scene_cfg: Loaded scene config dictionary.
-
-    Returns:
-        Tuple ``(object_name, scale_xyz, rotation, translation)``.
-    """
-    if "object" in scene_cfg:
-        obj_data = scene_cfg["object"]
-        obj_name = obj_data.get("name")
-        obj_scale = obj_data.get("rel_scale", obj_data.get("scale"))
-        obj_pose = obj_data.get("pose")
-    else:
-        scene = scene_cfg.get("scene", {})
-        obj_name = scene_cfg.get("task", {}).get("obj_name")
-        if obj_name is None:
-            candidates = [
-                name
-                for name, entry in scene.items()
-                if isinstance(entry, dict) and "scale" in entry and "pose" in entry and name != "table"
-            ]
-            obj_name = candidates[0] if candidates else None
-        obj_data = scene.get(obj_name, {}) if obj_name is not None else {}
-        obj_scale = obj_data.get("scale")
-        obj_pose = obj_data.get("pose")
-
-    if obj_name is None or obj_scale is None or obj_pose is None:
-        raise KeyError("Scene config does not contain complete object metadata.")
-    obj_rot, obj_trans = object_pose_to_rt(obj_pose)
-    return obj_name, normalize_object_scale(obj_scale), obj_rot, obj_trans
-
-
-def object_bbox_for_sample(sample_data: dict, bbox_cache: dict):
-    """Compute or retrieve a world-frame object bounding box for one sample.
-
-    Args:
-        sample_data: Saved sample dictionary.
-        bbox_cache: Cache keyed by point-cloud and scene paths.
-
-    Returns:
-        Tuple ``(bbox_min, bbox_max, used_scene_transform)`` or ``None``.
-    """
-    pc_path = resolve_existing_path(str(sample_data.get("pc_path", "")))
-    if not pc_path or not os.path.exists(pc_path):
-        return None
-    scene_path = resolve_existing_path(str(sample_data.get("scene_path", "")))
-    cache_key = (pc_path, scene_path)
-    if cache_key in bbox_cache:
-        return bbox_cache[cache_key]
-
-    points = np.asarray(np.load(pc_path, allow_pickle=True), dtype=np.float32).reshape(-1, 3)
-    used_scene_transform = False
-    if scene_path and os.path.exists(scene_path):
+    skipped = []
+    for idx, row in enumerate(score_rows):
         try:
-            scene_cfg = np.load(scene_path, allow_pickle=True).item()
-            _, obj_scale_xyz, obj_rot, obj_trans = extract_object_meta(scene_cfg)
-            points = np.matmul(points * obj_scale_xyz[None, :], obj_rot.T) + obj_trans[None, :]
-            used_scene_transform = True
+            descriptor = load_point_cloud_descriptor(row["pc_path"], max_points=max_points, cache=cache)
         except Exception as exc:
-            print(f"[evaluate] Could not transform point cloud with scene config {scene_path}: {exc}")
-
-    bbox = (points.min(axis=0), points.max(axis=0), used_scene_transform)
-    bbox_cache[cache_key] = bbox
-    return bbox
-
-
-def point_to_bbox_distance(point: np.ndarray, bbox_min: np.ndarray, bbox_max: np.ndarray) -> float:
-    """Compute Euclidean distance from a point to an axis-aligned bounding box.
-
-    Args:
-        point: Three-dimensional point.
-        bbox_min: Box minimum corner.
-        bbox_max: Box maximum corner.
-
-    Returns:
-        Distance in meters, zero when the point is inside the box.
-    """
-    point = np.asarray(point, dtype=np.float32)
-    outside = np.maximum(bbox_min - point, 0.0) + np.maximum(point - bbox_max, 0.0)
-    return float(np.linalg.norm(outside))
-
-
-def object_bbox_dims_for_sample_file(sample_file: str, bbox_cache: dict):
-    """Read object bbox dimensions for a saved sample file.
-
-    Args:
-        sample_file: Saved sample file path.
-        bbox_cache: Shared bbox cache.
-
-    Returns:
-        Three-dimensional bbox size vector, or ``None`` when unavailable.
-    """
-    sample_data = np.load(sample_file, allow_pickle=True).item()
-    bbox = object_bbox_for_sample(sample_data, bbox_cache)
-    if bbox is None:
-        return None
-    bbox_min, bbox_max, _ = bbox
-    return np.asarray(bbox_max - bbox_min, dtype=np.float64)
+            skipped.append({"scene_id": row.get("scene_id", ""), "pc_path": row.get("pc_path", ""), "error": str(exc)})
+            continue
+        out = {
+            "scene_id": row["scene_id"],
+            "scene_key": row["scene_key"],
+            "split": row.get("split", ""),
+            "canonical_object_id": row["object_id"],
+            "xy_long": float(descriptor[0]),
+            "xy_short": float(descriptor[1]),
+            "z_height": float(descriptor[2]),
+            "aspect_xy": float(descriptor[0] / max(descriptor[1], EPS)),
+        }
+        for type_id, score in zip(REAL_TYPE_IDS, row["scores"]):
+            out[f"type_{type_id}_score"] = float(score)
+        out["top1_type"] = int(np.argmax(row["scores"]) + 1)
+        rows.append(out)
+        if idx > 0 and idx % 50000 == 0:
+            print(f"[evaluate] computed scale descriptors for {idx} score rows")
+    if skipped:
+        _write_csv(skipped, os.path.join(output_dir, f"{prefix}_skipped_scale_rows.csv"))
+    return rows
 
 
-def size_bucket_from_dims(dims: np.ndarray, task_cfg) -> str:
-    """Assign an object-size sanity bucket.
+def percentile_summary(values: np.ndarray) -> dict:
+    """Compute compact descriptive statistics.
 
     Args:
-        dims: Bbox dimensions in meters.
-        task_cfg: Evaluation task config.
+        values: One-dimensional numeric values.
 
     Returns:
-        ``tiny``, ``small``, ``large``, or ``other``.
+        Summary dictionary.
     """
-    large_dim_min = float(getattr(task_cfg, "large_dim_min_m", 0.15))
-    small_dim_max = float(getattr(task_cfg, "small_dim_max_m", 0.05))
-    tiny_dim_max = float(getattr(task_cfg, "tiny_dim_max_m", 0.03))
-    if bool(np.all(dims < tiny_dim_max)):
-        return "tiny"
-    if bool(np.all(dims < small_dim_max)):
-        return "small"
-    if bool(np.all(dims > large_dim_min)):
-        return "large"
-    return "other"
+    values = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(values.mean()),
+        "std": float(values.std()),
+        "p05": float(np.percentile(values, 5)),
+        "p50": float(np.percentile(values, 50)),
+        "p95": float(np.percentile(values, 95)),
+        "ci95_half_width": float(1.96 * values.std(ddof=1) / math.sqrt(values.size)) if values.size > 1 else 0.0,
+    }
 
 
-def size_rule_violating_types(selected_types: list, dims: np.ndarray, task_cfg) -> list:
-    """Return predicted types that violate coarse object-size rules.
+def summarize_score_distribution(rows: list[dict], group_name: str, group_value: str) -> dict:
+    """Summarize score distribution for one DGN scale group.
 
     Args:
-        selected_types: Thresholded feasible type ids.
-        dims: Object bbox dimensions in meters.
-        task_cfg: Evaluation task config.
+        rows: DGN rows with score fields.
+        group_name: Group key name.
+        group_value: Group key value.
 
     Returns:
-        Sorted violating type ids.
+        Summary row.
     """
-    selected = set(int(type_id) for type_id in selected_types)
-    bucket = size_bucket_from_dims(dims, task_cfg)
-    if bucket == "large":
-        return sorted(selected & {1, 2, 3})
-    if bucket == "small":
-        return sorted(selected & {4, 5})
-    if bucket == "tiny":
-        return sorted(selected & {3, 4, 5})
-    return []
+    summary = {
+        "group_name": group_name,
+        "group_value": group_value,
+        "scene_num": int(len(rows)),
+        "object_num": int(len({row["canonical_object_id"] for row in rows})),
+    }
+    for type_id in REAL_TYPE_IDS:
+        stats = percentile_summary(np.asarray([row[f"type_{type_id}_score"] for row in rows], dtype=np.float64))
+        for key, value in stats.items():
+            summary[f"type_{type_id}_{key}"] = value
+    return summary
 
 
-def interval_holes_for_selected_types(selected_types: list) -> list:
-    """Find ordinal interval holes in a thresholded type set.
+def dgn_distribution_summaries(rows: list[dict], bucket_count: int, min_bucket_count: int) -> list[dict]:
+    """Build DGN score-vs-scale distribution summaries.
 
     Args:
-        selected_types: Thresholded feasible type ids.
+        rows: DGN score rows with scale descriptors.
+        bucket_count: Number of quantile buckets.
+        min_bucket_count: Minimum rows for joint-bucket summaries.
 
     Returns:
-        Missing middle type ids such as ``2`` for selected ``{1, 3}``.
+        Summary rows.
     """
-    selected = set(int(type_id) for type_id in selected_types)
-    holes = []
-    for left_type in (1, 2, 3):
-        middle_type = left_type + 1
-        right_type = left_type + 2
-        if left_type in selected and right_type in selected and middle_type not in selected:
-            holes.append(middle_type)
-    return holes
+    add_scale_buckets(rows, bucket_count)
+    aspect_edges = quantile_edges([float(row["aspect_xy"]) for row in rows], bucket_count)
+    for row in rows:
+        row["aspect_xy_bucket"] = bucket_label(float(row["aspect_xy"]), aspect_edges)
+        row["joint_scale_bucket"] = "|".join([row[f"{feature}_bucket"] for feature in SCALE_FEATURES])
+        row["xy_aspect_height_bucket"] = f"{row['xy_long_bucket']}|{row['xy_short_bucket']}|{row['z_height_bucket']}|{row['aspect_xy_bucket']}"
+    summaries = [summarize_score_distribution(rows, "all", "all")] if rows else []
+    for feature in SCALE_FEATURES:
+        bucket_key = f"{feature}_bucket"
+        for bucket in sorted({row[bucket_key] for row in rows}):
+            bucket_rows = [row for row in rows if row[bucket_key] == bucket]
+            summaries.append(summarize_score_distribution(bucket_rows, bucket_key, bucket))
+    for bucket_key in ["joint_scale_bucket", "xy_aspect_height_bucket"]:
+        for bucket in sorted({row[bucket_key] for row in rows}):
+            bucket_rows = [row for row in rows if row[bucket_key] == bucket]
+            if len(bucket_rows) >= min_bucket_count:
+                summaries.append(summarize_score_distribution(bucket_rows, bucket_key, bucket))
+    return summaries
 
 
-def continuous_ordinal_violations(scores: np.ndarray, margin: float) -> list:
-    """Find continuous score convexity violations along ordered grasp types.
+def dgn_correlations(rows: list[dict]) -> list[dict]:
+    """Compute score-scale Pearson and Spearman correlations.
 
     Args:
-        scores: Five-dimensional score vector.
-        margin: Minimum violation margin.
+        rows: DGN score rows with scale descriptors.
 
     Returns:
-        Rows describing each violating triplet.
+        Correlation rows.
     """
-    violations = []
-    for left_idx in range(3):
-        middle_idx = left_idx + 1
-        right_idx = left_idx + 2
-        gap = min(float(scores[left_idx]), float(scores[right_idx])) - float(scores[middle_idx])
-        if gap > margin:
-            violations.append(
+    out = []
+    for feature in SCALE_FEATURES:
+        x = np.asarray([row[feature] for row in rows], dtype=np.float64)
+        for type_id in REAL_TYPE_IDS:
+            y = np.asarray([row[f"type_{type_id}_score"] for row in rows], dtype=np.float64)
+            out.append(
                 {
-                    "left_type": left_idx + 1,
-                    "middle_type": middle_idx + 1,
-                    "right_type": right_idx + 1,
-                    "gap": gap,
+                    "scale_feature": feature,
+                    "type_id": type_id,
+                    "pearson": pearson_corr(x, y),
+                    "spearman": spearman_corr(x, y),
+                    "n": int(len(rows)),
                 }
             )
-    return violations
+    return out
 
 
-def run_size_rule_violations(score_records: list, task_cfg, sample_dir: str) -> list:
-    """Evaluate thresholded feasible sets against coarse size rules.
-
-    Args:
-        score_records: Score records loaded from saved samples.
-        task_cfg: Evaluation task config.
-        sample_dir: Sample output directory.
-
-    Returns:
-        Markdown summary lines.
-    """
-    if not score_records:
-        return ["- No score samples were available."]
-    thresholds = parse_thresholds(task_cfg)
-    bbox_cache = {}
-    rows = []
-    skipped = 0
-    for record in score_records:
-        dims = object_bbox_dims_for_sample_file(record["path"], bbox_cache)
-        if dims is None:
-            skipped += 1
-            continue
-        bucket = size_bucket_from_dims(dims, task_cfg)
-        for threshold in thresholds:
-            selected = selected_types_for_threshold(record["scores"], threshold)
-            violating_types = size_rule_violating_types(selected, dims, task_cfg)
-            rows.append(
-                {
-                    "threshold": float(threshold),
-                    "sample_path": record["path"],
-                    "scene_key": record["scene_key"],
-                    "canonical_object_id": record["canonical_object_id"],
-                    "size_bucket": bucket,
-                    "bbox_x_m": float(dims[0]),
-                    "bbox_y_m": float(dims[1]),
-                    "bbox_z_m": float(dims[2]),
-                    "selected_types": " ".join(str(type_id) for type_id in selected),
-                    "violating_types": " ".join(str(type_id) for type_id in violating_types),
-                    "violation_count": len(violating_types),
-                    "has_violation": bool(violating_types),
-                }
-            )
-    write_generic_csv(rows, os.path.join(sample_dir, "evaluation_size_rule_violations.csv"))
-    if not rows:
-        return [f"- No bbox dimensions were available for score records. Skipped: {skipped}"]
-    default_threshold = float(getattr(task_cfg, "score_threshold", 0.5))
-    lines = [
-        f"- Rows: {len(rows)}",
-        f"- Skipped score files without bbox: {skipped}",
-        (
-            f"- Rules: large all dims > {float(getattr(task_cfg, 'large_dim_min_m', 0.15)):.3f}m "
-            "forbid types 1/2/3; "
-            f"small all dims < {float(getattr(task_cfg, 'small_dim_max_m', 0.05)):.3f}m "
-            "forbid types 4/5; "
-            f"tiny all dims < {float(getattr(task_cfg, 'tiny_dim_max_m', 0.03)):.3f}m "
-            "forbid types 3/4/5."
-        ),
-    ]
-    for threshold in thresholds:
-        threshold_rows = [row for row in rows if abs(row["threshold"] - threshold) < 1e-8]
-        if not threshold_rows:
-            continue
-        violation_count = sum(1 for row in threshold_rows if row["has_violation"])
-        if threshold == default_threshold or threshold in (thresholds[0], thresholds[-1]):
-            lines.append(
-                f"- Threshold {threshold:.2f}: violation scenes={violation_count}/{len(threshold_rows)} "
-                f"({violation_count / len(threshold_rows):.4f})"
-            )
-    return lines
-
-
-def run_ordinal_consistency(score_records: list, task_cfg, sample_dir: str) -> list:
-    """Evaluate type-order consistency in thresholded sets and raw scores.
+def dgn_stability_rows(rows: list[dict]) -> list[dict]:
+    """Compute same-object score stability over DGN scenes.
 
     Args:
-        score_records: Score records loaded from saved samples.
-        task_cfg: Evaluation task config.
-        sample_dir: Sample output directory.
+        rows: DGN score rows with scale descriptors.
 
     Returns:
-        Markdown summary lines.
+        Per-object stability rows.
     """
-    if not score_records:
-        return ["- No score samples were available."]
-    thresholds = parse_thresholds(task_cfg)
-    margin = float(getattr(task_cfg, "ordinal_margin", 0.0))
-    rows = []
-    continuous_rows = []
-    for record in score_records:
-        continuous = continuous_ordinal_violations(record["scores"], margin)
-        for violation in continuous:
-            continuous_rows.append(
-                {
-                    "sample_path": record["path"],
-                    "scene_key": record["scene_key"],
-                    "canonical_object_id": record["canonical_object_id"],
-                    **violation,
-                }
-            )
-        for threshold in thresholds:
-            selected = selected_types_for_threshold(record["scores"], threshold)
-            holes = interval_holes_for_selected_types(selected)
-            rows.append(
-                {
-                    "threshold": float(threshold),
-                    "sample_path": record["path"],
-                    "scene_key": record["scene_key"],
-                    "canonical_object_id": record["canonical_object_id"],
-                    "selected_types": " ".join(str(type_id) for type_id in selected),
-                    "interval_holes": " ".join(str(type_id) for type_id in holes),
-                    "hole_count": len(holes),
-                    "has_interval_hole": bool(holes),
-                }
-            )
-    write_generic_csv(rows, os.path.join(sample_dir, "evaluation_ordinal_threshold_holes.csv"))
-    write_generic_csv(continuous_rows, os.path.join(sample_dir, "evaluation_ordinal_score_violations.csv"))
-    default_threshold = float(getattr(task_cfg, "score_threshold", 0.5))
-    default_rows = [row for row in rows if abs(row["threshold"] - default_threshold) < 1e-8]
-    hole_count = sum(1 for row in default_rows if row["has_interval_hole"])
-    lines = [
-        f"- Score records: {len(score_records)}",
-        f"- Continuous score violations: {len(continuous_rows)} with margin > {margin:.4f}",
-    ]
-    if default_rows:
-        lines.append(
-            f"- Threshold {default_threshold:.2f} interval-hole scenes: {hole_count}/{len(default_rows)} "
-            f"({hole_count / len(default_rows):.4f})"
-        )
-    return lines
-
-
-def run_bbox_geometry_sanity(pose_files: list, task_cfg, sample_dir: str) -> list:
-    """Evaluate sampled wrist targets against object point-cloud bounding boxes.
-
-    Args:
-        pose_files: Saved pose sample files.
-        task_cfg: Evaluation task config.
-        sample_dir: Sample output directory.
-
-    Returns:
-        Markdown summary lines.
-    """
-    max_files = int(getattr(task_cfg, "geometry_max_sample_files", 0))
-    if max_files > 0:
-        pose_files = pose_files[:max_files]
-    bbox_cache = {}
-    rows = []
-    skipped = 0
-    for sample_file in pose_files:
-        sample_data = np.load(sample_file, allow_pickle=True).item()
-        if "grasp_pose" not in sample_data:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row["canonical_object_id"], []).append(row)
+    out = []
+    for object_id, group in sorted(grouped.items(), key=lambda item: _natural_sort_key(item[0])):
+        if len(group) < 2:
             continue
-        bbox = object_bbox_for_sample(sample_data, bbox_cache)
-        if bbox is None:
-            skipped += 1
-            continue
-        bbox_min, bbox_max, used_scene_transform = bbox
-        pose = np.asarray(sample_data["grasp_pose"], dtype=np.float32).reshape(-1)
-        if pose.size < 7:
-            skipped += 1
-            continue
-        grasp_type_source = sample_data.get("pred_grasp_type_id", sample_data.get("grasp_type_id", 0))
-        grasp_type_id = int(np.asarray(grasp_type_source).reshape(-1)[0])
-        metadata = resolve_sample_scene_metadata(sample_data)
-        side_distances = {"right": point_to_bbox_distance(pose[0:3], bbox_min, bbox_max)}
-        if grasp_type_id >= 4 and pose.size >= 14:
-            side_distances["left"] = point_to_bbox_distance(pose[7:10], bbox_min, bbox_max)
-        rows.append(
+        scores = np.asarray([[row[f"type_{type_id}_score"] for type_id in REAL_TYPE_IDS] for row in group], dtype=np.float64)
+        top1 = np.asarray([row["top1_type"] for row in group], dtype=np.int64)
+        values, counts = np.unique(top1, return_counts=True)
+        majority_rate = float(counts.max() / counts.sum())
+        descriptor = np.asarray([[row[feature] for feature in SCALE_FEATURES] for row in group], dtype=np.float64).mean(axis=0)
+        out.append(
             {
-                "sample_path": sample_file,
-                "scene_key": metadata["scene_key"],
-                "canonical_object_id": metadata["canonical_object_id"],
-                "grasp_type_id": grasp_type_id,
-                "active_side_count": len(side_distances),
-                "max_bbox_distance_m": max(side_distances.values()),
-                "mean_bbox_distance_m": float(np.mean(list(side_distances.values()))),
-                "right_bbox_distance_m": side_distances.get("right", 0.0),
-                "left_bbox_distance_m": side_distances.get("left", ""),
-                "used_scene_transform": bool(used_scene_transform),
+                "canonical_object_id": object_id,
+                "scene_num": int(len(group)),
+                "xy_long": float(descriptor[0]),
+                "xy_short": float(descriptor[1]),
+                "z_height": float(descriptor[2]),
+                "mean_type_score_std": float(scores.std(axis=0).mean()),
+                "max_type_score_std": float(scores.std(axis=0).max()),
+                "top1_flip_rate": float(1.0 - majority_rate),
+                "top1_types": " ".join(str(value) for value in values.tolist()),
             }
         )
+    return out
 
-    write_generic_csv(rows, os.path.join(sample_dir, "evaluation_bbox_geometry.csv"))
+
+def similar_shape_consistency(rows: list[dict], min_bucket_count: int) -> list[dict]:
+    """Estimate consistency across objects with similar shape and size.
+
+    Args:
+        rows: DGN score rows with bucket labels.
+        min_bucket_count: Minimum objects per bucket.
+
+    Returns:
+        Bucket consistency rows.
+    """
+    object_groups: dict[str, list[dict]] = {}
+    for row in rows:
+        object_groups.setdefault(row["canonical_object_id"], []).append(row)
+    object_rows = []
+    for object_id, group in object_groups.items():
+        score = np.asarray([[row[f"type_{type_id}_score"] for type_id in REAL_TYPE_IDS] for row in group], dtype=np.float64).mean(axis=0)
+        base = group[0]
+        object_row = {
+            "canonical_object_id": object_id,
+            "joint_scale_bucket": base.get("joint_scale_bucket", "all"),
+            "aspect_xy_bucket": base.get("aspect_xy_bucket", "all"),
+            "shape_size_bucket": f"{base.get('joint_scale_bucket', 'all')}|{base.get('aspect_xy_bucket', 'all')}",
+        }
+        for type_id, value in zip(REAL_TYPE_IDS, score):
+            object_row[f"type_{type_id}_score"] = float(value)
+        object_rows.append(object_row)
+    grouped: dict[str, list[dict]] = {}
+    for row in object_rows:
+        grouped.setdefault(row["shape_size_bucket"], []).append(row)
+    out = []
+    for bucket, group in sorted(grouped.items()):
+        if len(group) < min_bucket_count:
+            continue
+        scores = np.asarray([[row[f"type_{type_id}_score"] for type_id in REAL_TYPE_IDS] for row in group], dtype=np.float64)
+        out.append(
+            {
+                "shape_size_bucket": bucket,
+                "object_num": int(len(group)),
+                "mean_cross_object_type_std": float(scores.std(axis=0).mean()),
+                "max_cross_object_type_std": float(scores.std(axis=0).max()),
+            }
+        )
+    return out
+
+
+def dgn_ordinal_sanity(rows: list[dict]) -> list[dict]:
+    """Compute coarse ordinal/rule sanity diagnostics.
+
+    Args:
+        rows: DGN rows with score and scale fields.
+
+    Returns:
+        Rule diagnostic rows.
+    """
     if not rows:
-        return [f"- No bbox geometry rows were available. Skipped files: {skipped}"]
-    threshold = float(getattr(task_cfg, "bbox_outlier_threshold_m", 0.2))
-    max_distances = [row["max_bbox_distance_m"] for row in rows]
-    outliers = [distance for distance in max_distances if distance > threshold]
+        return []
+    values = {feature: np.asarray([row[feature] for row in rows], dtype=np.float64) for feature in SCALE_FEATURES}
+    q20 = {feature: float(np.quantile(values[feature], 0.2)) for feature in SCALE_FEATURES}
+    q80 = {feature: float(np.quantile(values[feature], 0.8)) for feature in SCALE_FEATURES}
+    rules = {
+        "small_xy": [row for row in rows if row["xy_long"] <= q20["xy_long"] and row["xy_short"] <= q20["xy_short"]],
+        "large_flat": [row for row in rows if row["xy_long"] >= q80["xy_long"] and row["z_height"] <= q20["z_height"]],
+        "tall": [row for row in rows if row["z_height"] >= q80["z_height"]],
+    }
+    out = []
+    for name, group in rules.items():
+        if not group:
+            continue
+        summary = {"rule": name, "scene_num": int(len(group))}
+        for type_id in REAL_TYPE_IDS:
+            summary[f"type_{type_id}_mean_score"] = float(np.mean([row[f"type_{type_id}_score"] for row in group]))
+        out.append(summary)
+    return out
+
+
+def repeatability_rows(score_rows: list[dict]) -> list[dict]:
+    """Measure repeated score variance for duplicated scene ids.
+
+    Args:
+        score_rows: Original score rows before scene aggregation.
+
+    Returns:
+        Per-duplicated-scene repeatability rows.
+    """
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for row in score_rows:
+        grouped.setdefault((row.get("split", ""), row["scene_key"]), []).append(row)
+    out = []
+    for (split, key), group in grouped.items():
+        if len(group) < 2:
+            continue
+        scores = np.stack([row["scores"] for row in group], axis=0)
+        out.append(
+            {
+                "split": split,
+                "scene_key": key,
+                "repeat_count": int(len(group)),
+                "mean_type_score_std": float(scores.std(axis=0).mean()),
+                "max_type_score_std": float(scores.std(axis=0).max()),
+            }
+        )
+    return out
+
+
+def human_scale_gap_rows(dgn_rows: list[dict], human_metric_rows: list[dict], min_bucket_count: int, bucket_count: int) -> list[dict]:
+    """Compare DGN and human score distributions in matched scale buckets.
+
+    Args:
+        dgn_rows: DGN rows with bucket labels and scores.
+        human_metric_rows: Human metric rows with bucket labels and p scores.
+        min_bucket_count: Minimum rows per domain in a bucket.
+        bucket_count: Number of shared quantile buckets.
+
+    Returns:
+        DGN-minus-human score gap rows.
+    """
+    combined_edges = {
+        feature: quantile_edges(
+            [float(row[feature]) for row in dgn_rows] + [float(row[feature]) for row in human_metric_rows],
+            bucket_count,
+        )
+        for feature in SCALE_FEATURES
+    }
+
+    def common_joint_bucket(row: dict) -> str:
+        """Assign a row to a joint scale bucket using shared edges.
+
+        Args:
+            row: DGN or human row with scale descriptor fields.
+
+        Returns:
+            Joint bucket label built from shared quantile edges.
+        """
+        return "|".join(bucket_label(float(row[feature]), combined_edges[feature]) for feature in SCALE_FEATURES)
+
+    dgn_by_bucket: dict[str, list[dict]] = {}
+    for row in dgn_rows:
+        dgn_by_bucket.setdefault(common_joint_bucket(row), []).append(row)
+    human_by_domain_bucket: dict[tuple[str, str], list[dict]] = {}
+    for row in human_metric_rows:
+        bucket = common_joint_bucket(row)
+        human_by_domain_bucket.setdefault((f"human_{row['split']}", bucket), []).append(row)
+    out = []
+    for (domain, bucket), human_group in sorted(human_by_domain_bucket.items()):
+        dgn_group = dgn_by_bucket.get(bucket, [])
+        if len(human_group) < min_bucket_count or len(dgn_group) < min_bucket_count:
+            continue
+        gap = {
+            "human_domain": domain,
+            "joint_scale_bucket": bucket,
+            "human_count": int(len(human_group)),
+            "dgn_count": int(len(dgn_group)),
+        }
+        for type_id in REAL_TYPE_IDS:
+            dgn_mean = float(np.mean([row[f"type_{type_id}_score"] for row in dgn_group]))
+            human_mean = float(np.mean([row.get(f"type_{type_id}_p", row.get(f"type_{type_id}_score", 0.0)) for row in human_group]))
+            gap[f"type_{type_id}_dgn_minus_human"] = dgn_mean - human_mean
+        out.append(gap)
+    return out
+
+
+def dgn_report_lines(
+    dgn_rows: list[dict],
+    distribution_rows: list[dict],
+    correlation_rows: list[dict],
+    stability: list[dict],
+    consistency: list[dict],
+    ordinal_rows: list[dict],
+    repeat_rows: list[dict],
+    gap_rows: list[dict],
+    output_dir: str,
+) -> list[str]:
+    """Format the DGN 1B markdown section.
+
+    Args:
+        dgn_rows: DGN rows with scale descriptors.
+        distribution_rows: Score-vs-scale summaries.
+        correlation_rows: Score-scale correlations.
+        stability: Per-object stability rows.
+        consistency: Similar-shape consistency rows.
+        ordinal_rows: Rule sanity rows.
+        repeat_rows: Stochastic repeatability rows.
+        gap_rows: DGN-vs-human gap rows.
+        output_dir: Directory containing CSV outputs.
+
+    Returns:
+        Markdown lines.
+    """
     lines = [
-        f"- Geometry rows: {len(rows)}",
-        f"- Skipped files: {skipped}",
-        f"- Bbox outlier threshold: {threshold:.4f} m",
-        f"- Outlier rows: {len(outliers)} ({len(outliers) / len(rows) * 100.0:.2f}%)",
+        "- 本节实现 `Evaluation Metrics 1 / 1B`。DGN 没有 human label，因此只做 score 与 canonical point-cloud 三维尺寸 `(xy_long, xy_short, z_height)` 的关系诊断。",
+        f"- DGN score rows with scale: {len(dgn_rows)}。",
+        f"- 明细 CSV: `{os.path.join(output_dir, 'evaluation_dgn_score_scale_rows.csv')}`",
+        f"- distribution CSV: `{os.path.join(output_dir, 'evaluation_dgn_score_scale_distribution.csv')}`",
+        f"- correlation CSV: `{os.path.join(output_dir, 'evaluation_dgn_score_scale_correlation.csv')}`",
+        "",
+        "### 指标解释",
+        "- `Score-vs-3D-scale distribution`：按 `xy_long`、`xy_short`、`z_height` 的分位数 bucket 统计每个 type score 的均值、方差、分位数和 95% CI，用来观察 score 是否随尺寸出现系统性偏移。",
+        "- `Score-scale correlation`：每个 type 分别计算 score 与三个连续尺寸变量的 Pearson / Spearman correlation，用来发现单调尺度偏差。",
+        "- `Per-scale score stability`：同一 canonical object 的多个 DGN scenes 上统计 score 方差和 top-1 flip rate，用来定位 pose / point sampling 导致的不稳定。",
+        "- `Similar-shape-size consistency`：在相近 `(xy_long, xy_short, z_height)` 和 aspect ratio bucket 内比较不同 object 的平均 score 方差，用来发现几何尺寸相近但输出不连续的问题。",
+        "- `Ordinal / rule sanity`：只做粗规则诊断，例如 small-xy、large-flat、tall bucket 上各 type 平均 score 是否明显异常；它不是硬标签。",
+        "- `Score repeatability`：如果同一 scene 有重复 score row，则统计重复预测方差；没有重复 row 时该项不可用。",
+        "- `DGN-vs-Human 3D-scale-conditioned gap`：在相同 3D scale bucket 下比较 DGN 与 human train/test 的 score 均值差，用来观察 human-to-DGN OOD calibration gap。",
+        "",
+        "### Score-scale Correlation",
+        "| scale | type | Pearson | Spearman | N |",
+        "|---|---:|---:|---:|---:|",
     ]
-    lines.extend(percentile_lines("max wrist-to-bbox distance", max_distances, "m"))
+    for row in correlation_rows:
+        lines.append(
+            f"| {row['scale_feature']} | {row['type_id']} | {format_float(row['pearson'])} | "
+            f"{format_float(row['spearman'])} | {row['n']} |"
+        )
+    all_row = next((row for row in distribution_rows if row["group_name"] == "all"), None)
+    if all_row is not None:
+        lines.extend(["", "### Overall Score Percentiles（仅作 scale 分组诊断的入口）", "| type | mean | std | p05 | p50 | p95 | ci95 |", "|---:|---:|---:|---:|---:|---:|---:|"])
+        for type_id in REAL_TYPE_IDS:
+            lines.append(
+                f"| {type_id} | {format_float(all_row.get(f'type_{type_id}_mean'))} | "
+                f"{format_float(all_row.get(f'type_{type_id}_std'))} | {format_float(all_row.get(f'type_{type_id}_p05'))} | "
+                f"{format_float(all_row.get(f'type_{type_id}_p50'))} | {format_float(all_row.get(f'type_{type_id}_p95'))} | "
+                f"{format_float(all_row.get(f'type_{type_id}_ci95_half_width'))} |"
+            )
+    lines.extend(["", "### Stability / Consistency", f"- Same-object stability rows: {len(stability)}；CSV: `{os.path.join(output_dir, 'evaluation_dgn_object_stability.csv')}`"])
+    if stability:
+        lines.append(f"- mean top1 flip rate: {np.mean([row['top1_flip_rate'] for row in stability]):.4f}；mean type-score std: {np.mean([row['mean_type_score_std'] for row in stability]):.4f}")
+    lines.append(f"- Similar-shape-size consistency rows: {len(consistency)}；CSV: `{os.path.join(output_dir, 'evaluation_dgn_similar_shape_consistency.csv')}`")
+    if consistency:
+        lines.append(f"- mean cross-object type std in similar buckets: {np.mean([row['mean_cross_object_type_std'] for row in consistency]):.4f}")
+    lines.extend(["", "### Ordinal / Rule Sanity", "| rule | N | type1 | type2 | type3 | type4 | type5 |", "|---|---:|---:|---:|---:|---:|---:|"])
+    for row in ordinal_rows:
+        lines.append(
+            f"| {row['rule']} | {row['scene_num']} | " + " | ".join(format_float(row.get(f"type_{type_id}_mean_score")) for type_id in REAL_TYPE_IDS) + " |"
+        )
+    lines.extend(["", "### Repeatability / Domain Gap", f"- Repeated-scene score rows: {len(repeat_rows)}；CSV: `{os.path.join(output_dir, 'evaluation_dgn_score_repeatability.csv')}`"])
+    if repeat_rows:
+        lines.append(f"- repeat max type-score std mean: {np.mean([row['max_type_score_std'] for row in repeat_rows]):.4f}")
+    lines.append(f"- DGN-vs-Human scale-conditioned gap rows: {len(gap_rows)}；CSV: `{os.path.join(output_dir, 'evaluation_dgn_vs_human_scale_gap.csv')}`")
     return lines
+
+
+def run_dgn_1b(config, dgn_score_rows: list[dict], human_metric_rows: list[dict], output_dir: str) -> list[str]:
+    """Run 1B DGN score-scale diagnostics.
+
+    Args:
+        config: Full Hydra config.
+        dgn_score_rows: DGN score rows.
+        human_metric_rows: Human metric rows for scale-conditioned comparison.
+        output_dir: Directory for CSV outputs.
+
+    Returns:
+        Markdown lines.
+    """
+    if not dgn_score_rows:
+        return ["- 未找到 DGN test result score，因此跳过 1B。"]
+    bucket_count = int(getattr(config.task, "scale_bucket_count", 4))
+    min_bucket_count = int(getattr(config.task, "min_bucket_count", 20))
+    dgn_rows = score_rows_with_scale(dgn_score_rows, config.task, output_dir, "dgn")
+    distribution_rows = dgn_distribution_summaries(dgn_rows, bucket_count=bucket_count, min_bucket_count=min_bucket_count)
+    correlation_rows = dgn_correlations(dgn_rows)
+    stability = dgn_stability_rows(dgn_rows)
+    if stability:
+        add_scale_buckets(stability, bucket_count)
+    consistency = similar_shape_consistency(dgn_rows, min_bucket_count=max(2, min_bucket_count // 10))
+    ordinal_rows = dgn_ordinal_sanity(dgn_rows)
+    repeat_rows = repeatability_rows(dgn_score_rows)
+    gap_rows = human_scale_gap_rows(dgn_rows, human_metric_rows, min_bucket_count=min_bucket_count, bucket_count=bucket_count) if human_metric_rows else []
+
+    _write_csv(dgn_rows, os.path.join(output_dir, "evaluation_dgn_score_scale_rows.csv"))
+    _write_csv(distribution_rows, os.path.join(output_dir, "evaluation_dgn_score_scale_distribution.csv"))
+    _write_csv(correlation_rows, os.path.join(output_dir, "evaluation_dgn_score_scale_correlation.csv"))
+    _write_csv(stability, os.path.join(output_dir, "evaluation_dgn_object_stability.csv"))
+    _write_csv(consistency, os.path.join(output_dir, "evaluation_dgn_similar_shape_consistency.csv"))
+    _write_csv(ordinal_rows, os.path.join(output_dir, "evaluation_dgn_ordinal_rule_sanity.csv"))
+    _write_csv(repeat_rows, os.path.join(output_dir, "evaluation_dgn_score_repeatability.csv"))
+    _write_csv(gap_rows, os.path.join(output_dir, "evaluation_dgn_vs_human_scale_gap.csv"))
+    return dgn_report_lines(dgn_rows, distribution_rows, correlation_rows, stability, consistency, ordinal_rows, repeat_rows, gap_rows, output_dir)
+
+
+def output_dir_from_paths(config, primary_input_path: str) -> str:
+    """Resolve evaluation output directory.
+
+    Args:
+        config: Full Hydra config.
+        primary_input_path: Primary result directory or score JSONL path.
+
+    Returns:
+        Output directory path.
+    """
+    configured = getattr(config.task, "output_dir", "")
+    if configured:
+        return _abs_path(configured)
+    if primary_input_path:
+        if os.path.isdir(primary_input_path):
+            return os.path.join(os.path.dirname(primary_input_path), "evaluation")
+        return os.path.join(os.path.dirname(primary_input_path), "evaluation")
+    return _abs_path(os.path.join(str(config.output_folder), str(config.wandb.id), "evaluation"))
 
 
 def task_evaluate(config) -> None:
-    """Hydra task entry point for human model evaluation.
+    """Hydra entry point for Human Prior intrinsic evaluation 1A/1B.
 
     Args:
-        config: Full Hydra config for the current AnyScaleDexLearn run.
+        config: Full Hydra config. The task reads saved ``task=sample`` results
+            under ``tests/step_*/{humanMulti,DGNMulti}`` by default and does not
+            run model sampling or downstream BODex/Bench.
 
     Returns:
         None.
     """
     resolve_type_supervision_config(config)
     flatten_multidex_data_config(config.data)
-    flatten_multidex_data_config(config.test_data)
-    task_cfg = config.task
-    sample_dir = get_sample_output_dir(config)
-    sample_files = collect_sample_files(config, sample_dir)
-    inspected = inspect_sample_file_types(sample_files)
-    pose_files = inspected["pose_files"]
-    score_files = inspected["score_files"]
-    score_eval_files = inspected["score_only_files"] or score_files
+    if hasattr(config, "test_data"):
+        flatten_multidex_data_config(config.test_data)
 
-    require_score_samples = str(getattr(task_cfg, "require_score_samples", "auto")).lower()
-    if require_score_samples == "true" or (require_score_samples == "auto" and is_feasibility_model(config)):
-        if not score_eval_files:
-            raise_missing_samples(
-                config,
-                sample_dir,
-                "No feasibility score sample files were found.",
-                "0_any",
-            )
+    max_score_rows = int(getattr(config.task, "max_score_rows", 0))
+    score_grasp_type = str(getattr(config.task, "score_grasp_type", "0_any") or "0_any")
+    human_dataset_name = str(getattr(config.task, "human_results_dataset", "humanMulti") or "humanMulti")
+    dgn_dataset_name = str(getattr(config.task, "dgn_results_dataset", "DGNMulti") or "DGNMulti")
 
-    if bool(getattr(task_cfg, "require_pose_samples", True)) and not pose_files:
-        raise_missing_samples(
-            config,
-            sample_dir,
-            "No fixed-type pose sample files were found.",
-            FIXED_TYPE_SAMPLE_LIST,
+    human_score_jsonl = resolve_score_jsonl(config, "human_score_jsonl", fallback="")
+    dgn_score_jsonl = resolve_score_jsonl(config, "dgn_score_jsonl", fallback="")
+    human_results_dir = resolve_test_result_dir(config, "human_results_dir", human_dataset_name)
+    dgn_results_dir = resolve_test_result_dir(config, "dgn_results_dir", dgn_dataset_name)
+
+    split_lookup = human_split_lookup(config)
+    if human_score_jsonl:
+        human_score_rows = load_score_jsonl(human_score_jsonl, max_rows=max_score_rows)
+        human_source = human_score_jsonl
+    else:
+        human_score_rows = load_test_result_scores(
+            human_results_dir,
+            max_rows=max_score_rows,
+            split_lookup=split_lookup,
+            score_grasp_type=score_grasp_type,
         )
+        human_source = human_results_dir
 
-    report_path_value = getattr(task_cfg, "report_md", "")
-    report_path = str(report_path_value) if report_path_value else os.path.join(sample_dir, "evaluation_report.md")
-    report = MarkdownReport(report_path, "Human Prior Score-to-Feasibility Evaluation")
+    if dgn_score_jsonl:
+        dgn_score_rows = load_score_jsonl(dgn_score_jsonl, max_rows=max_score_rows)
+        dgn_source = dgn_score_jsonl
+    else:
+        dgn_score_rows = load_test_result_scores(
+            dgn_results_dir,
+            max_rows=max_score_rows,
+            split_lookup=None,
+            score_grasp_type=score_grasp_type,
+        )
+        dgn_source = dgn_results_dir
+
+    output_dir = output_dir_from_paths(config, dgn_source or human_source)
+    os.makedirs(output_dir, exist_ok=True)
+    report_path_value = getattr(config.task, "report_md", "")
+    report_path = _abs_path(report_path_value) if report_path_value else os.path.join(output_dir, "evaluation_report.md")
+    report = MarkdownReport(report_path, "Human Prior Intrinsic Evaluation")
+
     report.add_section(
-        "Sample Inventory",
+        "输入",
         [
-            f"- Sample directory: `{sample_dir}`",
-            f"- Total sample files: {len(sample_files)}",
-            f"- Pose sample files: {len(pose_files)}",
-            f"- Score sample files: {len(score_files)}",
-            f"- Score-only sample files: {len(inspected['score_only_files'])}",
-            f"- Report path: `{report_path}`",
+            f"- human_score_jsonl: `{human_score_jsonl}`",
+            f"- human_results_dir: `{human_results_dir}`",
+            f"- human score rows: {len(human_score_rows)}",
+            f"- dgn_score_jsonl: `{dgn_score_jsonl}`",
+            f"- dgn_results_dir: `{dgn_results_dir}`",
+            f"- dgn score rows: {len(dgn_score_rows)}",
+            f"- score_grasp_type: `{score_grasp_type}`",
+            f"- output_dir: `{output_dir}`",
+            "- 本任务只读已保存的 `tests/step_*` sample 结果，不运行 sampling、BimanBODex 或 Bench。",
         ],
     )
 
-    # Check whether the saved type scores are numerically sane before using
-    # them as feasibility or budget signals.
-    score_records = load_score_records(score_eval_files)
-    report.add_section("Score Sanity", run_score_sanity(score_records, sample_dir))
+    human_metric_rows = []
+    if bool(getattr(config.task, "run_human_1a", True)):
+        try:
+            human_lines, human_metric_rows, _ = run_human_1a(config, human_score_rows, output_dir)
+            report.add_section("1A Human Train/Test 有 Label", human_lines)
+        except Exception as exc:
+            report.add_section("1A Human Train/Test 有 Label", [f"- 1A 运行失败：`{type(exc).__name__}: {exc}`"])
+            raise
 
-    human_label_records = []
-    scene_labels = {}
-    if cfg_get(config.test_data, "dataset_type", default="") == "HumanMultiDexDataset":
-        # Human labels are evaluated at scene/sequence level. Same-object types
-        # observed elsewhere are treated as unknown rather than negatives.
-        scene_labels, human_label_records = build_human_scene_labels(config)
-        report.add_section(
-            "Human Scene Feasibility",
-            run_human_scene_feasibility(score_records, scene_labels, task_cfg, sample_dir),
-        )
+    if bool(getattr(config.task, "run_dgn_1b", True)):
+        dgn_lines = run_dgn_1b(config, dgn_score_rows, human_metric_rows, output_dir)
+        report.add_section("1B DGN Testset 无 Label", dgn_lines)
 
     report.add_section(
-        "Feasibility Threshold Sweep",
-        run_feasibility_threshold_sweep(score_records, scene_labels, task_cfg, sample_dir),
-    )
-    report.add_section("Budget-to-BODex Proxy", run_budget_to_bodex_proxy(score_records, scene_labels, task_cfg, sample_dir))
-    report.add_section("Size Rule Violations", run_size_rule_violations(score_records, task_cfg, sample_dir))
-    report.add_section("Ordinal Type Consistency", run_ordinal_consistency(score_records, task_cfg, sample_dir))
-
-    train_records = []
-    sample_records = []
-    if pose_files:
-        train_records = load_training_records(config)
-        sample_records = load_sample_records(pose_files)
-        reference_records = human_label_records if human_label_records else train_records
-        reference_name = "human eval split" if human_label_records else "training split"
-        print(f"[evaluate] Loaded {len(train_records)} training records.")
-        print(f"[evaluate] Loaded {len(human_label_records)} human split label records.")
-        print(f"[evaluate] Found {len(sample_files)} sample files in {sample_dir}")
-        print(f"[evaluate] Loaded {len(sample_records)} comparable pose sample records.")
-
-        # Inspect selected objects in detail to see whether generated grasps are
-        # near copies of reference poses or meaningfully novel alternatives.
-        object_rows = run_object_specific_nn_analysis(reference_records, sample_records, task_cfg, sample_dir)
-        report.add_section(
-            "Object Novelty",
-            [f"- Reference records: {reference_name} ({len(reference_records)})"]
-            + summarize_nearest_rows_markdown(object_rows, task_cfg),
-        )
-
-        # Estimate within-object/type pose diversity so a low NN distance is not
-        # mistaken for good multi-modal generation by itself.
-        report.add_section("Pose Diversity", run_pose_diversity_analysis(sample_records, task_cfg, sample_dir))
-
-        # Use object point-cloud bounding boxes as a lightweight geometry sanity
-        # check for Human/DGN samples without running downstream simulation.
-        report.add_section("BBox Geometry", run_bbox_geometry_sanity(pose_files, task_cfg, sample_dir))
-
-    report.add_section(
-        "Downstream Note",
+        "结论使用边界",
         [
-            "- This task does not run BODex/Bench. It only evaluates saved samples.",
-            "- Use the saved feasibility scores and fixed-type pose samples as inputs to downstream budget tests.",
+            "- 1A 的 `q_t` 来自 human observed count distribution，不是 closed-world feasibility，也不是 BimanBODex 下游最优 utility。",
+            "- 1B 没有 label，只能诊断 score 与三维 canonical point-cloud 尺寸的关系、稳定性和 human-to-DGN 分布差异。",
+            "- 最终 allocator 是否有效仍需要固定总 budget 下的 BimanBODex + Bench paired downstream evaluation 验证。",
         ],
     )
-    print(f"[evaluate] Wrote markdown report to {report_path}")
+    print(f"[evaluate] Wrote report to {report_path}")

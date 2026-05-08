@@ -12,7 +12,7 @@ object_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/object
 split_path: valid_split   # relative to object_path
 pc_path: vision_data/complete_pc    # relative to object_path
 
-test_split: test
+test_split: all # test
 test_scene_cfg: "**/*.npy"
 mini_test: False
 

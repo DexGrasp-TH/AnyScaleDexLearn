@@ -30,12 +30,11 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_EXP_NAMES = ["debug25", "debug26"]
+DEFAULT_EXP_NAMES = ["debug26"]
 DEFAULT_GPUS = ["2", "3", "4", "5", "6", "7"]
-DEFAULT_TEST_DATASETS = ["humanMulti", "DGNMulti"]
+DEFAULT_TEST_DATASETS = ["humanMulti"]
 DEFAULT_SAMPLE_KINDS = ["score", "pose"]
 DEFAULT_EXP_OVERRIDES = {
-    "debug25": [],
     "debug26": [],
 }
 
