@@ -625,3 +625,35 @@ to describe intentional differences from previous runs.
 - Key Features:
   - independent_from_scratch_diffusion_only_shared_arch_10000iter_record_uniform_soft_labels
 - Notes: 
+## humanMulti_humanMultiHierar_human_prior_2_type
+- Timestamp: `2026-05-12 23:27:25`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - independent_from_scratch_type_only_shared_arch_300iter_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug73_type
+- Timestamp: `2026-05-12 23:28:31`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - independent_from_scratch_type_only_shared_arch_300iter_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_human_prior_2_diffusion
+- Timestamp: `2026-05-12 23:29:00`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `10000`
+- Key Features:
+  - independent_from_scratch_diffusion_only_shared_arch_10000iter_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug73_diffusion
+- Timestamp: `2026-05-12 23:30:23`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `10000`
+- Key Features:
+  - independent_from_scratch_diffusion_only_shared_arch_10000iter_record_uniform_soft_labels
+- Notes: 

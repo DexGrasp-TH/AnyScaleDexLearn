@@ -269,6 +269,15 @@ OMP_NUM_THREADS=4 python dexlearn/scripts/launch_multi_sample.py \
 
 ### Object Human Prior Export
 
+Train:
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiHierar data=humanMulti \
+  algo.training.mode=independent_from_scratch \
+  data.sampling.train_split=all \
+  exp_name=human_prior_<x>
+```
+
 Export object-scene human prior scores and hand-position seeds for downstream
 BODex synthesis. The default task writes one 5-type budget score vector per
 scene and writes 20 unsorted pose samples per scene and grasp type. When
