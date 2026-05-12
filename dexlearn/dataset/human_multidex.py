@@ -17,8 +17,6 @@ from scipy.spatial.transform import Rotation as sciR
 FIXED_LEFT_HAND_TRANS = np.array([0.0, 0.0, -0.5])
 FIXED_LEFT_HAND_ROT = np.eye(3)
 REAL_GRASP_TYPE_IDS = tuple(range(1, len(GRASP_TYPES)))
-FEASIBILITY_LABEL_MODES = {"open_world_positive_only", "closed_world_object_complete"}
-RANKING_NEGATIVE_SAMPLING_MODES = {"uniform", "inverse_frequency"}
 TRAIN_SAMPLING_UNIT_ALIASES = {
     "record": "record_uniform",
     "record_uniform": "record_uniform",
@@ -46,64 +44,36 @@ class HumanMultiDexDataset(Dataset):
         self.pc_path_dict = {}
         self.type_grasp_path_dict = defaultdict(list)
         self.type_object_grasp_path_dict = defaultdict(lambda: defaultdict(list))
-        self.object_type_grasp_path_dict = defaultdict(lambda: defaultdict(list))
         self.object_sequence_type_counter = defaultdict(lambda: defaultdict(Counter))
         self.object_pose_group_dict = defaultdict(list)
         self.object_pose_group_by_key = {}
         self.grasp_path_pose_group_key = {}
         self.object_type_counter = defaultdict(Counter)
         self.type_counter = Counter()
-        self.object_positive_type_ids = {}
-        self.object_feasible_type_mask_dict = {}
-        self.object_tested_type_mask_dict = {}
         self.object_pc_folder = pjoin(config.object_path, config.pc_path)
         self.hand_pos_source = normalize_hand_pos_source(getattr(config, "hand_pos_source", "wrist"))
         self.random_pc_across_sequences = bool(getattr(config, "random_pc_across_sequences", True))
-        default_objective = "object_bce" if bool(getattr(config, "feasibility_enabled", False)) else "ce"
-        self.type_objective = str(getattr(config, "type_objective", default_objective)).lower()
-        self.supervision_scope = str(
-            getattr(config, "supervision_scope", "object" if self.type_objective == "object_bce" else "record")
-        ).lower()
-        self.negative_policy = str(
-            getattr(config, "negative_policy", "object_closed_world" if self.type_objective == "object_bce" else "softmax")
-        ).lower()
+        self.type_objective = str(getattr(config, "type_objective", "ce")).lower()
+        if self.type_objective != "ce":
+            raise ValueError("HumanMultiDexDataset only supports type_objective=ce")
+        self.supervision_scope = str(getattr(config, "supervision_scope", "record")).lower()
+        self.negative_policy = str(getattr(config, "negative_policy", "softmax")).lower()
         self.train_sampling_unit = self._normalize_train_sampling_unit(
             getattr(config, "train_sampling_unit", "record_uniform")
         )
         self.pose_group_soft_labels = bool(
             getattr(config, "pose_group_soft_labels", self.train_sampling_unit == "posed_object_uniform")
         )
-        self.object_bce_enabled = self.mode in ["train", "eval"] and self.type_objective == "object_bce"
-        self.ranking_enabled = self.mode in ["train", "eval"] and self.type_objective == "scene_ranking"
-        self.feasibility_enabled = self.object_bce_enabled
-        self.feasibility_label_mode = str(getattr(config, "feasibility_label_mode", "open_world_positive_only"))
         self.type_balancing_enabled = (
             self.mode == "train"
-            and not self.object_bce_enabled
             and bool(getattr(config, "type_balancing_enabled", False))
         )
         self.type_sampler_enabled = (
             self.mode == "train"
-            and not self.object_bce_enabled
             and bool(getattr(config, "type_sampler_enabled", False))
         )
         self.type_sampler_alpha = float(getattr(config, "type_sampler_alpha", 1.0))
         self.type_sampler_object_uniform = bool(getattr(config, "type_sampler_object_uniform", True))
-        self.ranking_negatives_per_positive = int(getattr(config, "ranking_negatives_per_positive", 4))
-        self.ranking_negative_sampling = str(getattr(config, "ranking_negative_sampling", "uniform")).lower()
-
-        if self.object_bce_enabled and self.feasibility_label_mode not in FEASIBILITY_LABEL_MODES:
-            raise ValueError(
-                f"Unsupported feasibility_label_mode={self.feasibility_label_mode}. "
-                f"Expected one of {sorted(FEASIBILITY_LABEL_MODES)}."
-            )
-        if self.ranking_enabled and self.ranking_negative_sampling not in RANKING_NEGATIVE_SAMPLING_MODES:
-            raise ValueError(
-                f"Unsupported ranking_negative_sampling={self.ranking_negative_sampling}. "
-                f"Expected one of {sorted(RANKING_NEGATIVE_SAMPLING_MODES)}."
-            )
-        if self.ranking_enabled and self.ranking_negatives_per_positive <= 0:
-            raise ValueError("ranking_negatives_per_positive must be positive")
 
         if mode == "test":
             self.grasp_type_lst = (
@@ -161,7 +131,7 @@ class HumanMultiDexDataset(Dataset):
         self._index_grasp_type_distribution()
         if self.train_sampling_unit == "posed_object_uniform":
             self._validate_pose_group_sampling_index()
-        self.data_num = len(self.obj_id_lst) if self.object_bce_enabled else self.record_data_num
+        self.data_num = self.record_data_num
         print(f"mode: {mode}, grasp data num: {self.data_num}, sampling unit: {self.train_sampling_unit}")
 
     def _index_grasp_type_distribution(self):
@@ -176,7 +146,6 @@ class HumanMultiDexDataset(Dataset):
         """
         self.type_grasp_path_dict = defaultdict(list)
         self.type_object_grasp_path_dict = defaultdict(lambda: defaultdict(list))
-        self.object_type_grasp_path_dict = defaultdict(lambda: defaultdict(list))
         self.object_sequence_type_counter = defaultdict(lambda: defaultdict(Counter))
         self.object_pose_group_dict = defaultdict(list)
         self.object_pose_group_by_key = {}
@@ -197,7 +166,6 @@ class HumanMultiDexDataset(Dataset):
                 grasp_type_id = int(grasp_type.split("_", 1)[0])
                 self.type_grasp_path_dict[grasp_type_id].append(grasp_path)
                 self.type_object_grasp_path_dict[grasp_type_id][obj_id].append(grasp_path)
-                self.object_type_grasp_path_dict[obj_id][grasp_type_id].append(grasp_path)
                 self.object_type_counter[obj_id][grasp_type_id] += 1
                 self.type_counter[grasp_type_id] += 1
                 sequence_id = self._get_grasp_sequence_id(grasp_data)
@@ -224,8 +192,6 @@ class HumanMultiDexDataset(Dataset):
 
         if metadata_pose_index is not None:
             self._finalize_pose_group_index(pose_group_records)
-
-        self._finalize_object_feasibility_metadata()
 
     def _metadata_csv_path(self):
         """Resolve the formatted dataset metadata CSV path.
@@ -506,39 +472,6 @@ class HumanMultiDexDataset(Dataset):
                 f"missing examples={missing[:5]}"
             )
 
-    def _finalize_object_feasibility_metadata(self):
-        """Finalize per-object feasibility metadata from indexed grasp paths.
-
-        Args:
-            None.
-
-        Returns:
-            None. Object-level positive type ids and feasibility/tested masks
-            are stored on this dataset instance.
-        """
-        self.object_positive_type_ids = {}
-        self.object_feasible_type_mask_dict = {}
-        self.object_tested_type_mask_dict = {}
-
-        for obj_id in self.obj_id_lst:
-            type_path_dict = self.object_type_grasp_path_dict.get(obj_id, {})
-            positive_type_ids = sorted(type_id for type_id, paths in type_path_dict.items() if paths)
-            if not positive_type_ids:
-                continue
-
-            feasible_mask = np.zeros(len(REAL_GRASP_TYPE_IDS), dtype=np.float32)
-            for type_idx, type_id in enumerate(REAL_GRASP_TYPE_IDS):
-                feasible_mask[type_idx] = 1.0 if type_id in positive_type_ids else 0.0
-
-            if self.feasibility_label_mode == "closed_world_object_complete":
-                tested_mask = np.ones_like(feasible_mask, dtype=np.float32)
-            else:
-                tested_mask = feasible_mask.copy()
-
-            self.object_positive_type_ids[obj_id] = positive_type_ids
-            self.object_feasible_type_mask_dict[obj_id] = feasible_mask
-            self.object_tested_type_mask_dict[obj_id] = tested_mask
-
     def get_distribution_analysis(self):
         """Return the indexed grasp-type distribution for this dataset.
 
@@ -554,12 +487,6 @@ class HumanMultiDexDataset(Dataset):
             str(obj_id): {str(type_id): int(count) for type_id, count in sorted(counter.items())}
             for obj_id, counter in sorted(self.object_type_counter.items())
         }
-        object_feasible_counts = {
-            str(type_id): int(
-                sum(1 for positive_type_ids in self.object_positive_type_ids.values() if type_id in positive_type_ids)
-            )
-            for type_id in REAL_GRASP_TYPE_IDS
-        }
         return {
             "mode": self.mode,
             "data_num": int(self.data_num),
@@ -568,15 +495,11 @@ class HumanMultiDexDataset(Dataset):
             "pose_group_num": int(sum(len(groups) for groups in self.object_pose_group_dict.values())),
             "type_counts": type_counts,
             "object_type_counts": object_counts,
-            "object_feasible_counts": object_feasible_counts,
             "type_objective": self.type_objective,
-            "sampling_unit": "object" if self.object_bce_enabled else self.train_sampling_unit,
+            "sampling_unit": self.train_sampling_unit,
             "supervision": {
                 "scope": self.supervision_scope,
                 "negative_policy": self.negative_policy,
-                "feasibility_label_mode": self.feasibility_label_mode,
-                "ranking_negatives_per_positive": int(self.ranking_negatives_per_positive),
-                "ranking_negative_sampling": self.ranking_negative_sampling,
             },
             "sampler": {
                 "type_balancing_enabled": bool(self.type_balancing_enabled),
@@ -683,41 +606,6 @@ class HumanMultiDexDataset(Dataset):
         ret_dict["target_type_distribution"] = pose_group["target_type_distribution"].copy()
         ret_dict["pose_group_record_count"] = np.int64(pose_group["record_count"])
 
-    def _sample_ranking_negative_type_ids(self, observed_type_id, obj_id=None, sequence_id=None):
-        """Sample weak negative grasp types for scene-level ranking.
-
-        Args:
-            observed_type_id: Positive grasp type id observed in the current
-                grasp record.
-            obj_id: Optional canonical object id for sequence-level filtering.
-            sequence_id: Optional scene/sequence id for sequence-level
-                filtering.
-
-        Returns:
-            NumPy array of negative type ids with length
-            ``ranking_negatives_per_positive``.
-        """
-        observed_type_ids = {int(observed_type_id)}
-        if self.supervision_scope == "sequence" and obj_id is not None and sequence_id is not None:
-            sequence_counter = self.object_sequence_type_counter.get(obj_id, {}).get(sequence_id, Counter())
-            observed_type_ids.update(int(type_id) for type_id in sequence_counter.keys())
-
-        candidates = [type_id for type_id in REAL_GRASP_TYPE_IDS if type_id not in observed_type_ids]
-        if not candidates:
-            candidates = [type_id for type_id in REAL_GRASP_TYPE_IDS if type_id != int(observed_type_id)]
-        if not candidates:
-            raise RuntimeError("No candidate negative grasp types are available")
-
-        negative_num = int(self.ranking_negatives_per_positive)
-        if self.mode != "train":
-            return np.asarray([candidates[idx % len(candidates)] for idx in range(negative_num)], dtype=np.int64)
-
-        if self.ranking_negative_sampling == "inverse_frequency":
-            weights = [1.0 / max(float(self.type_counter.get(type_id, 0)), 1.0) for type_id in candidates]
-        else:
-            weights = None
-        return np.asarray(random.choices(candidates, weights=weights, k=negative_num), dtype=np.int64)
-
     def _get_object_id_from_grasp_path(self, grasp_path):
         """Read the canonical object id from a grasp record path.
 
@@ -792,10 +680,7 @@ class HumanMultiDexDataset(Dataset):
         ret_dict = {}
 
         if self.mode in ["train", "eval"]:
-            if self.object_bce_enabled:
-                rand_grasp_type, pc, mirrored, grasp_data = self._load_feasibility_train_eval_data(id, ret_dict)
-            else:
-                rand_grasp_type, pc, mirrored, grasp_data = self._load_train_data(id, ret_dict)
+            rand_grasp_type, pc, mirrored, grasp_data = self._load_train_data(id, ret_dict)
         else:  # test
             rand_grasp_type, pc = self._load_test_data(id, ret_dict)
             mirrored = False
@@ -819,54 +704,6 @@ class HumanMultiDexDataset(Dataset):
             ret_dict["feats"] = pc
 
         return ret_dict
-
-    def _get_object_id_for_index(self, sample_index):
-        """Resolve one canonical object id from a train/eval sample index.
-
-        Args:
-            sample_index: Dataset index received by ``__getitem__``.
-
-        Returns:
-            Canonical object id string.
-        """
-        if not self.obj_id_lst:
-            raise RuntimeError("HumanMultiDexDataset has no indexed objects")
-        return self.obj_id_lst[int(sample_index) % len(self.obj_id_lst)]
-
-    def _sample_positive_type_for_object(self, obj_id, sample_index):
-        """Choose one positive grasp type for the given object.
-
-        Args:
-            obj_id: Canonical object id.
-            sample_index: Dataset index received by ``__getitem__``.
-
-        Returns:
-            Integer grasp type id in ``[1, 5]``.
-        """
-        positive_type_ids = self.object_positive_type_ids.get(obj_id, [])
-        if not positive_type_ids:
-            raise RuntimeError(f"Object '{obj_id}' has no positive grasp types")
-        if self.mode == "train":
-            return random.choice(positive_type_ids)
-        return positive_type_ids[int(sample_index) % len(positive_type_ids)]
-
-    def _sample_grasp_path_for_object_type(self, obj_id, grasp_type_id, sample_index):
-        """Choose one grasp record for the requested object and type.
-
-        Args:
-            obj_id: Canonical object id.
-            grasp_type_id: Selected positive grasp type id.
-            sample_index: Dataset index received by ``__getitem__``.
-
-        Returns:
-            Path to one grasp record.
-        """
-        grasp_paths = self.object_type_grasp_path_dict.get(obj_id, {}).get(grasp_type_id, [])
-        if not grasp_paths:
-            raise RuntimeError(f"Object '{obj_id}' has no grasp records for type {grasp_type_id}")
-        if self.mode == "train":
-            return random.choice(grasp_paths)
-        return grasp_paths[int(sample_index) % len(grasp_paths)]
 
     def _determine_grasp_type(self, grasp_data):
         """Determine grasp type and whether mirroring is needed."""
@@ -1110,43 +947,6 @@ class HumanMultiDexDataset(Dataset):
 
         return pc, pc_path
 
-    def _load_feasibility_train_eval_data(self, sample_index, ret_dict):
-        """Load one train/eval sample for object-level feasibility training.
-
-        Args:
-            sample_index: Dataset index received by ``__getitem__``.
-            ret_dict: Sample dictionary that will be filled in-place.
-
-        Returns:
-            Tuple ``(grasp_type, pc, mirrored, grasp_data)`` for the sampled
-            pose used by the diffusion target.
-        """
-        obj_id = self._get_object_id_for_index(sample_index)
-        ret_dict["feasible_type_mask"] = self.object_feasible_type_mask_dict[obj_id].copy()
-        ret_dict["tested_type_mask"] = self.object_tested_type_mask_dict[obj_id].copy()
-
-        grasp_type_id = self._sample_positive_type_for_object(obj_id, sample_index)
-        grasp_path = self._sample_grasp_path_for_object_type(obj_id, grasp_type_id, sample_index)
-        grasp_data = np.load(grasp_path, allow_pickle=True).item()
-        ret_dict["path"] = grasp_path
-        self._attach_pose_group_target(grasp_path, ret_dict)
-
-        grasp_type, mirrored = self._determine_grasp_type(grasp_data)
-        if int(grasp_type.split("_", 1)[0]) != grasp_type_id:
-            raise ValueError(
-                f"Indexed grasp type {grasp_type_id} does not match loaded grasp record type "
-                f"{grasp_type} for path {grasp_path}"
-            )
-        self._extract_hand_poses(grasp_data, mirrored, ret_dict)
-
-        obj_name = grasp_data["object"]["name"]
-        obj_scale = grasp_data["object"]["rel_scale"]
-        obj_pose = grasp_data["object"]["pose"]
-        sequence_id = self._get_grasp_sequence_id(grasp_data)
-        pc, pc_path = self._load_pointcloud(obj_name, obj_scale, obj_pose, mirrored, sequence_id=sequence_id)
-        ret_dict["pc_path"] = pc_path
-        return grasp_type, pc, mirrored, grasp_data
-
     def _load_train_data(self, sample_index, ret_dict):
         """Load one record-level training/eval sample.
 
@@ -1167,15 +967,6 @@ class HumanMultiDexDataset(Dataset):
         self._attach_pose_group_target(grasp_path, ret_dict)
 
         grasp_type, mirrored = self._determine_grasp_type(grasp_data)
-        if self.ranking_enabled:
-            grasp_type_id = int(grasp_type.split("_", 1)[0])
-            obj_id = self._get_object_id_from_grasp_path(grasp_path)
-            sequence_id = self._get_grasp_sequence_id(grasp_data)
-            ret_dict["negative_type_ids"] = self._sample_ranking_negative_type_ids(
-                grasp_type_id,
-                obj_id=obj_id,
-                sequence_id=sequence_id,
-            )
         self._extract_hand_poses(grasp_data, mirrored, ret_dict)
 
         obj_name = grasp_data["object"]["name"]

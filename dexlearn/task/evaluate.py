@@ -612,6 +612,55 @@ def top_k_indices(values: np.ndarray, k: int) -> set[int]:
     return {int(REAL_TYPE_IDS[idx]) for idx in order[: min(k, len(order))]}
 
 
+def positive_set_recall_at_positive_num(q: np.ndarray, p: np.ndarray) -> float | None:
+    """Measure how many GT-positive types appear in the top-|P| predictions.
+
+    Args:
+        q: Ground-truth five-way type distribution.
+        p: Predicted five-way type distribution.
+
+    Returns:
+        Recall value in ``[0, 1]`` using ``P={t | q_t>0}`` as GT-positive
+        types and the top-``|P|`` predicted types as the retrieved set.
+        Returns ``None`` only when the GT-positive set is empty.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    positive_type_ids = {int(REAL_TYPE_IDS[idx]) for idx, value in enumerate(q) if float(value) > 0.0}
+    if not positive_type_ids:
+        return None
+    predicted_type_ids = top_k_indices(p, len(positive_type_ids))
+    return float(len(positive_type_ids & predicted_type_ids) / len(positive_type_ids))
+
+
+def positive_set_soft_recall_at_positive_num(q: np.ndarray, p: np.ndarray) -> float | None:
+    """Measure how much GT positive probability mass is covered by top-|P| types.
+
+    Args:
+        q: Ground-truth five-way type distribution.
+        p: Predicted five-way type distribution.
+
+    Returns:
+        Soft recall value in ``[0, 1]`` using ``P={t | q_t>0}`` to define the
+        GT positive set and summing the GT mass covered by the predicted
+        top-``|P|`` types. Returns ``None`` only when the GT-positive set is
+        empty.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    positive_type_num = int(np.sum(q > 0.0))
+    if positive_type_num <= 0:
+        return None
+    predicted_type_ids = top_k_indices(p, positive_type_num)
+    return float(
+        sum(
+            float(q[idx])
+            for idx, type_id in enumerate(REAL_TYPE_IDS)
+            if int(type_id) in predicted_type_ids
+        )
+    )
+
+
 def js_divergence(q: np.ndarray, p: np.ndarray) -> float:
     """Compute Jensen-Shannon divergence using natural logarithms.
 
@@ -661,9 +710,8 @@ def positive_set_cross_entropy(q: np.ndarray, p: np.ndarray, eps: float = EPS) -
     """Compute CE inside the human-observed positive type set.
 
     The metric normalizes ``p`` only over types with ``q_t > 0``. It should be
-    read together with ``positive_probability_mass`` because it evaluates the
-    within-positive allocation but intentionally ignores mass assigned outside
-    the positive set.
+    read together with soft precision because it evaluates the within-positive
+    allocation but intentionally ignores mass assigned outside the positive set.
 
     Args:
         q: Reference probability distribution.
@@ -1502,6 +1550,9 @@ def metric_row_for_pose_class(row: dict) -> dict | None:
     ce = cross_entropy_with_eps(q, p, EPS)
     entropy = float(-np.sum(q * np.log(np.clip(q, EPS, None))))
     l1 = float(np.sum(np.abs(p - q)))
+    soft_precision = float(p[positive_mask].sum())
+    hard_recall = positive_set_recall_at_positive_num(q, p)
+    soft_recall = positive_set_soft_recall_at_positive_num(q, p)
     p_top1 = top_k_indices(p, 1)
     q_top1 = top_k_indices(q, 1)
     p_top2 = top_k_indices(p, 2)
@@ -1522,7 +1573,13 @@ def metric_row_for_pose_class(row: dict) -> dict | None:
         "distribution_l1": l1,
         "tvd": float(0.5 * l1),
         "js_divergence": js_divergence(q, p),
-        "positive_probability_mass": float(p[positive_mask].sum()),
+        "soft_precision": soft_precision,
+        "soft_recall_at_positive_num": soft_recall,
+        # Keep legacy aliases in CSV/report output so older notes and scripts
+        # keep working while the main report now highlights SoftPrecision and
+        # SoftRecall@card(P) as the primary metrics.
+        "positive_probability_mass": soft_precision,
+        "positive_set_recall_at_positive_num": hard_recall,
         "spearman": spearman_corr(q, p),
         "kendall": kendall_tau_b(q, p),
         "top1_match": float(bool(p_top1 & q_top1)),
@@ -1623,7 +1680,10 @@ def summarize_metric_rows(rows: list[dict], group_name: str, group_value: str) -
         "distribution_l1",
         "tvd",
         "js_divergence",
+        "soft_precision",
+        "soft_recall_at_positive_num",
         "positive_probability_mass",
+        "positive_set_recall_at_positive_num",
         "spearman",
         "kendall",
         "top1_match",
@@ -1740,29 +1800,35 @@ def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_
         f"- aggregate CSV: `{os.path.join(output_dir, 'evaluation_human_metric_summary.csv')}`",
         "",
         "### 指标解释",
-        "- `Soft-label CE / NLL`：`-sum_t q_t log(p_t)`，衡量模型给 human observed 分布的 likelihood；越低越好。",
         "- `KL(q||p)`：`CE-H(q)`，去掉 label 自身 entropy 后的分布偏差；越低越好。",
-        "- `Positive-set CE`：只在 `q_t>0` 的 human observed positive types 内重新归一化 `p_t` 后计算 CE，衡量 positive set 内部的概率分配；越低越好，需和 PosMass 一起解读。",
+        "- `Soft Precision`：`sum_{t in P(scene)} p_t`，其中 `P(scene)={t | q_t>0}`；衡量预测概率有多少落在 GT positive types 上，越高越好。它等价于此前 report 里的 `PosMass`。",
+        "- `Soft Recall@card(P)`：令 `P={t | q_t>0}`，取 `p_t` 最高的前 `|P|` 个 type，并把这些 type 覆盖到的 GT 概率质量相加，即 `sum_{t in Top-|P|(p)} q_t`；越高越好。",
+        "- `Soft-label CE / NLL`：`-sum_t q_t log(p_t)`，衡量模型给 human observed 分布的 likelihood；越低越好。",
+        "- `Positive-set CE`：只在 `q_t>0` 的 human observed positive types 内重新归一化 `p_t` 后计算 CE，衡量 positive set 内部的概率分配；越低越好，需和 SoftPrecision 一起解读。",
         "- `CE@eps`：用不同 `eps` 对 `p_t` 做 log 前下限裁剪后计算 CE，用于诊断平均 CE 对 `p_t≈0` 的敏感性；越低越好。",
         "- `Distribution L1 / TVD`：`sum_t |p_t-q_t|` 和其一半，直观表示概率质量错配量；越低越好。",
         "- `JS divergence`：对称、有界的分布距离，对 `p_t` 很小的情况比 KL 更稳定；越低越好。",
         "- `Positive probability mass`：`sum_{t in P(scene)} p_t`，衡量模型把多少概率放到 human observed positive types 上；越高越好。",
+        "- `Positive-set Recall@|P|`：令 `P={t | q_t>0}`，取 `p_t` 最高的前 `|P|` 个 type，统计其中覆盖了多少 GT positive types；越高越好，更接近“数据里出现过的 type 是否都被提出来”。",
         "- `Per-type signed bias / under / over`：分别统计 `p_t-q_t`、`max(q_t-p_t,0)`、`max(p_t-q_t,0)`，用于发现某一类是否系统性低估或高估。",
         "- `Rank agreement`：Spearman、Kendall、top-1 match、top-2 overlap，衡量五类排序是否接近 `q_t`，对 top-heavy allocator 更敏感。",
         "",
         "### Train/Test 主汇总",
-        "| split | avg | N | CE | KL | PosCE | CE@1e-6 | CE@1e-3 | L1 | TVD | JS | PosMass | Spearman | Kendall | Top1 | Top2 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| split | avg | N | KL | SoftPrec | SoftRec@card(P) | CE | PosCE | CE@1e-6 | CE@1e-3 | L1 | TVD | JS | PosMass | PosR@card(P) | Spearman | Kendall | Top1 | Top2 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     wanted = [row for row in summary_rows if row["group_name"] in {"scene_micro", "object_macro"} and row["group_value"] in {"train", "test"}]
     for row in wanted:
         lines.append(
             f"| {row['group_value']} | {row['group_name']} | {row['pose_class_num']} | "
-            f"{format_float(row.get('soft_label_ce'))} | {format_float(row.get('kl_q_p'))} | "
+            f"{format_float(row.get('kl_q_p'))} | {format_float(row.get('soft_precision'))} | "
+            f"{format_float(row.get('soft_recall_at_positive_num'))} | "
+            f"{format_float(row.get('soft_label_ce'))} | "
             f"{format_float(row.get('positive_set_ce'))} | {format_float(row.get(ce_eps_key(1e-6)))} | "
             f"{format_float(row.get(ce_eps_key(1e-3)))} | "
             f"{format_float(row.get('distribution_l1'))} | {format_float(row.get('tvd'))} | "
             f"{format_float(row.get('js_divergence'))} | {format_float(row.get('positive_probability_mass'))} | "
+            f"{format_float(row.get('positive_set_recall_at_positive_num'))} | "
             f"{format_float(row.get('spearman'))} | {format_float(row.get('kendall'))} | "
             f"{format_float(row.get('top1_match'))} | {format_float(row.get('top2_overlap'))} |"
         )
@@ -1932,8 +1998,8 @@ def scale_anchor_baseline_report_lines(
         f"- baseline summary CSV: `{os.path.join(output_dir, 'evaluation_human_scale_anchor_baseline_summary.csv')}`",
         "",
         "### Baseline vs Model（test）",
-        "| method | avg | N | CE | KL | PosCE | CE@1e-6 | CE@1e-3 | L1 | TVD | JS | PosMass | Spearman | Kendall | Top1 | Top2 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| method | avg | N | KL | SoftPrec | SoftRec@card(P) | CE | PosCE | CE@1e-6 | CE@1e-3 | L1 | TVD | JS | PosMass | PosR@card(P) | Spearman | Kendall | Top1 | Top2 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     model_test_rows = [row for row in model_metric_rows if str(row.get("split", "")) == "test"]
     compare_rows = []
@@ -1946,11 +2012,14 @@ def scale_anchor_baseline_report_lines(
     for method, row in compare_rows:
         lines.append(
             f"| {method} | {row['group_name']} | {row['pose_class_num']} | "
-            f"{format_float(row.get('soft_label_ce'))} | {format_float(row.get('kl_q_p'))} | "
+            f"{format_float(row.get('kl_q_p'))} | {format_float(row.get('soft_precision'))} | "
+            f"{format_float(row.get('soft_recall_at_positive_num'))} | "
+            f"{format_float(row.get('soft_label_ce'))} | "
             f"{format_float(row.get('positive_set_ce'))} | {format_float(row.get(ce_eps_key(1e-6)))} | "
             f"{format_float(row.get(ce_eps_key(1e-3)))} | "
             f"{format_float(row.get('distribution_l1'))} | {format_float(row.get('tvd'))} | "
             f"{format_float(row.get('js_divergence'))} | {format_float(row.get('positive_probability_mass'))} | "
+            f"{format_float(row.get('positive_set_recall_at_positive_num'))} | "
             f"{format_float(row.get('spearman'))} | {format_float(row.get('kendall'))} | "
             f"{format_float(row.get('top1_match'))} | {format_float(row.get('top2_overlap'))} |"
         )
@@ -2575,7 +2644,7 @@ def task_evaluate(config) -> None:
     report.add_section(
         "结论使用边界",
         [
-            "- 1A 的 `q_t` 来自 human observed count distribution，不是 closed-world feasibility，也不是 BimanBODex 下游最优 utility。",
+            "- 1A 的 `q_t` 来自 human observed count distribution，不是下游最优 utility。",
             "- 1B 没有 label，只能诊断 score 与三维 canonical point-cloud 尺寸的关系、稳定性和 human-to-DGN 分布差异。",
             "- 最终 allocator 是否有效仍需要固定总 budget 下的 BimanBODex + Bench paired downstream evaluation 验证。",
         ],

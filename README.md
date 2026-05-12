@@ -185,6 +185,37 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiHierar 
 # e.g.: CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME>
 ```
 
+Human Prior training mode can be switched with `algo.training.mode`:
+
+```bash
+# 1. two independent from-scratch runs: <EXP_NAME>_diffusion and <EXP_NAME>_type
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME> \
+  algo.training.mode=independent_from_scratch
+
+# 1b. only train the faster type-predictor branch
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME> \
+  algo.training.mode=independent_from_scratch \
+  algo.training.independent.run=type
+
+# 1c. only train the diffusion branch
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME> \
+  algo.training.mode=independent_from_scratch \
+  algo.training.independent.run=diffusion
+
+# 2. one shared model, joint single-stage training
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME> \
+  algo.training.mode=joint_single_stage
+
+# 3. Stage 1 diffusion only, Stage 2 frozen-encoder type-head training
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiHierar data=humanMulti exp_name=<EXP_NAME> \
+  algo.training.mode=two_stage_diffusion_then_frozen_type_head
+```
+
 ### Sample
 
 ```bash
@@ -249,6 +280,18 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=evaluate algo=humanMultiHier
 python dexlearn/main.py \
     task=evaluate algo=humanMultiHierar data=humanMulti test_data=humanMulti \
     exp_name=debug26 ckpt=010000 wandb.mode=disabled
+```
+
+### Diffusion Eval
+
+Evaluate saved human diffusion wrist-pose samples on `humanMulti` using
+record-level recall plus index-MCP-to-object-surface sanity metrics. Run
+`task=sample` first; this task does not generate samples.
+
+```bash
+python dexlearn/main.py \
+    task=diffusion_eval algo=humanMultiHierar data=humanMulti test_data=humanMulti \
+    exp_name=<EXP_NAME> ckpt=<CKPT> wandb.mode=disabled
 ```
 
 ### Scene Budget

@@ -1968,7 +1968,7 @@ def build_human_visualization_indices_by_split(sample_records, grasp_type_names,
 
 
 def human_object_score_summary(human_index, object_id: str, scene_path_resolver):
-    """Aggregate human feasibility/type-score outputs for one object.
+    """Aggregate human CE type-prior score outputs for one object.
 
     Args:
         human_index: Human visualization index from
@@ -2062,7 +2062,7 @@ def format_score_vector_text(scores: np.ndarray, grasp_type_names) -> str:
 
 
 def format_score_array_text(scores: np.ndarray) -> str:
-    """Format ordered feasibility scores as a compact array string.
+    """Format ordered CE type-prior scores as a compact array string.
 
     Args:
         scores: Real-type score vector aligned with type ids ``1..5``.

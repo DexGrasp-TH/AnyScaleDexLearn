@@ -6,7 +6,7 @@ num_points: 1024
 
 preload_point_clouds: True
 # Sample every explicit human prior type by default for fixed-type pose evaluation.
-# Override with ["0_any"] when exporting feasibility scores only.
+# Override with ["0_any"] when exporting type-prior scores only.
 grasp_type_lst: ["1_right_two", "2_right_three", "3_right_full", "4_both_three", "5_both_full"]
 pc_centering: True
 

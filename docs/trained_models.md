@@ -569,3 +569,43 @@ to describe intentional differences from previous runs.
 - Key Features:
   - integrated_stage1_diffusion_encoder_10000iter_save2500_loss_diffusion1_loss_type0.005_record_uniform_soft_labels
 - Notes: 
+## humanMulti_humanMultiHierar_debug63_stage2
+- Timestamp: `2026-05-12 15:22:51`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - integrated_stage2_frozen_stage1_encoder_train_yaml_configured_continued_type_head_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug64
+- Timestamp: `2026-05-12 15:40:59`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - debug64_reset_type_head_from_debug63_stage1_frozen_encoder_300iter_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug65_type
+- Timestamp: `2026-05-12 16:24:38`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `10000`
+- Key Features:
+  - independent_from_scratch_type_only_shared_arch_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug65_stage1
+- Timestamp: `2026-05-12 16:42:08`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `10000`
+- Key Features:
+  - integrated_stage1_diffusion_encoder_10000iter_save2500_loss_diffusion1_loss_type0.005_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug65_diffusion
+- Timestamp: `2026-05-12 16:48:18`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `10000`
+- Key Features:
+  - independent_from_scratch_diffusion_only_shared_arch_10000iter_record_uniform_soft_labels
+- Notes: 

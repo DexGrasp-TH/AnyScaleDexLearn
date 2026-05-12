@@ -1,6 +1,5 @@
 from .base import BaseModel
 from .hierarchical import (
-    HierarchicalFeasibilityModel,
     HierarchicalModel,
     HierarchicalTypeCEModel,
     HierarchicalTypeObjectiveModel,

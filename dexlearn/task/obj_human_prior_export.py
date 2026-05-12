@@ -313,13 +313,9 @@ def score_semantics_from_config(config: DictConfig) -> str:
         Human-readable score semantics for the manifest.
     """
     objective = str(getattr(config.algo.model, "type_objective", "ce")).lower()
-    if objective == "ce":
-        return "softmax_probability"
-    if objective == "object_bce":
-        return "sigmoid_compatibility"
-    if objective == "scene_ranking":
-        return "ranking_compatibility"
-    return f"model_score:{objective}"
+    if objective != "ce":
+        raise ValueError("Human prior export only supports CE type scores")
+    return "softmax_probability"
 
 
 def scene_split_for_record(object_id: str, fallback_split: str, split_lookup: dict[str, str]) -> str:

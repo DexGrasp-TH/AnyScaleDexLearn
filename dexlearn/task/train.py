@@ -195,6 +195,9 @@ def _summarize_model_features(config: DictConfig) -> str:
     train_type_only = OmegaConf.select(config, "algo.model.train_type_only")
     if train_type_only is not None:
         parts.append(f"train_type_only={bool(train_type_only)}")
+    training_mode = OmegaConf.select(config, "algo.training.mode")
+    if training_mode is not None:
+        parts.append(f"training_mode={training_mode}")
     type_balance_enabled = OmegaConf.select(config, "algo.supervision.balancing.enabled")
     if type_balance_enabled is not None:
         sampler_alpha = OmegaConf.select(config, "algo.supervision.balancing.sampler.alpha")
@@ -410,6 +413,118 @@ def _two_stage_stage1_type_loss(config: DictConfig) -> float:
     return float(OmegaConf.select(config, "algo.two_stage.stage1.loss_type", default=0.0))
 
 
+def _training_mode(config: DictConfig) -> str:
+    """Resolve and validate the high-level training mode.
+
+    Args:
+        config: Hydra config containing the optional ``algo.training.mode``.
+
+    Returns:
+        Normalized training mode string.
+    """
+    mode = str(
+        OmegaConf.select(
+            config,
+            "algo.training.mode",
+            default="legacy_shared_encoder_two_stage",
+        )
+    ).strip()
+    supported_modes = {
+        "legacy_shared_encoder_two_stage",
+        "independent_from_scratch",
+        "joint_single_stage",
+        "two_stage_diffusion_then_frozen_type_head",
+    }
+    if mode not in supported_modes:
+        raise ValueError(f"Unsupported algo.training.mode={mode}. Expected one of {sorted(supported_modes)}")
+    return mode
+
+
+def _build_independent_from_scratch_config(
+    config: DictConfig,
+    branch_name: str,
+    exp_name: str,
+) -> DictConfig:
+    """Create one branch config for the independent from-scratch route.
+
+    Args:
+        config: User-provided base config.
+        branch_name: Either ``diffusion`` or ``type``.
+        exp_name: Concrete experiment name for this independent branch.
+
+    Returns:
+        Deep-copied config mutated for one independent run.
+    """
+    branch_config = copy.deepcopy(config)
+    _set_exp_name(branch_config, exp_name)
+    branch_config.algo.two_stage.enabled = False
+    branch_config.ckpt = None
+    branch_config.resume = False
+    branch_config.wandb.resume = False
+
+    branch_schedule = OmegaConf.select(branch_config, f"algo.training.independent.{branch_name}")
+    if branch_schedule is None:
+        raise ValueError(f"Missing algo.training.independent.{branch_name} config")
+    branch_config.algo.max_iter = int(branch_schedule.max_iter)
+    branch_config.algo.save_every = int(branch_schedule.save_every)
+    branch_config.algo.val_every = int(branch_schedule.val_every)
+    branch_config.algo.lr = float(branch_schedule.lr)
+    branch_config.algo.lr_min = float(branch_schedule.lr_min)
+
+    if branch_name == "diffusion":
+        branch_config.algo.model.train_type_only = False
+        branch_config.algo.loss_weight.loss_diffusion = 1.0
+        branch_config.algo.loss_weight.loss_type = 0.0
+        branch_config.algo.freeze.backbone = False
+        branch_config.algo.freeze.type_classifier = True
+        branch_config.algo.freeze.grasp_type_emb = False
+        branch_config.algo.freeze.output_head = False
+        branch_config.model_registry.key_features = (
+            "independent_from_scratch_diffusion_only_shared_arch_"
+            f"{branch_config.algo.max_iter}iter_record_uniform_soft_labels"
+        )
+        return branch_config
+
+    if branch_name == "type":
+        branch_config.algo.model.train_type_only = True
+        branch_config.algo.loss_weight.loss_diffusion = 0.0
+        branch_config.algo.loss_weight.loss_type = 1.0
+        branch_config.algo.freeze.backbone = False
+        branch_config.algo.freeze.type_classifier = False
+        branch_config.algo.freeze.grasp_type_emb = True
+        branch_config.algo.freeze.output_head = True
+        branch_config.model_registry.key_features = (
+            "independent_from_scratch_type_only_shared_arch_"
+            f"{branch_config.algo.max_iter}iter_record_uniform_soft_labels"
+        )
+        return branch_config
+
+    raise ValueError(f"Unsupported independent branch_name={branch_name}")
+
+
+def _independent_from_scratch_branches(config: DictConfig) -> list[str]:
+    """Resolve which independent branches should run in this launch.
+
+    Args:
+        config: Hydra config containing ``algo.training.independent.run``.
+
+    Returns:
+        Ordered branch list. ``both`` runs ``type`` first because it is the
+        faster branch to inspect before launching the slower diffusion run.
+    """
+    run_mode = str(
+        OmegaConf.select(config, "algo.training.independent.run", default="both")
+    ).strip()
+    if run_mode == "both":
+        return ["type", "diffusion"]
+    if run_mode in {"type", "diffusion"}:
+        return [run_mode]
+    raise ValueError(
+        f"Unsupported algo.training.independent.run={run_mode}. "
+        "Expected one of ['both', 'type', 'diffusion']"
+    )
+
+
 def _build_two_stage_config(
     config: DictConfig,
     stage_name: str,
@@ -485,15 +600,21 @@ def _build_two_stage_config(
     raise ValueError(f"Unsupported two-stage stage_name={stage_name}")
 
 
-def _task_train_two_stage(config: DictConfig) -> None:
+def _task_train_two_stage(config: DictConfig, stage1_loss_type_override: float | None = None) -> None:
     """Run Stage 1 and Stage 2 sequentially from one task=train launch.
 
     Args:
         config: User-provided base Hydra config with ``algo.two_stage.enabled``.
+        stage1_loss_type_override: Optional override for the Stage 1 type loss.
+            ``0.0`` reproduces the pure-diffusion Stage 1 route.
 
     Returns:
         None.
     """
+    if stage1_loss_type_override is not None:
+        config = copy.deepcopy(config)
+        config.algo.two_stage.stage1.loss_type = float(stage1_loss_type_override)
+
     base_exp_name = str(config.exp_name)
     stage1_exp_name = _stage_exp_name(base_exp_name, config.algo.two_stage.stage1.exp_suffix)
     stage2_exp_name = _stage_exp_name(base_exp_name, config.algo.two_stage.stage2.exp_suffix)
@@ -517,6 +638,32 @@ def _task_train_two_stage(config: DictConfig) -> None:
     )
     _task_train_single(stage2_config)
     wandb.finish()
+
+
+def _task_train_independent_from_scratch(config: DictConfig) -> None:
+    """Train diffusion and type models independently from scratch.
+
+    Args:
+        config: User-provided base config. This route ignores ``config.ckpt``
+            and launches two fresh runs with separate experiment names.
+
+    Returns:
+        None.
+    """
+    base_exp_name = str(config.exp_name)
+    diffusion_suffix = OmegaConf.select(config, "algo.training.independent.diffusion_exp_suffix", default="diffusion")
+    type_suffix = OmegaConf.select(config, "algo.training.independent.type_exp_suffix", default="type")
+    exp_name_by_branch = {
+        "diffusion": _stage_exp_name(base_exp_name, diffusion_suffix),
+        "type": _stage_exp_name(base_exp_name, type_suffix),
+    }
+
+    for branch_name in _independent_from_scratch_branches(config):
+        branch_exp_name = exp_name_by_branch[branch_name]
+        print(f"Independent-from-scratch mode: {branch_name} exp_name={branch_exp_name}")
+        branch_config = _build_independent_from_scratch_config(config, branch_name, branch_exp_name)
+        _task_train_single(branch_config)
+        wandb.finish()
 
 
 def _task_train_single(config: DictConfig):
@@ -693,7 +840,7 @@ def _task_train_single(config: DictConfig):
 
 
 def task_train(config: DictConfig):
-    """Run training, optionally using the integrated two-stage Human Prior flow.
+    """Run training according to the configured Human Prior training mode.
 
     Args:
         config: Full Hydra config for ``task=train``.
@@ -701,7 +848,38 @@ def task_train(config: DictConfig):
     Returns:
         None.
     """
-    if bool(OmegaConf.select(config, "algo.two_stage.enabled", default=False)):
-        _task_train_two_stage(config)
+    mode = _training_mode(config)
+
+    if mode == "legacy_shared_encoder_two_stage":
+        if bool(OmegaConf.select(config, "algo.two_stage.enabled", default=False)):
+            _task_train_two_stage(config)
+            return
+        _task_train_single(config)
         return
-    _task_train_single(config)
+
+    if mode == "independent_from_scratch":
+        _task_train_independent_from_scratch(config)
+        return
+
+    if mode == "joint_single_stage":
+        config = copy.deepcopy(config)
+        config.algo.two_stage.enabled = False
+        config.algo.model.train_type_only = False
+        config.algo.freeze.backbone = False
+        config.algo.freeze.type_classifier = False
+        config.algo.freeze.grasp_type_emb = False
+        config.algo.freeze.output_head = False
+        if not OmegaConf.select(config, "model_registry.key_features"):
+            config.model_registry.key_features = (
+                "joint_single_stage_shared_encoder_type_and_diffusion_record_uniform_soft_labels"
+            )
+        _task_train_single(config)
+        return
+
+    if mode == "two_stage_diffusion_then_frozen_type_head":
+        config = copy.deepcopy(config)
+        config.algo.two_stage.enabled = True
+        _task_train_two_stage(config, stage1_loss_type_override=0.0)
+        return
+
+    raise ValueError(f"Unhandled training mode: {mode}")

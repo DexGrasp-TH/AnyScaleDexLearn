@@ -6,28 +6,15 @@ TYPE_OBJECTIVE_ALIASES = {
     "scene_ce": "ce",
     "softmax": "ce",
     "softmax_ce": "ce",
-    "bce": "object_bce",
-    "feasibility": "object_bce",
-    "object_prior_bce": "object_bce",
-    "ranking": "scene_ranking",
-    "pairwise": "scene_ranking",
-    "sampled_negative": "scene_ranking",
 }
 
 TYPE_OBJECTIVE_DEFAULTS = {
     "ce": {"scope": "record", "negative_policy": "softmax"},
-    "object_bce": {"scope": "object", "negative_policy": "object_closed_world"},
-    "scene_ranking": {"scope": "record", "negative_policy": "sampled_ranking"},
 }
 
 VALID_TYPE_OBJECTIVES = set(TYPE_OBJECTIVE_DEFAULTS)
-VALID_SUPERVISION_SCOPES = {"record", "sequence", "object"}
-VALID_NEGATIVE_POLICIES = {
-    "softmax",
-    "open_world_positive_only",
-    "object_closed_world",
-    "sampled_ranking",
-}
+VALID_SUPERVISION_SCOPES = {"record", "sequence"}
+VALID_NEGATIVE_POLICIES = {"softmax"}
 
 
 def cfg_get(config, *keys, default=None):
@@ -102,8 +89,6 @@ def _infer_type_objective(config):
     data_type = str(OmegaConf.select(config, "data.dataset_type") or "")
     if data_type != "HumanMultiDexDataset":
         return None
-    if model_name == "HierarchicalFeasibilityModel":
-        return "object_bce"
     if model_name in {"HierarchicalModel", "HierarchicalTypeCEModel"}:
         return "ce"
     if model_name == "HierarchicalTypeObjectiveModel":
@@ -151,19 +136,8 @@ def resolve_type_supervision_config(config):
             f"Expected one of {sorted(VALID_NEGATIVE_POLICIES)}."
         )
 
-    if objective == "ce" and (scope not in {"record", "sequence"} or negative_policy != "softmax"):
+    if scope not in {"record", "sequence"} or negative_policy != "softmax":
         raise ValueError("type_objective=ce requires scope=record|sequence and negative_policy=softmax")
-    if objective == "object_bce" and (
-        scope != "object" or negative_policy not in {"open_world_positive_only", "object_closed_world"}
-    ):
-        raise ValueError(
-            "type_objective=object_bce requires scope=object and "
-            "negative_policy=open_world_positive_only|object_closed_world"
-        )
-    if objective == "scene_ranking" and (scope not in {"record", "sequence"} or negative_policy != "sampled_ranking"):
-        raise ValueError(
-            "type_objective=scene_ranking requires scope=record|sequence and negative_policy=sampled_ranking"
-        )
 
     with open_dict(supervision_cfg):
         supervision_cfg.scope = scope
@@ -172,11 +146,6 @@ def resolve_type_supervision_config(config):
         model_cfg.type_objective = objective
         model_cfg.supervision_scope = scope
         model_cfg.negative_policy = negative_policy
-        model_cfg.ranking_loss = cfg_get(supervision_cfg, "ranking.loss", default="logistic")
-        model_cfg.ranking_margin = float(cfg_get(supervision_cfg, "ranking.margin", default=1.0))
-        focal_gamma = cfg_get(supervision_cfg, "balancing.focal_gamma", default=None)
-        if focal_gamma is not None:
-            model_cfg.focal_gamma = float(focal_gamma)
     return config
 
 
@@ -198,7 +167,6 @@ def apply_type_supervision_to_data_config(config, data_config, mode):
 
     supervision_cfg = OmegaConf.select(config, "algo.supervision")
     balancing_cfg = OmegaConf.select(config, "algo.supervision.balancing")
-    ranking_cfg = OmegaConf.select(config, "algo.supervision.ranking")
     scope = cfg_get(supervision_cfg, "scope", default=TYPE_OBJECTIVE_DEFAULTS[objective]["scope"])
     negative_policy = cfg_get(
         supervision_cfg,
@@ -209,15 +177,6 @@ def apply_type_supervision_to_data_config(config, data_config, mode):
     _set_top_level(data_config, "type_objective", objective)
     _set_top_level(data_config, "supervision_scope", scope)
     _set_top_level(data_config, "negative_policy", negative_policy)
-    _set_top_level(data_config, "feasibility_enabled", objective == "object_bce")
-    _set_top_level(
-        data_config,
-        "feasibility_label_mode",
-        "closed_world_object_complete" if negative_policy == "object_closed_world" else "open_world_positive_only",
-    )
-    _set_top_level(data_config, "ranking_enabled", objective == "scene_ranking")
-    _set_top_level(data_config, "ranking_negatives_per_positive", int(cfg_get(ranking_cfg, "negatives_per_positive", default=4)))
-    _set_top_level(data_config, "ranking_negative_sampling", cfg_get(ranking_cfg, "negative_sampling", default="uniform"))
 
     if balancing_cfg is not None:
         balancing_enabled = bool(cfg_get(balancing_cfg, "enabled", default=False))
@@ -270,8 +229,6 @@ def flatten_multidex_data_config(config):
         "augmentation.pc_noise.clip_multiplier": "pc_noise_clip_multiplier",
         "augmentation.point_dropout.enabled": "point_dropout_aug",
         "augmentation.point_dropout.ratio": "point_dropout_ratio",
-        "feasibility.enabled": "feasibility_enabled",
-        "feasibility.label_mode": "feasibility_label_mode",
         "type_balancing.enabled": "type_balancing_enabled",
         "type_balancing.sampler.enabled": "type_sampler_enabled",
         "type_balancing.sampler.alpha": "type_sampler_alpha",

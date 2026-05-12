@@ -10,9 +10,46 @@ val_num: 10
 save_every: 2500
 grad_clip: 10.0
 
+training:
+  # Explicit high-level training route for Human Prior experiments.
+  #
+  # - legacy_shared_encoder_two_stage:
+  #     Keep the previous default route. Stage 1 and Stage 2 are controlled by
+  #     `algo.two_stage.*`, and Stage 1 may include a weak type loss.
+  # - independent_from_scratch:
+  #     Launch two fresh runs with separate experiment names:
+  #     `<exp>_diffusion` and `<exp>_type`.
+  # - joint_single_stage:
+  #     Train type prediction and wrist diffusion jointly inside one model and
+  #     one stage, without Stage 1 / Stage 2 splitting.
+  # - two_stage_diffusion_then_frozen_type_head:
+  #     Reuse `algo.two_stage.*` scheduling, but force Stage 1 to train
+  #     diffusion only and Stage 2 to reset / train the frozen-encoder type
+  #     predictor.
+  mode: independent_from_scratch
+  independent:
+    # both | type | diffusion
+    # `both` runs `type` first because it is much faster to inspect.
+    run: both
+    diffusion_exp_suffix: diffusion
+    type_exp_suffix: type
+    type:
+      max_iter: 300
+      save_every: 50
+      val_every: 50
+      lr: 0.001
+      lr_min: 0.0001
+    diffusion:
+      max_iter: 10000
+      save_every: 2500
+      val_every: 2500
+      lr: 0.001
+      lr_min: 0.0001
+
 two_stage:
   # When enabled, task=train runs Stage 1 and Stage 2 sequentially inside one
-  # python process. Disable this for legacy single-stage training.
+  # python process. `algo.training.mode=two_stage_diffusion_then_frozen_type_head`
+  # also reuses this schedule, but forces `stage1.loss_type=0`.
   enabled: true
   stage1:
     exp_suffix: stage1
@@ -54,10 +91,7 @@ freeze:
 
 model:
   name: HierarchicalTypeObjectiveModel
-  # ce | object_bce | scene_ranking
-  # Example:
-  #   python dexlearn/main.py task=train data=humanMulti algo=humanMultiHierar \
-  #     algo.model.type_objective=scene_ranking
+  # Type prediction is trained with 5-real-type softmax CE only.
   type_objective: ce
   # When true, train only the point-cloud backbone and grasp-type predictor.
   # Diffusion pose generation loss is skipped, which is useful for fast
@@ -91,10 +125,7 @@ model:
       loss_type: l1
  
 supervision:
-  # auto resolves from algo.model.type_objective:
-  #   ce -> record + 5-real-type softmax
-  #   object_bce -> object + object_closed_world
-  #   scene_ranking -> record + sampled_ranking
+  # auto resolves CE supervision to record-level 5-real-type softmax labels.
   scope: auto
   negative_policy: auto
   balancing:
@@ -109,12 +140,6 @@ supervision:
       # Keep this weak when sampler balancing is enabled to avoid double-counting rare types.
       beta: 0.25
       reference: sampler # sampler or data
-    focal_gamma:
-  ranking:
-    negatives_per_positive: 4
-    negative_sampling: uniform # uniform or inverse_frequency
-    loss: logistic # logistic, bpr, or margin
-    margin: 1.0
 
 loss_weight:
   loss_diffusion: 1.0

@@ -34,10 +34,6 @@ augmentation:
     enabled: true
     scale: 0.001
 
-feasibility:
-  enabled: false
-  label_mode: open_world_positive_only
-
 type_balancing:
   # Analyze the real train split and use it for mild grasp-type balancing.
   enabled: true
