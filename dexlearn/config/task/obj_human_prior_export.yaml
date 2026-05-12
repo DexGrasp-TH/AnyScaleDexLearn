@@ -21,6 +21,15 @@ samples_per_type: 20
 output_dir:
 quat_norm_tol: 0.001
 
+# Optional independent-network export inputs. When these are left empty, one
+# checkpoint from the top-level exp_name/ckpt is used for both type scores and
+# pose generation. For independent_from_scratch runs, set score_* to the
+# *_type branch and pose_* to the *_diffusion branch.
+score_exp_name:
+score_ckpt:
+pose_exp_name:
+pose_ckpt:
+
 # Reusing completed scene files is important for long exports that may be
 # interrupted. A scene is skipped only when its existing .npy file passes the
 # current shape, field, and quaternion checks.

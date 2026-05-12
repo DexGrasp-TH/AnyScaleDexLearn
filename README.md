@@ -218,11 +218,53 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
 
 ### Sample
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<EXP_NAME>
+For the default `algo.training.mode=independent_from_scratch`, diffusion poses
+and grasp-type scores are saved by two different runs. If the base experiment
+name is `<EXP_NAME>`, use `<EXP_NAME>_diffusion` for wrist/index-MCP pose
+sampling and `<EXP_NAME>_type` for Human Prior grasp-type score sampling.
 
-# e.g,: CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanMulti algo=humanMultiHierar test_data=DGNMulti exp_name=<EXP_NAME>
-# e.g,: CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti exp_name=<EXP_NAME>
+```bash
+# 1. Sample typed wrist/index-MCP poses from the diffusion checkpoint.
+# humanMultiHierar defaults to test_grasp_num=100, test_topk=20, and
+# algo.sample_selection.mode=pose_diversity.
+OMP_NUM_THREADS=4 python dexlearn/main.py \
+  task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti \
+  exp_name=<EXP_NAME>_diffusion ckpt=007500 device=cuda:0 \
+  'test_data.grasp_type_lst=["1_right_two","2_right_three","3_right_full","4_both_three","5_both_full"]'
+
+# Optional pose candidate selection overrides:
+#   algo.sample_selection.mode=prob            # legacy log-prob top-20
+#   algo.sample_selection.mode=random          # random 20 from 100 candidates
+#   algo.sample_selection.mode=pose_diversity  # default diverse 20 from 100
+
+# 2. Sample grasp-type scores from the type checkpoint.
+OMP_NUM_THREADS=4 python dexlearn/main.py \
+  task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti \
+  exp_name=<EXP_NAME>_type ckpt=000300 device=cuda:0 \
+  algo.model.train_type_only=true \
+  'test_data.grasp_type_lst=["0_any"]'
+```
+
+For multi-GPU batch sampling, run the helper once for poses and once for scores
+because the diffusion and type checkpoints usually use different step numbers.
+
+```bash
+# Typed pose samples.
+OMP_NUM_THREADS=4 python dexlearn/scripts/launch_multi_sample.py \
+  --exp-names <EXP_NAME>_diffusion \
+  --ckpt 010000 \
+  --gpus 0 1 2 3 \
+  --test-datasets humanMulti \
+  --sample-kinds pose
+
+# Grasp-type score samples.
+OMP_NUM_THREADS=4 python dexlearn/scripts/launch_multi_sample.py \
+  --exp-names <EXP_NAME>_type \
+  --ckpt 000300 \
+  --gpus 0 1 2 3 \
+  --test-datasets humanMulti \
+  --sample-kinds score \
+  --score-extra-overrides "algo.model.train_type_only=true"
 ```
 
 ### Object Human Prior Export
@@ -284,9 +326,11 @@ python dexlearn/main.py \
 
 ### Diffusion Eval
 
-Evaluate saved human diffusion wrist-pose samples on `humanMulti` using
+Evaluate saved human diffusion index-MCP pose samples on `humanMulti` using
 record-level recall plus index-MCP-to-object-surface sanity metrics. Run
-`task=sample` first; this task does not generate samples.
+`task=sample` first; this task does not generate samples or run MANO recovery.
+Translation metrics use saved/generated index-MCP positions; rotation metrics
+use saved/generated wrist quaternions.
 
 ```bash
 python dexlearn/main.py \

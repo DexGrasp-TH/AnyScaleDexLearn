@@ -70,8 +70,19 @@ two_stage:
     lr: 0.001
     lr_min: 0.0001
 
-test_grasp_num: 20
+# Generate a larger candidate pool first, then keep `test_topk` candidates
+# according to `sample_selection.mode`.
+test_grasp_num: 100
 test_topk: 20
+
+sample_selection:
+  # prob: preserve the legacy behavior and keep the highest-log-prob samples.
+  # random: keep a random subset from the generated candidate pool.
+  # pose_diversity: seed with the highest-log-prob sample, then greedily add
+  #   candidates that maximize pose-space distance to the selected set.
+  mode: pose_diversity
+  translation_scale_m: 0.05
+  rotation_weight: 1.0
 
 ckpt_load:
   # When true, resume optimizer state from ckpt. Disable for finetuning runs

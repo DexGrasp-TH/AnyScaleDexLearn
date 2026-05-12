@@ -1,10 +1,11 @@
-# Intrinsic evaluation for human diffusion wrist-pose samples.
+# Intrinsic evaluation for human diffusion index-MCP pose samples.
 #
 # This task reads saved `task=sample` human results and compares generated
-# wrist poses against GT human grasps from the requested human split(s).
+# index-MCP positions and wrist rotations against GT human grasps from the
+# requested human split(s).
 # It focuses on:
-# - record-level recall: whether the unique GT wrist pose is covered by the
-#   generated wrist-pose set for the same scene and grasp type
+# - record-level recall: whether the unique GT index-MCP/wrist-rotation pose is
+#   covered by the generated pose set for the same scene and grasp type
 # - generated index-MCP-to-object-surface distance as a sanity check
 #
 # Default result path:
@@ -21,7 +22,7 @@ human_results_dataset: humanMulti
 output_dir:
 report_md:
 
-# GT human splits used to rebuild reference wrist-pose sets.
+# GT human splits used to rebuild reference pose sets.
 human_splits: [test]
 
 # Empty means evaluate all real grasp types 1..5.
@@ -31,14 +32,24 @@ grasp_types:
 max_scene_type_groups: 0
 
 # A GT record is counted as recalled if at least one generated sample is inside
-# both thresholds.
-match_translation_threshold_m: 0.03
-match_rotation_threshold_deg: 20.0
+# both thresholds for the same grasp type.
+match_thresholds_by_grasp_type:
+  right_two:
+    translation_m: 0.03
+    rotation_deg: 30.0
+  right_three:
+    translation_m: 0.03
+    rotation_deg: 30.0
+  right_full:
+    translation_m: 0.03
+    rotation_deg: 30.0
+  both_three:
+    translation_m: 0.03
+    rotation_deg: 30.0
+  both_full:
+    translation_m: 0.05
+    rotation_deg: 45.0
 
 # Optional point cap for index-MCP-to-surface distance lookup. Non-positive
 # values keep all object points.
 surface_max_points: 8192
-
-# MANO assets used only when generated samples were saved with
-# `grasp_pose` and need conversion to wrist / index-MCP positions.
-mano_root: third_party/manopth/mano/models

@@ -10,7 +10,7 @@ preload_point_clouds: True
 grasp_type_lst: ["1_right_two", "2_right_three", "3_right_full", "4_both_three", "5_both_full"]
 pc_centering: True
 
-object_path: ${data_folder}/object/DGN_2k
+object_path: ${data_folder}/object/DGN_5k
 split_path: valid_split   # relative to object_path
 
 pc_source: complete   # 'partial' for partial_pc**.npy, 'complete' for processed_data/<obj>/complete_point_cloud.npy

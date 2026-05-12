@@ -109,7 +109,8 @@ class HumanMultiDexDataset(Dataset):
 
     def _init_train_eval(self, mode):
 
-        split_name = "test" if mode == "eval" else "train"
+        split_name = self._resolve_train_eval_split_name(mode)
+        self.split_name = split_name
         self.mano_pose_dim = 24 if "GRAB" in self.config.grasp_path else 45
         self.obj_id_lst = load_json(pjoin(self.config.object_path, self.config.split_path, f"{split_name}.json"))
 
@@ -132,7 +133,28 @@ class HumanMultiDexDataset(Dataset):
         if self.train_sampling_unit == "posed_object_uniform":
             self._validate_pose_group_sampling_index()
         self.data_num = self.record_data_num
-        print(f"mode: {mode}, grasp data num: {self.data_num}, sampling unit: {self.train_sampling_unit}")
+        print(
+            f"mode: {mode}, split: {split_name}, grasp data num: {self.data_num}, "
+            f"sampling unit: {self.train_sampling_unit}"
+        )
+
+    def _resolve_train_eval_split_name(self, mode):
+        """Resolve the object split file used by train/eval indexing.
+
+        Args:
+            mode: Dataset mode passed by the dataloader builder. ``train``
+                reads the configured train split, and ``eval`` keeps the
+                validation/test split.
+
+        Returns:
+            Split name without the ``.json`` suffix.
+        """
+        if mode == "eval":
+            return "test"
+        split_name = str(getattr(self.config, "train_split", "train")).strip()
+        if split_name not in {"train", "all"}:
+            raise ValueError(f"Unsupported human train_split={split_name}. Expected 'train' or 'all'.")
+        return split_name
 
     def _index_grasp_type_distribution(self):
         """Index train/eval grasp paths by grasp type and object.
@@ -373,7 +395,7 @@ class HumanMultiDexDataset(Dataset):
             configured = str(configured)
             return configured if configured else None
         dataset_root = os.path.dirname(str(self.config.object_path).rstrip(os.sep))
-        split_name = "test" if self.mode == "eval" else self.mode
+        split_name = getattr(self, "split_name", "test" if self.mode == "eval" else self.mode)
         return pjoin(dataset_root, "human_prior_pose_groups", f"{split_name}.csv")
 
     def _write_pose_group_cache(self):
@@ -416,7 +438,7 @@ class HumanMultiDexDataset(Dataset):
                         counts = group["type_counts"].astype(int).tolist()
                         writer.writerow(
                             {
-                                "split": "test" if self.mode == "eval" else self.mode,
+                                "split": getattr(self, "split_name", "test" if self.mode == "eval" else self.mode),
                                 "object_id": group["object_id"],
                                 "pose_index": group["pose_index"],
                                 "member_sequences": "|".join(group["member_sequences"]),
@@ -489,6 +511,7 @@ class HumanMultiDexDataset(Dataset):
         }
         return {
             "mode": self.mode,
+            "split_name": str(getattr(self, "split_name", "")),
             "data_num": int(self.data_num),
             "record_data_num": int(getattr(self, "record_data_num", self.data_num)),
             "object_num": int(len(self.obj_id_lst)) if hasattr(self, "obj_id_lst") else 0,

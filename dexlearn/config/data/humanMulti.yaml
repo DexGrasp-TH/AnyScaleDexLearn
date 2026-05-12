@@ -23,6 +23,9 @@ point_cloud:
   random_pc_across_sequences: false
 
 sampling:
+  # Training object split loaded from paths.split_path. Use "all" when
+  # training Human Prior on the full human dataset via all.json.
+  train_split: train
   # record_uniform matches the empirical record distribution. object_uniform
   # first samples canonical objects uniformly, then records within each object.
   # posed_object_uniform first samples canonical objects uniformly, then posed

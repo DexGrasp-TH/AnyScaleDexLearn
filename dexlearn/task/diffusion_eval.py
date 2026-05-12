@@ -1,17 +1,17 @@
 import math
 import os
+from time import perf_counter
 from copy import deepcopy
 from glob import glob
 from typing import Any
 
 import numpy as np
 from omegaconf import DictConfig
-import torch
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as SciR
+from tqdm import tqdm
 
 from dexlearn.dataset.grasp_types import GRASP_TYPES
-from dexlearn.dataset.human_multidex import FIXED_LEFT_HAND_ROT, FIXED_LEFT_HAND_TRANS
 from dexlearn.task.evaluate import (
     EPS,
     MarkdownReport,
@@ -32,13 +32,34 @@ from dexlearn.task.evaluate import (
     scene_parts_from_result,
     sequence_id_from_grasp,
 )
-from dexlearn.task.human_prior_format import build_mano_layers, infer_positions_from_pose, split_grasp_pose
 
 
 REAL_TYPE_IDS = tuple(range(1, len(GRASP_TYPES)))
 REAL_TYPE_NAMES = tuple(GRASP_TYPES[type_id] for type_id in REAL_TYPE_IDS)
 MIRROR_X = np.diag([-1.0, 1.0, 1.0]).astype(np.float32)
 FIXED_LEFT_QUAT_WXYZ = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+DEFAULT_MATCH_THRESHOLDS_BY_GRASP_TYPE = {
+    1: (0.03, 30.0),
+    2: (0.03, 30.0),
+    3: (0.03, 30.0),
+    4: (0.03, 30.0),
+    5: (0.05, 45.0),
+}
+
+
+def tqdm_progress(iterable: Any, desc: str, total: int | None = None, unit: str = "it") -> Any:
+    """Wrap an iterable with a consistent tqdm progress bar.
+
+    Args:
+        iterable: Iterable object to wrap.
+        desc: Short progress-bar label shown in the terminal.
+        total: Optional item count. When omitted, tqdm infers it if possible.
+        unit: Unit label printed by tqdm.
+
+    Returns:
+        Iterable that yields the same values while displaying progress.
+    """
+    return tqdm(iterable, desc=desc, total=total, unit=unit, dynamic_ncols=True)
 
 
 def normalize_quaternions(quat: np.ndarray) -> np.ndarray:
@@ -139,6 +160,92 @@ def normalize_grasp_type_filter(values: Any) -> list[int]:
     return sorted(set(normalized))
 
 
+def grasp_type_id_from_value(value: Any) -> int:
+    """Normalize one grasp type identifier to its integer id.
+
+    Args:
+        value: Grasp type id, full name such as ``1_right_two``, or short name
+            such as ``right_two``.
+
+    Returns:
+        Integer real grasp type id.
+    """
+    if isinstance(value, (int, np.integer)):
+        type_id = int(value)
+    else:
+        text = str(value).strip()
+        if text.isdigit():
+            type_id = int(text)
+        elif text in GRASP_TYPES:
+            type_id = GRASP_TYPES.index(text)
+        else:
+            matching_ids = [type_id for type_id in REAL_TYPE_IDS if GRASP_TYPES[type_id].split("_", 1)[1] == text]
+            if not matching_ids:
+                raise ValueError(f"Unsupported grasp type identifier: {value}")
+            type_id = int(matching_ids[0])
+    if type_id not in REAL_TYPE_IDS:
+        raise ValueError(f"Expected real grasp type id in {REAL_TYPE_IDS}, got {type_id}")
+    return type_id
+
+
+def resolve_match_thresholds_by_grasp_type(task_cfg: Any) -> dict[int, dict[str, float]]:
+    """Resolve record-recall thresholds for each real grasp type.
+
+    Args:
+        task_cfg: Task-level Hydra config containing optional scalar legacy
+            thresholds and optional ``match_thresholds_by_grasp_type`` overrides.
+
+    Returns:
+        Mapping from grasp type id to translation and rotation thresholds.
+    """
+    thresholds = {
+        type_id: {"translation_m": float(trans), "rotation_deg": float(rot)}
+        for type_id, (trans, rot) in DEFAULT_MATCH_THRESHOLDS_BY_GRASP_TYPE.items()
+    }
+    configured = getattr(task_cfg, "match_thresholds_by_grasp_type", None)
+    if configured is None:
+        legacy_trans = getattr(task_cfg, "match_translation_threshold_m", None)
+        legacy_rot = getattr(task_cfg, "match_rotation_threshold_deg", None)
+        if legacy_trans is not None or legacy_rot is not None:
+            for type_id in REAL_TYPE_IDS:
+                if legacy_trans is not None:
+                    thresholds[type_id]["translation_m"] = float(legacy_trans)
+                if legacy_rot is not None:
+                    thresholds[type_id]["rotation_deg"] = float(legacy_rot)
+        return thresholds
+
+    for key, value in configured.items():
+        type_id = grasp_type_id_from_value(key)
+        if not hasattr(value, "get"):
+            raise ValueError(f"Threshold override for {key!r} must be a mapping.")
+        trans = value.get("translation_m", value.get("match_translation_threshold_m", value.get("translation_threshold_m", None)))
+        rot = value.get("rotation_deg", value.get("match_rotation_threshold_deg", value.get("rotation_threshold_deg", None)))
+        if trans is not None:
+            thresholds[type_id]["translation_m"] = float(trans)
+        if rot is not None:
+            thresholds[type_id]["rotation_deg"] = float(rot)
+    return thresholds
+
+
+def format_match_thresholds_by_grasp_type(thresholds: dict[int, dict[str, float]]) -> str:
+    """Format per-grasp-type thresholds for human-readable reports.
+
+    Args:
+        thresholds: Mapping returned by ``resolve_match_thresholds_by_grasp_type``.
+
+    Returns:
+        Compact string that lists translation and rotation thresholds by type.
+    """
+    parts = []
+    for type_id in REAL_TYPE_IDS:
+        type_thresholds = thresholds[type_id]
+        parts.append(
+            f"{GRASP_TYPES[type_id]}<={type_thresholds['translation_m']:.3f}m/"
+            f"{type_thresholds['rotation_deg']:.1f}deg"
+        )
+    return ", ".join(parts)
+
+
 def infer_human_grasp_type_and_mirror(grasp_data: dict) -> tuple[int, bool]:
     """Infer grasp type id and whether the sample is mirrored to right-only form.
 
@@ -170,79 +277,95 @@ def infer_human_grasp_type_and_mirror(grasp_data: dict) -> tuple[int, bool]:
     return grasp_type_id, bool(has_left and not has_right)
 
 
-def extract_gt_wrist_pose(grasp_data: dict, mirrored: bool) -> tuple[np.ndarray, np.ndarray]:
-    """Extract GT wrist positions and quaternions in world coordinates.
+def extract_gt_pose_fields(grasp_data: dict, mirrored: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Extract GT index-MCP positions and wrist quaternions in world coordinates.
 
     Args:
         grasp_data: Raw formatted human grasp dictionary.
         mirrored: Whether a left-only grasp should be mirrored to right-only.
 
     Returns:
-        Tuple ``(wrist_pos, wrist_quat)`` with shapes ``(2, 3)`` and ``(2, 4)``.
+        Tuple ``(index_mcp_pos, wrist_quat)`` with shapes ``(2, 3)`` and ``(2, 4)``.
     """
-    wrist_pos = np.zeros((2, 3), dtype=np.float32)
+    index_mcp_pos = np.zeros((2, 3), dtype=np.float32)
     wrist_quat = np.zeros((2, 4), dtype=np.float32)
-    wrist_pos[1] = FIXED_LEFT_HAND_TRANS.astype(np.float32)
     wrist_quat[1] = FIXED_LEFT_QUAT_WXYZ
 
     if not mirrored:
         for hand_idx, side in enumerate(("right", "left")):
             hand_data = grasp_data.get("hand", {}).get(side)
             if hand_data:
-                wrist_pos[hand_idx] = np.asarray(hand_data["trans"], dtype=np.float32)
+                if "index_mcp_pos" not in hand_data:
+                    raise KeyError(f"GT hand '{side}' is missing index_mcp_pos.")
+                index_mcp_pos[hand_idx] = np.asarray(hand_data["index_mcp_pos"], dtype=np.float32)
                 rotmat = rotvec_to_rotmat(hand_data["rot"])
                 wrist_quat[hand_idx] = quat_wxyz_from_rotmat(rotmat)
             elif side == "right":
                 wrist_quat[hand_idx] = FIXED_LEFT_QUAT_WXYZ
-        return wrist_pos, normalize_quaternions(wrist_quat)
+        return index_mcp_pos, normalize_quaternions(wrist_quat)
 
     left_hand = grasp_data.get("hand", {}).get("left")
     if left_hand is None:
         raise ValueError("Mirrored grasp is missing left hand data.")
-    left_pos = np.asarray(left_hand["trans"], dtype=np.float32)
+    if "index_mcp_pos" not in left_hand:
+        raise KeyError("Mirrored GT left hand is missing index_mcp_pos.")
+    left_pos = np.asarray(left_hand["index_mcp_pos"], dtype=np.float32)
     left_rot = rotvec_to_rotmat(left_hand["rot"])
-    wrist_pos[0] = MIRROR_X @ left_pos
+    index_mcp_pos[0] = MIRROR_X @ left_pos
     wrist_quat[0] = quat_wxyz_from_rotmat(MIRROR_X @ left_rot @ MIRROR_X)
-    return wrist_pos, normalize_quaternions(wrist_quat)
+    return index_mcp_pos, normalize_quaternions(wrist_quat)
 
 
-def grasp_pose_to_pose_fields(
+def split_saved_grasp_pose(grasp_pose: np.ndarray) -> np.ndarray:
+    """Split a flat saved human pose into per-hand position/quaternion fields.
+
+    Args:
+        grasp_pose: Flat saved grasp pose shaped ``(7 * H,)``.
+
+    Returns:
+        Per-hand pose array shaped ``(H, 7)``.
+    """
+    pose = np.asarray(grasp_pose, dtype=np.float32).reshape(-1)
+    if pose.size == 0 or pose.size % 7 != 0:
+        raise ValueError(f"Expected grasp_pose to be non-empty and divisible by 7, got shape {np.shape(grasp_pose)}")
+    hand_num = pose.size // 7
+    if hand_num > 2:
+        raise ValueError(f"Unsupported hand count {hand_num} in grasp_pose with shape {np.shape(grasp_pose)}")
+    return pose.reshape(hand_num, 7)
+
+
+def saved_sample_to_pose_fields(
     grasp_pose: np.ndarray,
     grasp_pos_source: str,
-    mano_layers: dict | None,
-    device: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Convert one saved grasp-pose sample to wrist and index-MCP coordinates.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read index-MCP positions and wrist quaternions from one saved sample pose.
 
     Args:
         grasp_pose: Flat saved grasp pose shaped ``(7 * H,)``.
         grasp_pos_source: Position target convention used during sampling.
-        mano_layers: Optional MANO layer mapping for ``index_mcp`` conversion.
-        device: Torch device string used by MANO helpers.
 
     Returns:
-        Tuple ``(wrist_pos, wrist_quat, index_mcp_pos)`` with shapes
-        ``(H, 3)``, ``(H, 4)``, and ``(H, 3)``.
+        Tuple ``(index_mcp_pos, wrist_quat)`` with shapes ``(H, 3)`` and
+        ``(H, 4)``.
     """
-    hand_poses = split_grasp_pose(np.asarray(grasp_pose, dtype=np.float32))
+    hand_poses = split_saved_grasp_pose(np.asarray(grasp_pose, dtype=np.float32))
     grasp_pos_source = str(grasp_pos_source).strip().lower()
+    if grasp_pos_source != "index_mcp":
+        raise ValueError(
+            "diffusion_eval no longer runs MANO recovery; saved grasp_pose "
+            f"must use grasp_pos_source='index_mcp', got {grasp_pos_source!r}."
+        )
+    index_mcp_pos = hand_poses[:, :3]
     wrist_quat = normalize_quaternions(hand_poses[:, 3:7])
-    if mano_layers is None:
-        raise ValueError("MANO layers are required to recover index-MCP positions.")
-    wrist_pos, index_mcp_pos = infer_positions_from_pose(hand_poses, mano_layers, device, grasp_pos_source)
-    return (
-        wrist_pos.astype(np.float32, copy=False),
-        wrist_quat,
-        index_mcp_pos.astype(np.float32, copy=False),
-    )
+    return index_mcp_pos.astype(np.float32, copy=False), wrist_quat
 
 
 def translation_distance_matrix(a_pos: np.ndarray, b_pos: np.ndarray, hand_mask: np.ndarray) -> np.ndarray:
-    """Compute pairwise mean wrist translation distances between two pose sets.
+    """Compute pairwise mean index-MCP translation distances between two pose sets.
 
     Args:
-        a_pos: Wrist positions shaped ``(A, 2, 3)``.
-        b_pos: Wrist positions shaped ``(B, 2, 3)``.
+        a_pos: Index-MCP positions shaped ``(A, 2, 3)``.
+        b_pos: Index-MCP positions shaped ``(B, 2, 3)``.
         hand_mask: Boolean active-hand mask shaped ``(2,)``.
 
     Returns:
@@ -289,22 +412,6 @@ def pose_group_key(split: str, scene_key_value: str, grasp_type_id: int) -> tupl
         Hashable grouping tuple.
     """
     return str(split), str(scene_key_value), int(grasp_type_id)
-
-
-def resolve_eval_device(config: DictConfig) -> str:
-    """Choose a safe device for MANO-based evaluation-side pose recovery.
-
-    Args:
-        config: Full Hydra config.
-
-    Returns:
-        Device string. CUDA is used only when it is actually available.
-    """
-    device = str(getattr(config, "device", "cpu"))
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        print(f"[diffusion_eval] CUDA is unavailable; fall back to CPU for MANO pose recovery (requested {device}).")
-        return "cpu"
-    return device
 
 
 def pointcloud_source_from_path(pc_path: str) -> str:
@@ -411,7 +518,7 @@ def load_scene_object_points(
     max_points: int,
     cache: dict[tuple[str, str, int], np.ndarray],
 ) -> np.ndarray:
-    """Load the object point cloud in the same world frame as saved wrist poses.
+    """Load the object point cloud in the same world frame as saved poses.
 
     Args:
         scene_path: Saved scene-config path from the generated sample.
@@ -475,11 +582,14 @@ def compute_pose_to_surface_distances(
     return nearest.mean(axis=1)
 
 
-def load_generated_pose_groups(config: DictConfig) -> tuple[dict, dict]:
+def load_generated_pose_groups(config: DictConfig, pose_key_filter: set[tuple[str, str, int]] | None = None) -> tuple[dict, dict]:
     """Load saved diffusion samples grouped by split, scene, and grasp type.
 
     Args:
         config: Full Hydra config.
+        pose_key_filter: Optional group-key set that needs full wrist/index-MCP
+            pose fields. Groups outside the set are kept as metadata-only
+            entries so missing-GT reporting remains unchanged.
 
     Returns:
         Tuple ``(groups, metadata)`` where ``groups`` maps group keys to pose
@@ -492,16 +602,14 @@ def load_generated_pose_groups(config: DictConfig) -> tuple[dict, dict]:
 
     grasp_type_filter = set(normalize_grasp_type_filter(getattr(config.task, "grasp_types", None)))
     sample_paths = sorted(glob(os.path.join(results_dir, "**", "*.npy"), recursive=True), key=_natural_sort_key)
-    eval_device = resolve_eval_device(config)
-    mano_layers = None
-    mano_config = deepcopy(config)
-    mano_config.device = eval_device
     groups: dict[tuple[str, str, int], dict] = {}
+    skipped_pose_file_num = 0
 
-    for sample_path in sample_paths:
+    print(f"[diffusion_eval] Found {len(sample_paths)} generated sample files under {results_dir}")
+    for sample_path in tqdm_progress(sample_paths, desc="load generated samples", unit="file"):
         try:
             sample = np.load(sample_path, allow_pickle=True).item()
-            if "grasp_pose" not in sample:
+            if "grasp_pose" not in sample and ("index_mcp_pos" not in sample or "wrist_quat" not in sample):
                 continue
             grasp_type_raw = np.asarray(sample.get("grasp_type_id", -1)).reshape(-1)
             if grasp_type_raw.size == 0:
@@ -514,59 +622,50 @@ def load_generated_pose_groups(config: DictConfig) -> tuple[dict, dict]:
                 continue
             split = split_lookup.get(object_id, "")
             key = pose_group_key(split, scene_key(object_id, scene_id), grasp_type_id)
+            group = groups.setdefault(
+                key,
+                {
+                    "split": split,
+                    "scene_key": key[1],
+                    "object_id": object_id,
+                    "grasp_type_id": grasp_type_id,
+                    "grasp_type_name": GRASP_TYPES[grasp_type_id],
+                    "scene_path": str(sample.get("scene_path", "")),
+                    "pc_path": str(sample.get("pc_path", "")),
+                    "sample_paths": [],
+                    "wrist_quat": [],
+                    "index_mcp_pos": [],
+                    "grasp_error": [],
+                },
+            )
+            group["sample_paths"].append(sample_path)
+            if "grasp_error" in sample:
+                group["grasp_error"].append(float(np.asarray(sample["grasp_error"]).reshape(-1)[0]))
+
+            # Most generated groups do not have GT records in the requested
+            # split. Keep their metadata for missing-GT diagnostics, but avoid
+            # reading pose arrays because those poses are never scored.
+            if pose_key_filter is not None and key not in pose_key_filter:
+                continue
+
             grasp_pos_source = str(sample.get("grasp_pos_source", getattr(config.data, "hand_pos_source", "wrist")))
-            if "wrist_pos" in sample and "wrist_quat" in sample:
-                wrist_pos = np.asarray(sample["wrist_pos"], dtype=np.float32)
+            if "index_mcp_pos" in sample and "wrist_quat" in sample:
+                index_mcp_pos = np.asarray(sample["index_mcp_pos"], dtype=np.float32)
                 wrist_quat = normalize_quaternions(np.asarray(sample["wrist_quat"], dtype=np.float32))
-                if "index_mcp_pos" in sample:
-                    index_mcp_pos = np.asarray(sample["index_mcp_pos"], dtype=np.float32)
-                elif "grasp_pose" in sample:
-                    if mano_layers is None:
-                        mano_layers = build_mano_layers(mano_config)
-                    _, _, index_mcp_pos = grasp_pose_to_pose_fields(
-                        np.asarray(sample["grasp_pose"], dtype=np.float32),
-                        grasp_pos_source,
-                        mano_layers=mano_layers,
-                        device=eval_device,
-                    )
-                else:
-                    index_mcp_pos = np.full_like(wrist_pos, np.nan, dtype=np.float32)
-            else:
-                if mano_layers is None:
-                    mano_layers = build_mano_layers(mano_config)
-                wrist_pos, wrist_quat, index_mcp_pos = grasp_pose_to_pose_fields(
+            elif "grasp_pose" in sample:
+                index_mcp_pos, wrist_quat = saved_sample_to_pose_fields(
                     np.asarray(sample["grasp_pose"], dtype=np.float32),
                     grasp_pos_source,
-                    mano_layers=mano_layers,
-                    device=eval_device,
                 )
+            else:
+                raise KeyError("Generated sample must contain index_mcp_pos+wrist_quat or grasp_pose.")
         except Exception as exc:
             print(f"[diffusion_eval] Skip unreadable generated sample {sample_path}: {type(exc).__name__}: {exc}")
+            skipped_pose_file_num += 1
             continue
 
-        group = groups.setdefault(
-            key,
-            {
-                "split": split,
-                "scene_key": key[1],
-                "object_id": object_id,
-                "grasp_type_id": grasp_type_id,
-                "grasp_type_name": GRASP_TYPES[grasp_type_id],
-                "scene_path": str(sample.get("scene_path", "")),
-                "pc_path": str(sample.get("pc_path", "")),
-                "sample_paths": [],
-                "wrist_pos": [],
-                "wrist_quat": [],
-                "index_mcp_pos": [],
-                "grasp_error": [],
-            },
-        )
-        group["sample_paths"].append(sample_path)
-        group["wrist_pos"].append(wrist_pos.astype(np.float32, copy=False))
         group["wrist_quat"].append(wrist_quat.astype(np.float32, copy=False))
         group["index_mcp_pos"].append(index_mcp_pos.astype(np.float32, copy=False))
-        if "grasp_error" in sample:
-            group["grasp_error"].append(float(np.asarray(sample["grasp_error"]).reshape(-1)[0]))
 
     max_groups = int(getattr(config.task, "max_scene_type_groups", 0))
     ordered_items = sorted(groups.items(), key=lambda item: (item[0][0], _natural_sort_key(item[0][1]), item[0][2]))
@@ -574,26 +673,36 @@ def load_generated_pose_groups(config: DictConfig) -> tuple[dict, dict]:
         ordered_items = ordered_items[:max_groups]
 
     normalized_groups = {}
-    for key, group in ordered_items:
+    for key, group in tqdm_progress(ordered_items, desc="normalize generated groups", unit="group"):
+        has_pose = bool(group["index_mcp_pos"])
         normalized_groups[key] = {
             **group,
-            "wrist_pos": np.stack(group["wrist_pos"], axis=0).astype(np.float32),
-            "wrist_quat": normalize_quaternions(np.stack(group["wrist_quat"], axis=0)),
-            "index_mcp_pos": np.stack(group["index_mcp_pos"], axis=0).astype(np.float32),
+            "wrist_quat": (
+                normalize_quaternions(np.stack(group["wrist_quat"], axis=0))
+                if has_pose
+                else np.empty((0, 2, 4), dtype=np.float32)
+            ),
+            "index_mcp_pos": (
+                np.stack(group["index_mcp_pos"], axis=0).astype(np.float32)
+                if has_pose
+                else np.empty((0, 2, 3), dtype=np.float32)
+            ),
             "grasp_error_mean": float(np.mean(group["grasp_error"])) if group["grasp_error"] else None,
+            "pose_recovered": int(has_pose),
         }
 
     metadata = {
         "results_dir": results_dir,
         "grasp_type_filter": [GRASP_TYPES[type_id] for type_id in sorted(grasp_type_filter)],
         "raw_sample_file_num": int(len(sample_paths)),
+        "skipped_pose_file_num": int(skipped_pose_file_num),
         "scene_type_group_num": int(len(normalized_groups)),
     }
     return normalized_groups, metadata
 
 
 def load_gt_pose_groups(config: DictConfig) -> tuple[dict, dict]:
-    """Load GT human wrist poses grouped by split, scene, and grasp type.
+    """Load GT human index-MCP positions and wrist rotations by scene/type.
 
     Args:
         config: Full Hydra config.
@@ -608,13 +717,14 @@ def load_gt_pose_groups(config: DictConfig) -> tuple[dict, dict]:
     requested_splits = [str(split) for split in _as_list(getattr(config.task, "human_splits", ["test"]))]
     groups: dict[tuple[str, str, int], dict] = {}
 
-    for _, (grasp_root, object_root) in enumerate(iter_human_roots(data_config)):
+    for root_index, (grasp_root, object_root) in enumerate(iter_human_roots(data_config)):
         for split in requested_splits:
             split_json = os.path.join(object_root, split_path, f"{split}.json")
             if not os.path.isfile(split_json):
                 continue
             object_ids = sorted(_load_json(split_json), key=_natural_sort_key)
-            for object_id_raw in object_ids:
+            desc = f"load GT grasps root{root_index}:{split}"
+            for object_id_raw in tqdm_progress(object_ids, desc=desc, unit="object"):
                 object_id = canonical_object_id(object_id_raw)
                 grasp_paths = sorted(
                     glob(os.path.join(grasp_root, str(object_id_raw), "**", "*.npy"), recursive=True),
@@ -627,7 +737,7 @@ def load_gt_pose_groups(config: DictConfig) -> tuple[dict, dict]:
                         if grasp_type_id not in grasp_type_filter:
                             continue
                         scene_key_value = scene_key(object_id, sequence_id_from_grasp(grasp_data, grasp_path))
-                        wrist_pos, wrist_quat = extract_gt_wrist_pose(grasp_data, mirrored)
+                        index_mcp_pos, wrist_quat = extract_gt_pose_fields(grasp_data, mirrored)
                     except Exception as exc:
                         print(f"[diffusion_eval] Skip unreadable GT grasp {grasp_path}: {type(exc).__name__}: {exc}")
                         continue
@@ -642,19 +752,19 @@ def load_gt_pose_groups(config: DictConfig) -> tuple[dict, dict]:
                             "grasp_type_id": grasp_type_id,
                             "grasp_type_name": GRASP_TYPES[grasp_type_id],
                             "grasp_paths": [],
-                            "wrist_pos": [],
+                            "index_mcp_pos": [],
                             "wrist_quat": [],
                         },
                     )
                     group["grasp_paths"].append(os.path.abspath(grasp_path))
-                    group["wrist_pos"].append(wrist_pos.astype(np.float32, copy=False))
+                    group["index_mcp_pos"].append(index_mcp_pos.astype(np.float32, copy=False))
                     group["wrist_quat"].append(wrist_quat.astype(np.float32, copy=False))
 
     normalized_groups = {}
     for key, group in sorted(groups.items(), key=lambda item: (item[0][0], _natural_sort_key(item[0][1]), item[0][2])):
         normalized_groups[key] = {
             **group,
-            "wrist_pos": np.stack(group["wrist_pos"], axis=0).astype(np.float32),
+            "index_mcp_pos": np.stack(group["index_mcp_pos"], axis=0).astype(np.float32),
             "wrist_quat": normalize_quaternions(np.stack(group["wrist_quat"], axis=0)),
         }
 
@@ -756,13 +866,15 @@ def build_record_match_rows(
     match_rotation_threshold_deg: float,
     surface_metrics: dict,
 ) -> list[dict]:
-    """Evaluate whether each GT record is covered by the generated wrist poses.
+    """Evaluate whether each GT record is covered by the generated pose set.
 
     Args:
         generated_group: Generated pose group dictionary.
         gt_group: GT pose group dictionary.
-        match_translation_threshold_m: Translation threshold for record recall.
-        match_rotation_threshold_deg: Rotation threshold for record recall.
+        match_translation_threshold_m: Type-specific index-MCP translation
+            threshold for record recall.
+        match_rotation_threshold_deg: Type-specific rotation threshold for
+            record recall.
         surface_metrics: Optional generated-group surface-distance metrics.
 
     Returns:
@@ -770,10 +882,12 @@ def build_record_match_rows(
     """
     grasp_type_id = int(generated_group["grasp_type_id"])
     hand_mask = active_hand_mask(grasp_type_id)
-    gen_pos = np.asarray(generated_group["wrist_pos"], dtype=np.float32)
+    gen_pos = np.asarray(generated_group["index_mcp_pos"], dtype=np.float32)
     gen_quat = np.asarray(generated_group["wrist_quat"], dtype=np.float32)
-    gt_pos = np.asarray(gt_group["wrist_pos"], dtype=np.float32)
+    gt_pos = np.asarray(gt_group["index_mcp_pos"], dtype=np.float32)
     gt_quat = np.asarray(gt_group["wrist_quat"], dtype=np.float32)
+    if gen_pos.shape[0] == 0:
+        raise ValueError(f"Generated group {generated_group['scene_key']} / {generated_group['grasp_type_name']} has no pose fields.")
 
     trans = translation_distance_matrix(gen_pos, gt_pos, hand_mask)
     rot = rotation_distance_matrix_deg(gen_quat, gt_quat, hand_mask)
@@ -794,6 +908,8 @@ def build_record_match_rows(
                 "generated_sample_num": int(gen_pos.shape[0]),
                 "matched_sample_num": int(matched_indices.size),
                 "record_recall": float(matched_indices.size > 0),
+                "match_translation_threshold_m": float(match_translation_threshold_m),
+                "match_rotation_threshold_deg": float(match_rotation_threshold_deg),
                 "nn_generated_index": best_gen_index,
                 "nn_trans_m": float(trans[best_gen_index, gt_index]),
                 "nn_rot_deg": float(rot[best_gen_index, gt_index]),
@@ -824,6 +940,8 @@ def aggregate_metric_rows(rows: list[dict]) -> list[dict]:
     metric_keys = [
         "record_recall",
         "matched_sample_num",
+        "match_translation_threshold_m",
+        "match_rotation_threshold_deg",
         "nn_trans_m",
         "nn_rot_deg",
         "nn_index_mcp_surface_m",
@@ -847,6 +965,9 @@ def aggregate_metric_rows(rows: list[dict]) -> list[dict]:
         }
         for key in metric_keys:
             summary[key] = metric_mean(group_rows, key)
+        if grasp_type_name == "all":
+            summary["match_translation_threshold_m"] = None
+            summary["match_rotation_threshold_deg"] = None
         summary_rows.append(summary)
     return summary_rows
 
@@ -906,30 +1027,45 @@ def build_report_lines(config: DictConfig, metadata: dict, metric_rows: list[dic
                 f"- gt scene/type groups: {metadata['gt']['scene_type_group_num']}",
                 f"- evaluated GT records: {len(metric_rows)}",
                 f"- grasp_types: {', '.join(metadata['generated']['grasp_type_filter'])}",
-                f"- match thresholds: trans<={float(config.task.match_translation_threshold_m):.4f} m, rot<={float(config.task.match_rotation_threshold_deg):.2f} deg",
+                f"- match thresholds by grasp type: {metadata['match_thresholds_by_grasp_type_text']}",
                 f"- surface_max_points: {int(getattr(config.task, 'surface_max_points', 8192))}",
             ],
         )
     )
+    profile = metadata.get("profile", {})
+    if profile:
+        sections.append(
+            (
+                "耗时",
+                [
+                    f"- {name}: {float(seconds):.2f}s"
+                    for name, seconds in profile.items()
+                    if isinstance(seconds, (int, float))
+                ],
+            )
+        )
     sections.append(
         (
             "指标定义",
             [
-                "- `record_recall`: 对每一个 GT record，检查该 scene/type 下生成的 wrist pose 集合中，是否至少有一个样本同时满足 translation 与 rotation 阈值。",
+                "- `record_recall`: 对每一个 GT record，检查该 scene/type 下生成的 index-MCP / wrist-rotation pose 集合中，是否至少有一个样本同时满足 translation 与 rotation 阈值。",
+                "- recall 阈值按 grasp type 单独定义；`1_right_two` 到 `4_both_three` 使用 3cm / 30deg，`5_both_full` 使用 5cm / 45deg，除非 config 显式覆盖。",
                 "- `matched_sample_num`: 对同一个 GT record，落入阈值窗口的生成样本个数；它不是 precision，只表示命中的候选数量。",
-                "- `nn_trans_m` / `nn_rot_deg`: 以阈值归一化后的联合最近邻为准，对应 GT record 最近的生成 wrist pose 与 GT 的距离。",
+                "- `nn_trans_m`: 按 grasp type 使用对应 active hand 与对应阈值归一化后选最近邻，再统计 index MCP translation 距离。",
+                "- `nn_rot_deg`: 按 grasp type 使用对应 active hand 与对应阈值归一化后选最近邻，再统计 wrist quaternion rotation geodesic 距离。",
                 "- `nn_index_mcp_surface_m`: 上述最近邻生成样本的 index MCP 到物体表面的最近距离，用于排除明显离物体太远的错误姿态。",
                 "- `index_mcp_surface_*`: 同一个 scene/type 的全部生成样本在 index MCP 到物体表面距离上的 min / mean / max，用于整体 sanity check。",
             ],
         )
     )
     lines = [
-        "| split | grasp_type | N | Recall | MatchedK | NN_t(m) | NN_r(deg) | NN_idx2surf(m) | SetMinSurf(m) | SetMeanSurf(m) |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| split | grasp_type | N | T_thr(m) | R_thr(deg) | Recall | MatchedK | NN_t(m) | NN_r(deg) | NN_idx2surf(m) | SetMinSurf(m) | SetMeanSurf(m) |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in summary_rows:
         lines.append(
             f"| {row['split']} | {row['grasp_type_name']} | {row['record_num']} | "
+            f"{format_float(row['match_translation_threshold_m'])} | {format_float(row['match_rotation_threshold_deg'])} | "
             f"{format_float(row['record_recall'])} | {format_float(row['matched_sample_num'])} | "
             f"{format_float(row['nn_trans_m'])} | {format_float(row['nn_rot_deg'])} | "
             f"{format_float(row['nn_index_mcp_surface_m'])} | {format_float(row['index_mcp_surface_min_m'])} | "
@@ -940,7 +1076,7 @@ def build_report_lines(config: DictConfig, metadata: dict, metric_rows: list[dic
 
 
 def task_diffusion_eval(config: DictConfig) -> None:
-    """Run intrinsic diffusion wrist-pose evaluation on saved human samples.
+    """Run intrinsic diffusion index-MCP pose evaluation on saved human samples.
 
     Args:
         config: Full Hydra config.
@@ -948,19 +1084,38 @@ def task_diffusion_eval(config: DictConfig) -> None:
     Returns:
         None.
     """
-    generated_groups, generated_meta = load_generated_pose_groups(config)
+    total_start = perf_counter()
+    profile: dict[str, float] = {}
+
+    stage_start = perf_counter()
     gt_groups, gt_meta = load_gt_pose_groups(config)
+    profile["load_gt_s"] = perf_counter() - stage_start
+
+    stage_start = perf_counter()
+    generated_groups, generated_meta = load_generated_pose_groups(config, pose_key_filter=set(gt_groups.keys()))
+    profile["load_generated_s"] = perf_counter() - stage_start
+
+    stage_start = perf_counter()
     output_dir = default_output_dir(config)
     os.makedirs(output_dir, exist_ok=True)
+    profile["init_output_s"] = perf_counter() - stage_start
 
-    match_translation_threshold_m = float(getattr(config.task, "match_translation_threshold_m", 0.03))
-    match_rotation_threshold_deg = float(getattr(config.task, "match_rotation_threshold_deg", 20.0))
+    match_thresholds_by_grasp_type = resolve_match_thresholds_by_grasp_type(config.task)
     max_surface_points = int(getattr(config.task, "surface_max_points", 8192))
 
     metric_rows = []
     missing_gt_rows = []
     object_points_cache: dict[tuple[str, str, int], np.ndarray] = {}
-    for key, generated_group in generated_groups.items():
+    surface_total_s = 0.0
+    match_total_s = 0.0
+    eval_start = perf_counter()
+    generated_items = list(generated_groups.items())
+    for key, generated_group in tqdm_progress(
+        generated_items,
+        desc="evaluate scene/type groups",
+        total=len(generated_items),
+        unit="group",
+    ):
         gt_group = gt_groups.get(key)
         if gt_group is None:
             missing_gt_rows.append(
@@ -974,18 +1129,25 @@ def task_diffusion_eval(config: DictConfig) -> None:
             )
             continue
 
+        surface_start = perf_counter()
         surface_metrics = build_group_surface_metrics(
             generated_group,
             object_points_cache=object_points_cache,
             max_surface_points=max_surface_points,
         )
+        surface_total_s += perf_counter() - surface_start
+
+        match_start = perf_counter()
+        grasp_type_id = int(generated_group["grasp_type_id"])
+        match_thresholds = match_thresholds_by_grasp_type[grasp_type_id]
         group_rows = build_record_match_rows(
             generated_group,
             gt_group,
-            match_translation_threshold_m=match_translation_threshold_m,
-            match_rotation_threshold_deg=match_rotation_threshold_deg,
+            match_translation_threshold_m=float(match_thresholds["translation_m"]),
+            match_rotation_threshold_deg=float(match_thresholds["rotation_deg"]),
             surface_metrics=surface_metrics,
         )
+        match_total_s += perf_counter() - match_start
         for row in group_rows:
             metric_rows.append(
                 {
@@ -994,18 +1156,23 @@ def task_diffusion_eval(config: DictConfig) -> None:
                 "object_id": generated_group["object_id"],
                 "grasp_type_id": int(generated_group["grasp_type_id"]),
                 "grasp_type_name": generated_group["grasp_type_name"],
-                "gt_sample_num": int(np.asarray(gt_group["wrist_pos"]).shape[0]),
+                "gt_sample_num": int(np.asarray(gt_group["index_mcp_pos"]).shape[0]),
                 "scene_path": generated_group["scene_path"],
                 "pc_path": generated_group["pc_path"],
                 "grasp_error_mean": generated_group["grasp_error_mean"],
                 **row,
                 }
             )
+    profile["evaluate_groups_s"] = perf_counter() - eval_start
+    profile["surface_distance_s"] = surface_total_s
+    profile["record_match_s"] = match_total_s
 
+    stage_start = perf_counter()
     metric_rows.sort(
         key=lambda row: (row["split"], _natural_sort_key(row["scene_key"]), row["grasp_type_id"], row["gt_record_index"])
     )
     summary_rows = aggregate_metric_rows(metric_rows)
+    profile["aggregate_s"] = perf_counter() - stage_start
 
     metric_csv = os.path.join(output_dir, "diffusion_eval_record_metrics.csv")
     summary_csv = os.path.join(output_dir, "diffusion_eval_summary.csv")
@@ -1013,9 +1180,12 @@ def task_diffusion_eval(config: DictConfig) -> None:
     metadata_json = os.path.join(output_dir, "diffusion_eval_metadata.json")
     report_md = _abs_path(getattr(config.task, "report_md", "")) or os.path.join(output_dir, "diffusion_eval_report.md")
 
+    stage_start = perf_counter()
     _write_csv(metric_rows, metric_csv)
     _write_csv(summary_rows, summary_csv)
     _write_csv(missing_gt_rows, missing_gt_csv)
+    profile["write_csv_s"] = perf_counter() - stage_start
+    profile["total_s"] = perf_counter() - total_start
     metadata = {
         "generated": generated_meta,
         "gt": gt_meta,
@@ -1024,12 +1194,27 @@ def task_diffusion_eval(config: DictConfig) -> None:
         "summary_csv": summary_csv,
         "missing_gt_csv": missing_gt_csv,
         "report_md": report_md,
+        "profile": profile,
+        "match_thresholds_by_grasp_type": {
+            GRASP_TYPES[type_id]: match_thresholds_by_grasp_type[type_id]
+            for type_id in REAL_TYPE_IDS
+        },
+        "match_thresholds_by_grasp_type_text": format_match_thresholds_by_grasp_type(match_thresholds_by_grasp_type),
     }
     _write_json(metadata, metadata_json)
 
+    stage_start = perf_counter()
     report = MarkdownReport(report_md, "DexLearn Diffusion Wrist Pose Evaluation")
     for title, lines in build_report_lines(config, metadata, metric_rows, summary_rows):
         report.add_section(title, lines)
+    profile["write_report_s"] = perf_counter() - stage_start
+    profile["total_s"] = perf_counter() - total_start
+    metadata["profile"] = profile
+    _write_json(metadata, metadata_json)
+
+    print("[diffusion_eval] Timing summary:")
+    for name, seconds in sorted(profile.items(), key=lambda item: item[1], reverse=True):
+        print(f"[diffusion_eval]   {name}: {seconds:.2f}s")
 
     print(f"[diffusion_eval] Wrote record metrics to {metric_csv}")
     print(f"[diffusion_eval] Wrote summary to {summary_csv}")

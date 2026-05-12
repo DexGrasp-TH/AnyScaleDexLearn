@@ -212,6 +212,7 @@ def flatten_multidex_data_config(config):
         "point_cloud.preload": "preload_point_clouds",
         "point_cloud.source": "pc_source",
         "point_cloud.random_pc_across_sequences": "random_pc_across_sequences",
+        "sampling.train_split": "train_split",
         "sampling.train_unit": "train_sampling_unit",
         "sampling.pose_group_soft_labels": "pose_group_soft_labels",
         "augmentation.pc_centering": "pc_centering",

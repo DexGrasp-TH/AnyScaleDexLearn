@@ -99,6 +99,32 @@ def resolve_checkpoint_path(config: DictConfig) -> str:
     raise FileNotFoundError(f"Could not resolve checkpoint from ckpt={config.ckpt}. Tried: {candidates}")
 
 
+def clone_config_for_checkpoint(
+    config: DictConfig,
+    exp_name: str | None,
+    ckpt: str | None,
+) -> DictConfig:
+    """Clone the Hydra config and optionally point it at another run checkpoint.
+
+    Args:
+        config: Base export config.
+        exp_name: Optional experiment name whose ``output/<wandb.id>/ckpts`` should be used.
+        ckpt: Optional checkpoint step or path for the cloned config.
+
+    Returns:
+        Config clone with ``exp_name``, ``wandb.id`` and ``ckpt`` updated when
+        overrides are provided.
+    """
+    branch_config = copy.deepcopy(config)
+    with open_dict(branch_config):
+        if exp_name is not None:
+            branch_config.exp_name = str(exp_name)
+            branch_config.wandb.id = f"{branch_config.data_name}_{branch_config.algo_name}_{branch_config.exp_name}"
+        if ckpt is not None:
+            branch_config.ckpt = str(ckpt)
+    return branch_config
+
+
 def load_export_model(config: DictConfig) -> tuple[torch.nn.Module, str, int | None]:
     """Instantiate the human prior model and load the requested checkpoint.
 
@@ -119,6 +145,50 @@ def load_export_model(config: DictConfig) -> tuple[torch.nn.Module, str, int | N
     model.eval()
     print(f"Loaded checkpoint from {checkpoint_path}")
     return model, checkpoint_path, checkpoint_iter
+
+
+def load_export_models(config: DictConfig) -> tuple[torch.nn.Module, torch.nn.Module, dict]:
+    """Load the score and pose models used by object human-prior export.
+
+    Args:
+        config: Full Hydra config. ``task.score_*`` and ``task.pose_*`` may
+            point to separate independent-network checkpoints.
+
+    Returns:
+        Tuple ``(score_model, pose_model, checkpoint_meta)``. The two models are
+        the same object when no independent checkpoint override is configured.
+    """
+    score_exp_name = getattr(config.task, "score_exp_name", None)
+    score_ckpt = getattr(config.task, "score_ckpt", None)
+    pose_exp_name = getattr(config.task, "pose_exp_name", None)
+    pose_ckpt = getattr(config.task, "pose_ckpt", None)
+    use_independent_models = any(value is not None for value in (score_exp_name, score_ckpt, pose_exp_name, pose_ckpt))
+
+    if not use_independent_models:
+        model, checkpoint_path, checkpoint_iter = load_export_model(config)
+        return model, model, {
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_iter": checkpoint_iter,
+            "score_checkpoint_path": checkpoint_path,
+            "score_checkpoint_iter": checkpoint_iter,
+            "pose_checkpoint_path": checkpoint_path,
+            "pose_checkpoint_iter": checkpoint_iter,
+            "uses_independent_models": False,
+        }
+
+    score_config = clone_config_for_checkpoint(config, score_exp_name, score_ckpt)
+    pose_config = clone_config_for_checkpoint(config, pose_exp_name, pose_ckpt)
+    score_model, score_checkpoint_path, score_checkpoint_iter = load_export_model(score_config)
+    pose_model, pose_checkpoint_path, pose_checkpoint_iter = load_export_model(pose_config)
+    return score_model, pose_model, {
+        "checkpoint_path": pose_checkpoint_path,
+        "checkpoint_iter": pose_checkpoint_iter,
+        "score_checkpoint_path": score_checkpoint_path,
+        "score_checkpoint_iter": score_checkpoint_iter,
+        "pose_checkpoint_path": pose_checkpoint_path,
+        "pose_checkpoint_iter": pose_checkpoint_iter,
+        "uses_independent_models": True,
+    }
 
 
 def clone_config_with_grasp_types(config: DictConfig, grasp_types: list[str], split_name: str) -> DictConfig:
@@ -600,7 +670,8 @@ def sample_fixed_types_from_features(
 
 def sample_scene_scores_and_fixed_type_poses(
     config: DictConfig,
-    model: torch.nn.Module,
+    score_model: torch.nn.Module,
+    pose_model: torch.nn.Module,
     split_lookup: dict[str, str],
     scene_dir: str,
     skip_scene_ids: set[str] | None = None,
@@ -609,7 +680,8 @@ def sample_scene_scores_and_fixed_type_poses(
 
     Args:
         config: Full Hydra config.
-        model: Loaded human prior model.
+        score_model: Loaded model used for grasp-type budget scores.
+        pose_model: Loaded model used for fixed-type hand-position proposals.
         split_lookup: Object id to split mapping for metadata.
         scene_dir: Root directory where per-scene files are saved.
         skip_scene_ids: Scene ids that already have a complete export.
@@ -641,14 +713,18 @@ def sample_scene_scores_and_fixed_type_poses(
             data = filter_batch_data(data, keep_indices, config)
             batch_metadata = [batch_metadata[index] for index in keep_indices]
 
-            global_feature, _ = model.backbone(data)
-            _, type_scores = model._compute_type_scores(global_feature)
+            score_global_feature, _ = score_model.backbone(data)
+            _, type_scores = score_model._compute_type_scores(score_global_feature)
             scores = extract_real_type_scores(type_scores)
+            if pose_model is score_model:
+                pose_global_feature = score_global_feature
+            else:
+                pose_global_feature, _ = pose_model.backbone(data)
             grasp_pose_tensor, log_prob_tensor, sampled_type_ids = sample_fixed_types_from_features(
                 config,
-                model,
+                pose_model,
                 data,
-                global_feature,
+                pose_global_feature,
                 samples_per_type,
             )
             grasp_pose_np = grasp_pose_tensor.detach().cpu().numpy().astype(np.float32)
@@ -1126,21 +1202,25 @@ def write_obj_human_prior_export(
     }
 
 
-def build_manifest(config: DictConfig, checkpoint_path: str, checkpoint_iter: int | None) -> dict:
+def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
     """Build export manifest metadata.
 
     Args:
         config: Full Hydra config.
-        checkpoint_path: Resolved checkpoint path.
-        checkpoint_iter: Iteration stored in the checkpoint, if available.
+        checkpoint_meta: Checkpoint metadata returned by ``load_export_models``.
 
     Returns:
         JSON-serializable manifest dictionary.
     """
     return {
         "task_name": "obj_human_prior_export",
-        "checkpoint_path": checkpoint_path,
-        "checkpoint_iter": checkpoint_iter,
+        "checkpoint_path": checkpoint_meta["checkpoint_path"],
+        "checkpoint_iter": checkpoint_meta["checkpoint_iter"],
+        "uses_independent_models": bool(checkpoint_meta["uses_independent_models"]),
+        "score_checkpoint_path": checkpoint_meta["score_checkpoint_path"],
+        "score_checkpoint_iter": checkpoint_meta["score_checkpoint_iter"],
+        "pose_checkpoint_path": checkpoint_meta["pose_checkpoint_path"],
+        "pose_checkpoint_iter": checkpoint_meta["pose_checkpoint_iter"],
         "model_name": str(config.algo.model.name),
         "type_objective": str(getattr(config.algo.model, "type_objective", "ce")),
         "score_semantics": score_semantics_from_config(config),
@@ -1175,8 +1255,8 @@ def task_obj_human_prior_export(config: DictConfig) -> None:
     if not bool(config.algo.human):
         raise ValueError("task=obj_human_prior_export expects a human prior model with algo.human=True")
 
-    model, checkpoint_path, checkpoint_iter = load_export_model(config)
-    output_dir = resolve_output_dir(config, checkpoint_iter)
+    score_model, pose_model, checkpoint_meta = load_export_models(config)
+    output_dir = resolve_output_dir(config, checkpoint_meta["checkpoint_iter"])
     skip_existing = bool(getattr(config.task, "skip_existing", True))
     skip_scene_ids = collect_complete_scene_ids(output_dir, config) if skip_existing else set()
     if skip_scene_ids:
@@ -1189,7 +1269,8 @@ def task_obj_human_prior_export(config: DictConfig) -> None:
     with torch.no_grad():
         score_lines, scene_index = sample_scene_scores_and_fixed_type_poses(
             config,
-            model,
+            score_model,
+            pose_model,
             split_lookup,
             scene_dir,
             skip_scene_ids=skip_scene_ids,
@@ -1199,7 +1280,7 @@ def task_obj_human_prior_export(config: DictConfig) -> None:
     if expected_count is not None and not skip_existing and expected_count != len(score_lines):
         raise RuntimeError(f"Expected {expected_count} scenes, but exported scores for {len(score_lines)} scenes")
 
-    manifest = build_manifest(config, checkpoint_path, checkpoint_iter)
+    manifest = build_manifest(config, checkpoint_meta)
     if expected_count is not None:
         manifest["expected_scene_count"] = expected_count
     manifest["skip_existing"] = skip_existing
