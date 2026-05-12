@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import textwrap
+import copy
 from datetime import datetime
 
 import torch
@@ -9,6 +10,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from tqdm import trange
+import wandb
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.utils.logger import Logger
@@ -21,6 +23,125 @@ from dexlearn.network.models import *
 def _maybe_cuda_sync(device: str, enabled: bool):
     if enabled and isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize(device)
+
+
+def _as_list(value) -> list:
+    """Convert optional Hydra list-like values to a plain Python list.
+
+    Args:
+        value: A scalar, list-like object, or ``None`` from Hydra config.
+
+    Returns:
+        Plain list. ``None`` returns an empty list.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def _load_model_state(model: torch.nn.Module, ckpt_state: dict, strict: bool, ignore_prefixes: list[str]) -> None:
+    """Load checkpoint weights with optional non-strict head replacement.
+
+    Args:
+        model: Model instance receiving weights.
+        ckpt_state: State dictionary from a checkpoint.
+        strict: Whether to require exact key and shape matches.
+        ignore_prefixes: Parameter/buffer prefixes to skip intentionally.
+
+    Returns:
+        None.
+    """
+    if strict and not ignore_prefixes:
+        model.load_state_dict(ckpt_state)
+        return
+
+    model_state = model.state_dict()
+    filtered_state = {}
+    skipped = []
+    for key, value in ckpt_state.items():
+        if any(key.startswith(prefix) for prefix in ignore_prefixes):
+            skipped.append(key)
+            continue
+        if key not in model_state:
+            skipped.append(key)
+            continue
+        if tuple(model_state[key].shape) != tuple(value.shape):
+            skipped.append(key)
+            continue
+        filtered_state[key] = value
+
+    load_result = model.load_state_dict(filtered_state, strict=False)
+    if skipped:
+        preview = ", ".join(skipped[:8])
+        suffix = "..." if len(skipped) > 8 else ""
+        print(f"Skipped {len(skipped)} checkpoint tensor(s): {preview}{suffix}")
+    if load_result.missing_keys:
+        preview = ", ".join(load_result.missing_keys[:8])
+        suffix = "..." if len(load_result.missing_keys) > 8 else ""
+        print(f"Missing {len(load_result.missing_keys)} model tensor(s) after load: {preview}{suffix}")
+    if load_result.unexpected_keys:
+        preview = ", ".join(load_result.unexpected_keys[:8])
+        suffix = "..." if len(load_result.unexpected_keys) > 8 else ""
+        print(f"Unexpected {len(load_result.unexpected_keys)} checkpoint tensor(s): {preview}{suffix}")
+
+
+def _freeze_named_module(model: torch.nn.Module, module_name: str) -> bool:
+    """Freeze one named top-level module when it exists.
+
+    Args:
+        model: Model containing the module.
+        module_name: Attribute name such as ``backbone`` or ``type_classifier``.
+
+    Returns:
+        ``True`` if the module exists and was frozen, otherwise ``False``.
+    """
+    module = getattr(model, module_name, None)
+    if module is None:
+        return False
+    module.requires_grad_(False)
+    module.eval()
+    return True
+
+
+def _apply_freeze_config(model: torch.nn.Module, config: DictConfig) -> list[str]:
+    """Apply configured module freezing.
+
+    Args:
+        model: Model whose top-level modules may be frozen.
+        config: Full Hydra config.
+
+    Returns:
+        Names of modules that were frozen.
+    """
+    freeze_cfg = OmegaConf.select(config, "algo.freeze")
+    if freeze_cfg is None:
+        return []
+
+    frozen = []
+    for module_name in ("backbone", "type_classifier", "grasp_type_emb", "output_head"):
+        if bool(getattr(freeze_cfg, module_name, False)) and _freeze_named_module(model, module_name):
+            frozen.append(module_name)
+    if frozen:
+        print(f"Frozen module(s): {', '.join(frozen)}")
+    return frozen
+
+
+def _keep_frozen_modules_eval(model: torch.nn.Module, frozen_modules: list[str]) -> None:
+    """Keep frozen modules in eval mode after calls to ``model.train()``.
+
+    Args:
+        model: Model containing frozen modules.
+        frozen_modules: Names returned by ``_apply_freeze_config``.
+
+    Returns:
+        None.
+    """
+    for module_name in frozen_modules:
+        module = getattr(model, module_name, None)
+        if module is not None:
+            module.eval()
 
 
 def _markdown_text(value) -> str:
@@ -71,6 +192,9 @@ def _summarize_model_features(config: DictConfig) -> str:
         scope = OmegaConf.select(config, "algo.supervision.scope")
         negative_policy = OmegaConf.select(config, "algo.supervision.negative_policy")
         parts.append(f"type_objective={type_objective}[scope={scope},negative={negative_policy}]")
+    train_type_only = OmegaConf.select(config, "algo.model.train_type_only")
+    if train_type_only is not None:
+        parts.append(f"train_type_only={bool(train_type_only)}")
     type_balance_enabled = OmegaConf.select(config, "algo.supervision.balancing.enabled")
     if type_balance_enabled is not None:
         sampler_alpha = OmegaConf.select(config, "algo.supervision.balancing.sampler.alpha")
@@ -191,7 +315,211 @@ def _append_model_registry_entry(config: DictConfig) -> None:
         f.write(entry)
 
 
-def task_train(config: DictConfig):
+def _run_id(config: DictConfig, exp_name: str) -> str:
+    """Build the canonical local run id for an experiment name.
+
+    Args:
+        config: Full Hydra config with data and algo names.
+        exp_name: Short experiment name, without data/algo prefixes.
+
+    Returns:
+        Run id used for local output directories.
+    """
+    return f"{config.data_name}_{config.algo_name}_{exp_name}"
+
+
+def _set_exp_name(
+    config: DictConfig,
+    exp_name: str,
+    output_exp_name: str | None = None,
+    ckpt_subdir: str | None = None,
+) -> None:
+    """Set the Hydra experiment name, wandb id, and optional local output id.
+
+    Args:
+        config: Full Hydra config to mutate for one training stage.
+        exp_name: Short experiment name, without data/algo prefixes.
+        output_exp_name: Optional short experiment name for local checkpoint
+            and sample directories. When omitted, ``exp_name`` is used.
+        ckpt_subdir: Optional checkpoint subdirectory under ``ckpts``.
+
+    Returns:
+        None.
+    """
+    config.exp_name = exp_name
+    config.wandb.id = _run_id(config, exp_name)
+    if output_exp_name is not None:
+        OmegaConf.update(config, "wandb.output_id", _run_id(config, output_exp_name), force_add=True)
+    if ckpt_subdir is not None:
+        OmegaConf.update(config, "wandb.ckpt_subdir", str(ckpt_subdir), force_add=True)
+
+
+def _format_ckpt_step(step_value) -> str:
+    """Format a checkpoint step value as the six-digit Logger filename token.
+
+    Args:
+        step_value: Integer-like checkpoint step from Hydra config.
+
+    Returns:
+        Six-digit string used in checkpoint filenames, such as ``010000``.
+    """
+    return str(int(step_value)).zfill(6)
+
+
+def _stage1_ckpt_path(config: DictConfig, output_exp_name: str) -> str:
+    """Build the Stage 1 checkpoint path consumed by Stage 2.
+
+    Args:
+        config: Full Hydra config containing output folder and two-stage config.
+        output_exp_name: Short experiment name for the shared local output dir.
+
+    Returns:
+        Relative or absolute checkpoint path for the configured Stage 1 step.
+    """
+    ckpt_step = _format_ckpt_step(config.algo.two_stage.stage1.ckpt_step)
+    return os.path.join(config.output_folder, _run_id(config, output_exp_name), "ckpts", "stage1", f"step_{ckpt_step}.pth")
+
+
+def _stage_exp_name(base_exp_name: str, suffix) -> str:
+    """Compose the concrete experiment name for one two-stage phase.
+
+    Args:
+        base_exp_name: User-provided experiment name.
+        suffix: Stage suffix from Hydra config. Empty suffix keeps the base
+            name unchanged.
+
+    Returns:
+        Concrete experiment name used by Logger and wandb.
+    """
+    suffix_text = "" if suffix is None else str(suffix).strip()
+    if not suffix_text:
+        return base_exp_name
+    return f"{base_exp_name}_{suffix_text}"
+
+
+def _two_stage_stage1_type_loss(config: DictConfig) -> float:
+    """Read the Stage 1 type-prior loss weight.
+
+    Args:
+        config: Hydra config containing ``algo.two_stage.stage1``.
+
+    Returns:
+        Floating-point Stage 1 type loss weight. A value less than or equal to
+        zero means Stage 1 does not train the type predictor.
+    """
+    return float(OmegaConf.select(config, "algo.two_stage.stage1.loss_type", default=0.0))
+
+
+def _build_two_stage_config(
+    config: DictConfig,
+    stage_name: str,
+    exp_name: str,
+    output_exp_name: str,
+    ckpt_path: str | None = None,
+) -> DictConfig:
+    """Create a stage-specific config for the integrated two-stage trainer.
+
+    Args:
+        config: User-provided base config.
+        stage_name: Either ``stage1`` or ``stage2``.
+        exp_name: Short experiment name for this stage's wandb/registry id.
+        output_exp_name: Short experiment name for the shared local output dir.
+        ckpt_path: Stage 1 checkpoint path for Stage 2, otherwise ``None``.
+
+    Returns:
+        A deep-copied and mutated config for one concrete training stage.
+    """
+    stage_config = copy.deepcopy(config)
+    _set_exp_name(stage_config, exp_name, output_exp_name=output_exp_name, ckpt_subdir=stage_name)
+    stage_config.algo.two_stage.enabled = False
+
+    if stage_name == "stage1":
+        stage1_loss_type = _two_stage_stage1_type_loss(stage_config)
+        stage1_loss_diffusion = float(
+            OmegaConf.select(stage_config, "algo.two_stage.stage1.loss_diffusion", default=1.0)
+        )
+        stage_config.ckpt = config.ckpt
+        stage_config.algo.model.train_type_only = False
+        stage_config.algo.loss_weight.loss_diffusion = stage1_loss_diffusion
+        stage_config.algo.loss_weight.loss_type = stage1_loss_type
+        stage_config.algo.freeze.type_classifier = stage1_loss_type <= 0.0
+        stage_config.algo.freeze.backbone = False
+        stage_config.algo.freeze.grasp_type_emb = False
+        stage_config.algo.freeze.output_head = False
+        stage_config.model_registry.key_features = (
+            f"integrated_stage1_diffusion_encoder_10000iter_save2500_"
+            f"loss_diffusion{stage1_loss_diffusion:g}_loss_type{stage1_loss_type:g}_"
+            "record_uniform_soft_labels"
+        )
+        return stage_config
+
+    if stage_name == "stage2":
+        if ckpt_path is None:
+            raise ValueError("Stage 2 requires a Stage 1 checkpoint path")
+        reset_type_head = _two_stage_stage1_type_loss(stage_config) <= 0.0
+        stage_config.ckpt = ckpt_path
+        stage_config.resume = False
+        stage_config.wandb.resume = False
+        stage_config.algo.model.train_type_only = True
+        stage_config.algo.loss_weight.loss_diffusion = 0.0
+        stage_config.algo.loss_weight.loss_type = 1.0
+        stage_config.algo.ckpt_load.load_optimizer = False
+        stage_config.algo.ckpt_load.reset_iter = True
+        stage_config.algo.ckpt_load.strict_model = not reset_type_head
+        stage_config.algo.ckpt_load.ignore_prefixes = ["type_classifier"] if reset_type_head else []
+        stage_config.algo.freeze.backbone = True
+        stage_config.algo.freeze.type_classifier = False
+        stage_config.algo.freeze.grasp_type_emb = True
+        stage_config.algo.freeze.output_head = True
+        stage_config.algo.max_iter = stage_config.algo.two_stage.stage2.max_iter
+        stage_config.algo.save_every = stage_config.algo.two_stage.stage2.save_every
+        stage_config.algo.val_every = stage_config.algo.two_stage.stage2.val_every
+        stage_config.algo.lr = stage_config.algo.two_stage.stage2.lr
+        stage_config.algo.lr_min = stage_config.algo.two_stage.stage2.lr_min
+        stage_config.model_registry.key_features = (
+            "integrated_stage2_frozen_stage1_encoder_train_yaml_configured_"
+            f"{'reset' if reset_type_head else 'continued'}_type_head_record_uniform_soft_labels"
+        )
+        return stage_config
+
+    raise ValueError(f"Unsupported two-stage stage_name={stage_name}")
+
+
+def _task_train_two_stage(config: DictConfig) -> None:
+    """Run Stage 1 and Stage 2 sequentially from one task=train launch.
+
+    Args:
+        config: User-provided base Hydra config with ``algo.two_stage.enabled``.
+
+    Returns:
+        None.
+    """
+    base_exp_name = str(config.exp_name)
+    stage1_exp_name = _stage_exp_name(base_exp_name, config.algo.two_stage.stage1.exp_suffix)
+    stage2_exp_name = _stage_exp_name(base_exp_name, config.algo.two_stage.stage2.exp_suffix)
+    ckpt_path = _stage1_ckpt_path(config, base_exp_name)
+
+    print(f"Two-stage training enabled: Stage 1 exp_name={stage1_exp_name}, output_exp_name={base_exp_name}")
+    stage1_config = _build_two_stage_config(config, "stage1", stage1_exp_name, output_exp_name=base_exp_name)
+    _task_train_single(stage1_config)
+    wandb.finish()
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Stage 1 checkpoint not found for Stage 2: {ckpt_path}")
+
+    print(f"Two-stage training enabled: Stage 2 exp_name={stage2_exp_name}, output_exp_name={base_exp_name}, ckpt={ckpt_path}")
+    stage2_config = _build_two_stage_config(
+        config,
+        "stage2",
+        stage2_exp_name,
+        output_exp_name=base_exp_name,
+        ckpt_path=ckpt_path,
+    )
+    _task_train_single(stage2_config)
+    wandb.finish()
+
+
+def _task_train_single(config: DictConfig):
     resolve_type_supervision_config(config)
     set_seed(config.seed)
     logger = Logger(config)
@@ -211,27 +539,42 @@ def task_train(config: DictConfig):
 
     model = eval(config.algo.model.name)(config.algo.model)
 
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config.algo.lr)
-    scheduler = CosineAnnealingLR(optimizer, config.algo.max_iter, eta_min=config.algo.lr_min)
-
     # load ckpt if exists
+    optimizer_state = None
     if config.ckpt is not None:
         ckpt = torch.load(config.ckpt, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
+        ckpt_load_cfg = OmegaConf.select(config, "algo.ckpt_load")
+        strict_model = bool(getattr(ckpt_load_cfg, "strict_model", True)) if ckpt_load_cfg is not None else True
+        ignore_prefixes = _as_list(getattr(ckpt_load_cfg, "ignore_prefixes", [])) if ckpt_load_cfg is not None else []
+        load_optimizer = bool(getattr(ckpt_load_cfg, "load_optimizer", True)) if ckpt_load_cfg is not None else True
+        reset_iter = bool(getattr(ckpt_load_cfg, "reset_iter", False)) if ckpt_load_cfg is not None else False
+        _load_model_state(model, ckpt["model"], strict=strict_model, ignore_prefixes=ignore_prefixes)
         model.to(config.device)
-        optimizer.load_state_dict(ckpt["optimizer"])
-        cur_iter = ckpt["iter"]
-        for _ in range(cur_iter):
-            scheduler.step()
-        print(f"loaded ckpt from {config.ckpt}")
+        optimizer_state = ckpt.get("optimizer") if load_optimizer else None
+        cur_iter = 0 if reset_iter else ckpt["iter"]
+        print(f"loaded ckpt from {config.ckpt}; reset_iter={reset_iter}; load_optimizer={load_optimizer}")
     else:
         cur_iter = 0
+
+    frozen_modules = _apply_freeze_config(model, config)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters remain after applying freeze config")
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=config.algo.lr)
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    scheduler = CosineAnnealingLR(optimizer, config.algo.max_iter, eta_min=config.algo.lr_min)
+    for _ in range(cur_iter):
+        scheduler.step()
 
     # training
     model.to(config.device)
     model.train()
+    _keep_frozen_modules_eval(model, frozen_modules)
 
     for it in trange(cur_iter, config.algo.max_iter):
+        _keep_frozen_modules_eval(model, frozen_modules)
         if timing_enabled:
             _maybe_cuda_sync(config.device, timing_sync_cuda)
             iter_start = time.perf_counter()
@@ -344,5 +687,21 @@ def task_train(config: DictConfig):
                     it,
                 )
                 model.train()
+                _keep_frozen_modules_eval(model, frozen_modules)
 
     return
+
+
+def task_train(config: DictConfig):
+    """Run training, optionally using the integrated two-stage Human Prior flow.
+
+    Args:
+        config: Full Hydra config for ``task=train``.
+
+    Returns:
+        None.
+    """
+    if bool(OmegaConf.select(config, "algo.two_stage.enabled", default=False)):
+        _task_train_two_stage(config)
+        return
+    _task_train_single(config)

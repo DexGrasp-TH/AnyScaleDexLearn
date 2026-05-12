@@ -1,4 +1,5 @@
 import os
+import csv
 from os.path import join as pjoin
 from glob import glob
 from collections import Counter, defaultdict
@@ -23,6 +24,9 @@ TRAIN_SAMPLING_UNIT_ALIASES = {
     "record_uniform": "record_uniform",
     "object": "object_uniform",
     "object_uniform": "object_uniform",
+    "posed_object": "posed_object_uniform",
+    "pose_group": "posed_object_uniform",
+    "posed_object_uniform": "posed_object_uniform",
 }
 
 
@@ -44,6 +48,9 @@ class HumanMultiDexDataset(Dataset):
         self.type_object_grasp_path_dict = defaultdict(lambda: defaultdict(list))
         self.object_type_grasp_path_dict = defaultdict(lambda: defaultdict(list))
         self.object_sequence_type_counter = defaultdict(lambda: defaultdict(Counter))
+        self.object_pose_group_dict = defaultdict(list)
+        self.object_pose_group_by_key = {}
+        self.grasp_path_pose_group_key = {}
         self.object_type_counter = defaultdict(Counter)
         self.type_counter = Counter()
         self.object_positive_type_ids = {}
@@ -62,6 +69,9 @@ class HumanMultiDexDataset(Dataset):
         ).lower()
         self.train_sampling_unit = self._normalize_train_sampling_unit(
             getattr(config, "train_sampling_unit", "record_uniform")
+        )
+        self.pose_group_soft_labels = bool(
+            getattr(config, "pose_group_soft_labels", self.train_sampling_unit == "posed_object_uniform")
         )
         self.object_bce_enabled = self.mode in ["train", "eval"] and self.type_objective == "object_bce"
         self.ranking_enabled = self.mode in ["train", "eval"] and self.type_objective == "scene_ranking"
@@ -149,6 +159,8 @@ class HumanMultiDexDataset(Dataset):
         ]
         self.record_data_num = len(self.record_grasp_path_lst)
         self._index_grasp_type_distribution()
+        if self.train_sampling_unit == "posed_object_uniform":
+            self._validate_pose_group_sampling_index()
         self.data_num = len(self.obj_id_lst) if self.object_bce_enabled else self.record_data_num
         print(f"mode: {mode}, grasp data num: {self.data_num}, sampling unit: {self.train_sampling_unit}")
 
@@ -166,8 +178,13 @@ class HumanMultiDexDataset(Dataset):
         self.type_object_grasp_path_dict = defaultdict(lambda: defaultdict(list))
         self.object_type_grasp_path_dict = defaultdict(lambda: defaultdict(list))
         self.object_sequence_type_counter = defaultdict(lambda: defaultdict(Counter))
+        self.object_pose_group_dict = defaultdict(list)
+        self.object_pose_group_by_key = {}
+        self.grasp_path_pose_group_key = {}
         self.object_type_counter = defaultdict(Counter)
         self.type_counter = Counter()
+        metadata_pose_index = self._load_metadata_pose_index() if self._pose_group_metadata_required() else None
+        pose_group_records = defaultdict(list)
 
         for obj_id, grasp_paths in self.grasp_path_dict.items():
             for grasp_path in grasp_paths:
@@ -186,8 +203,308 @@ class HumanMultiDexDataset(Dataset):
                 sequence_id = self._get_grasp_sequence_id(grasp_data)
                 if sequence_id is not None:
                     self.object_sequence_type_counter[obj_id][sequence_id][grasp_type_id] += 1
+                if metadata_pose_index is not None:
+                    pose_index = self._lookup_pose_index(
+                        metadata_pose_index,
+                        obj_id=obj_id,
+                        sequence_id=sequence_id,
+                        grasp_data=grasp_data,
+                        grasp_path=grasp_path,
+                    )
+                    pose_group_key = (obj_id, pose_index)
+                    self.grasp_path_pose_group_key[grasp_path] = pose_group_key
+                    pose_group_records[pose_group_key].append(
+                        {
+                            "grasp_path": grasp_path,
+                            "sequence_id": sequence_id or "",
+                            "grasp_type_id": grasp_type_id,
+                            "grasp_data": grasp_data,
+                        }
+                    )
+
+        if metadata_pose_index is not None:
+            self._finalize_pose_group_index(pose_group_records)
 
         self._finalize_object_feasibility_metadata()
+
+    def _metadata_csv_path(self):
+        """Resolve the formatted dataset metadata CSV path.
+
+        Args:
+            None.
+
+        Returns:
+            Path to ``metadata.csv`` for the formatted human grasp dataset.
+        """
+        configured = getattr(self.config, "metadata_path", None)
+        if configured:
+            return str(configured)
+        dataset_root = os.path.dirname(str(self.config.object_path).rstrip(os.sep))
+        return pjoin(dataset_root, "metadata.csv")
+
+    def _pose_group_metadata_required(self):
+        """Return whether train/eval indexing needs metadata pose groups.
+
+        Args:
+            None.
+
+        Returns:
+            ``True`` when posed-object sampling or soft-label supervision is
+            enabled.
+        """
+        return self.train_sampling_unit == "posed_object_uniform" or self.pose_group_soft_labels
+
+    def _load_metadata_pose_index(self):
+        """Load ``scene -> pose_index`` annotations from metadata.csv.
+
+        Args:
+            None.
+
+        Returns:
+            Dictionary mapping scene ids such as ``obj_31_seq_0`` to the
+            annotated pose index string.
+        """
+        metadata_csv = self._metadata_csv_path()
+        if not os.path.exists(metadata_csv):
+            if not self._pose_group_metadata_required():
+                print(f"Warning: metadata.csv not found; posed-object soft labels are disabled: {metadata_csv}")
+                return None
+            raise FileNotFoundError(
+                f"metadata.csv is required for posed-object soft labels but was not found: {metadata_csv}"
+            )
+
+        pose_index_by_scene = {}
+        with open(metadata_csv, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if "scene" not in (reader.fieldnames or []) or "pose_index" not in (reader.fieldnames or []):
+                raise ValueError(f"metadata.csv must contain 'scene' and 'pose_index' columns: {metadata_csv}")
+            for row in reader:
+                scene = str(row.get("scene", "")).strip()
+                pose_index = str(row.get("pose_index", "")).strip()
+                if scene and pose_index:
+                    pose_index_by_scene[scene] = pose_index
+        return pose_index_by_scene
+
+    def _scene_id_from_obj_sequence(self, obj_id, sequence_id):
+        """Build a metadata scene id from object and sequence ids.
+
+        Args:
+            obj_id: Canonical object id, for example ``obj_31``.
+            sequence_id: Sequence id, for example ``seq_0``.
+
+        Returns:
+            Scene id such as ``obj_31_seq_0``, or ``None`` when the sequence is
+            unavailable.
+        """
+        if sequence_id is None or sequence_id == "":
+            return None
+        return f"{obj_id}_{sequence_id}"
+
+    def _lookup_pose_index(self, metadata_pose_index, obj_id, sequence_id, grasp_data, grasp_path):
+        """Find the annotated pose index for one grasp record.
+
+        Args:
+            metadata_pose_index: Mapping loaded from ``metadata.csv``.
+            obj_id: Canonical object id inferred from the grasp folder.
+            sequence_id: Sequence id read from the grasp record.
+            grasp_data: Loaded grasp data dictionary.
+            grasp_path: Path to the current grasp record, used in errors.
+
+        Returns:
+            Pose-index string from the metadata table.
+        """
+        scene_candidates = []
+        scene_from_sequence = self._scene_id_from_obj_sequence(obj_id, sequence_id)
+        if scene_from_sequence is not None:
+            scene_candidates.append(scene_from_sequence)
+
+        object_data = grasp_data.get("object", {})
+        source_scene = object_data.get("source_scene")
+        if source_scene is not None:
+            scene_candidates.append(str(source_scene))
+
+        for scene in scene_candidates:
+            if scene in metadata_pose_index:
+                return metadata_pose_index[scene]
+
+        raise KeyError(
+            "Could not find pose_index in metadata.csv for grasp record "
+            f"{grasp_path}; tried scenes={scene_candidates}"
+        )
+
+    def _representative_pose_group_record(self, records):
+        """Choose a deterministic representative record for cache metadata.
+
+        Args:
+            records: Pose-group member records collected during indexing.
+
+        Returns:
+            The first record after sorting by grasp path.
+        """
+        return sorted(records, key=lambda item: item["grasp_path"])[0]
+
+    def _finalize_pose_group_index(self, pose_group_records):
+        """Build posed-object group targets from indexed grasp records.
+
+        Args:
+            pose_group_records: Mapping from ``(object_id, pose_index)`` to
+                member grasp records.
+
+        Returns:
+            None. Pose-group dictionaries are stored on this dataset instance.
+        """
+        self.object_pose_group_dict = defaultdict(list)
+        self.object_pose_group_by_key = {}
+
+        for pose_group_key, records in sorted(pose_group_records.items()):
+            obj_id, pose_index = pose_group_key
+            type_counts = np.zeros(len(REAL_GRASP_TYPE_IDS), dtype=np.float32)
+            for record in records:
+                grasp_type_id = int(record["grasp_type_id"])
+                if grasp_type_id not in REAL_GRASP_TYPE_IDS:
+                    raise ValueError(f"Invalid grasp_type_id={grasp_type_id} in pose group {pose_group_key}")
+                type_counts[grasp_type_id - 1] += 1.0
+
+            record_count = float(type_counts.sum())
+            if record_count <= 0.0:
+                continue
+
+            representative = self._representative_pose_group_record(records)
+            representative_data = representative["grasp_data"]
+            obj_name = representative_data.get("object", {}).get("name", obj_id)
+            sequence_id = representative.get("sequence_id", "")
+            target_distribution = type_counts / record_count
+            group = {
+                "object_id": obj_id,
+                "pose_index": pose_index,
+                "pose_group_key": pose_group_key,
+                "member_sequences": sorted({str(record.get("sequence_id", "")) for record in records}),
+                "member_grasp_paths": sorted(record["grasp_path"] for record in records),
+                "type_counts": type_counts,
+                "target_type_distribution": target_distribution.astype(np.float32),
+                "record_count": int(record_count),
+                "representative_pc_path": self._representative_pointcloud_path(obj_name, sequence_id),
+                "representative_object_pose": np.asarray(
+                    representative_data.get("object", {}).get("pose", np.eye(4)),
+                    dtype=np.float32,
+                ),
+            }
+            self.object_pose_group_by_key[pose_group_key] = group
+            self.object_pose_group_dict[obj_id].append(group)
+        self._write_pose_group_cache()
+
+    def _pose_group_cache_path(self):
+        """Resolve the optional posed-object group cache CSV path.
+
+        Args:
+            None.
+
+        Returns:
+            Cache CSV path. A configured empty value disables cache writing.
+        """
+        configured = getattr(self.config, "pose_group_cache_path", None)
+        if configured is not None:
+            configured = str(configured)
+            return configured if configured else None
+        dataset_root = os.path.dirname(str(self.config.object_path).rstrip(os.sep))
+        split_name = "test" if self.mode == "eval" else self.mode
+        return pjoin(dataset_root, "human_prior_pose_groups", f"{split_name}.csv")
+
+    def _write_pose_group_cache(self):
+        """Write a readable posed-object group cache for inspection.
+
+        Args:
+            None.
+
+        Returns:
+            None. The function writes a CSV cache when the target path is
+            configured and writable.
+        """
+        cache_path = self._pose_group_cache_path()
+        if cache_path is None:
+            return
+        fieldnames = [
+            "split",
+            "object_id",
+            "pose_index",
+            "member_sequences",
+            "member_grasp_paths",
+            "count_1",
+            "count_2",
+            "count_3",
+            "count_4",
+            "count_5",
+            "record_count",
+            "representative_pc_path",
+            "representative_object_pose",
+        ]
+        try:
+            cache_dir = os.path.dirname(cache_path)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for obj_id in sorted(self.object_pose_group_dict.keys()):
+                    for group in sorted(self.object_pose_group_dict[obj_id], key=lambda item: str(item["pose_index"])):
+                        counts = group["type_counts"].astype(int).tolist()
+                        writer.writerow(
+                            {
+                                "split": "test" if self.mode == "eval" else self.mode,
+                                "object_id": group["object_id"],
+                                "pose_index": group["pose_index"],
+                                "member_sequences": "|".join(group["member_sequences"]),
+                                "member_grasp_paths": "|".join(group["member_grasp_paths"]),
+                                "count_1": counts[0],
+                                "count_2": counts[1],
+                                "count_3": counts[2],
+                                "count_4": counts[3],
+                                "count_5": counts[4],
+                                "record_count": group["record_count"],
+                                "representative_pc_path": group["representative_pc_path"],
+                                "representative_object_pose": np.asarray(
+                                    group["representative_object_pose"], dtype=np.float32
+                                ).reshape(-1).tolist(),
+                            }
+                        )
+        except OSError as exc:
+            print(f"Warning: failed to write posed-object group cache to {cache_path}: {exc}")
+
+    def _representative_pointcloud_path(self, obj_name, sequence_id):
+        """Return a representative point-cloud path without random sampling.
+
+        Args:
+            obj_name: Canonical object id used under ``object_pc_folder``.
+            sequence_id: Sequence id preferred for the representative path.
+
+        Returns:
+            Point-cloud path string, or an empty string when no point cloud is
+            indexed yet.
+        """
+        if obj_name not in self.pc_path_dict:
+            self.pc_path_dict[obj_name] = sorted(glob(pjoin(self.object_pc_folder, obj_name, "**.npy")))
+        pc_candidates = self.pc_path_dict.get(obj_name, [])
+        if sequence_id:
+            matching = [pc_path for pc_path in pc_candidates if self._pointcloud_matches_sequence(pc_path, sequence_id)]
+            if matching:
+                return matching[0]
+        return pc_candidates[0] if pc_candidates else ""
+
+    def _validate_pose_group_sampling_index(self):
+        """Validate that every indexed train object has posed-object groups.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        missing = [obj_id for obj_id in self.obj_id_lst if not self.object_pose_group_dict.get(obj_id)]
+        if missing:
+            raise RuntimeError(
+                "posed_object_uniform sampling requires at least one metadata pose group per object; "
+                f"missing examples={missing[:5]}"
+            )
 
     def _finalize_object_feasibility_metadata(self):
         """Finalize per-object feasibility metadata from indexed grasp paths.
@@ -248,6 +565,7 @@ class HumanMultiDexDataset(Dataset):
             "data_num": int(self.data_num),
             "record_data_num": int(getattr(self, "record_data_num", self.data_num)),
             "object_num": int(len(self.obj_id_lst)) if hasattr(self, "obj_id_lst") else 0,
+            "pose_group_num": int(sum(len(groups) for groups in self.object_pose_group_dict.values())),
             "type_counts": type_counts,
             "object_type_counts": object_counts,
             "object_feasible_counts": object_feasible_counts,
@@ -317,7 +635,53 @@ class HumanMultiDexDataset(Dataset):
             object_sample_index = sample_index // len(self.obj_id_lst)
             return grasp_paths[object_sample_index % len(grasp_paths)]
 
+        if self.train_sampling_unit == "posed_object_uniform":
+            return self._sample_pose_group_grasp_path(sample_index)
+
         raise ValueError(f"Unsupported train_sampling_unit={self.train_sampling_unit}")
+
+    def _sample_pose_group_grasp_path(self, sample_index):
+        """Sample one record through object -> posed-object -> record.
+
+        Args:
+            sample_index: Dataset index received by ``__getitem__``.
+
+        Returns:
+            Path to one grasp record from the sampled posed-object group.
+        """
+        obj_id = self.obj_id_lst[int(sample_index) % len(self.obj_id_lst)]
+        pose_groups = self.object_pose_group_dict.get(obj_id, [])
+        if not pose_groups:
+            raise RuntimeError(f"Object '{obj_id}' has no posed-object groups")
+        if self.mode == "train":
+            pose_group = random.choice(pose_groups)
+            return random.choice(pose_group["member_grasp_paths"])
+
+        pose_group_index = (int(sample_index) // len(self.obj_id_lst)) % len(pose_groups)
+        pose_group = pose_groups[pose_group_index]
+        record_index = (int(sample_index) // (len(self.obj_id_lst) * len(pose_groups))) % len(
+            pose_group["member_grasp_paths"]
+        )
+        return pose_group["member_grasp_paths"][record_index]
+
+    def _attach_pose_group_target(self, grasp_path, ret_dict):
+        """Attach the posed-object soft type target for one grasp record.
+
+        Args:
+            grasp_path: Path to the sampled grasp record.
+            ret_dict: Sample dictionary updated in-place.
+
+        Returns:
+            None.
+        """
+        if not self.pose_group_soft_labels or not self.object_pose_group_by_key:
+            return
+        pose_group_key = self.grasp_path_pose_group_key.get(grasp_path)
+        if pose_group_key is None:
+            raise KeyError(f"No posed-object group was indexed for grasp path: {grasp_path}")
+        pose_group = self.object_pose_group_by_key[pose_group_key]
+        ret_dict["target_type_distribution"] = pose_group["target_type_distribution"].copy()
+        ret_dict["pose_group_record_count"] = np.int64(pose_group["record_count"])
 
     def _sample_ranking_negative_type_ids(self, observed_type_id, obj_id=None, sequence_id=None):
         """Sample weak negative grasp types for scene-level ranking.
@@ -444,7 +808,8 @@ class HumanMultiDexDataset(Dataset):
             pc = self._apply_scale_aug(pc, ret_dict)
             pc = self._apply_geometric_aug(pc, ret_dict)
 
-        if self.mode == "train" and getattr(self.config, "pc_noise_aug", False):
+        if self.mode == "train":
+            pc = self._apply_point_dropout_aug(pc)
             pc = self._apply_pc_noise_aug(pc)
 
         ret_dict["point_clouds"] = pc
@@ -659,6 +1024,25 @@ class HumanMultiDexDataset(Dataset):
             or sequence_id in path_parts
         )
 
+    def _pointcloud_sequence_match_rank(self, pc_path, sequence_id):
+        """Rank how directly a point-cloud path matches a sequence id.
+
+        Args:
+            pc_path: Candidate point-cloud path.
+            sequence_id: Required sequence id, for example ``seq_0``.
+
+        Returns:
+            Integer rank where smaller means a more direct match.
+        """
+        base_name = os.path.splitext(os.path.basename(pc_path))[0]
+        if base_name == f"{sequence_id}_textured_pc":
+            return 0
+        if base_name == sequence_id:
+            return 1
+        if base_name.startswith(f"{sequence_id}_"):
+            return 2
+        return 3
+
     def _select_pointcloud_path(self, obj_name, sequence_id=None):
         """Select a point-cloud path for one object and optional sequence.
 
@@ -690,6 +1074,11 @@ class HumanMultiDexDataset(Dataset):
                     f"No point-cloud file for object '{obj_name}' matches sequence_id='{sequence_id}' "
                     f"under {pjoin(self.object_pc_folder, obj_name)}"
                 )
+            pc_candidates = sorted(
+                pc_candidates,
+                key=lambda pc_path: (self._pointcloud_sequence_match_rank(pc_path, sequence_id), pc_path),
+            )
+            return pc_candidates[0]
         return random.choice(pc_candidates)
 
     def _load_pointcloud(self, obj_name, obj_scale, obj_pose, mirrored=False, sequence_id=None):
@@ -740,6 +1129,7 @@ class HumanMultiDexDataset(Dataset):
         grasp_path = self._sample_grasp_path_for_object_type(obj_id, grasp_type_id, sample_index)
         grasp_data = np.load(grasp_path, allow_pickle=True).item()
         ret_dict["path"] = grasp_path
+        self._attach_pose_group_target(grasp_path, ret_dict)
 
         grasp_type, mirrored = self._determine_grasp_type(grasp_data)
         if int(grasp_type.split("_", 1)[0]) != grasp_type_id:
@@ -753,7 +1143,8 @@ class HumanMultiDexDataset(Dataset):
         obj_scale = grasp_data["object"]["rel_scale"]
         obj_pose = grasp_data["object"]["pose"]
         sequence_id = self._get_grasp_sequence_id(grasp_data)
-        pc, _ = self._load_pointcloud(obj_name, obj_scale, obj_pose, mirrored, sequence_id=sequence_id)
+        pc, pc_path = self._load_pointcloud(obj_name, obj_scale, obj_pose, mirrored, sequence_id=sequence_id)
+        ret_dict["pc_path"] = pc_path
         return grasp_type, pc, mirrored, grasp_data
 
     def _load_train_data(self, sample_index, ret_dict):
@@ -773,6 +1164,7 @@ class HumanMultiDexDataset(Dataset):
         grasp_data = np.load(grasp_path, allow_pickle=True).item()
 
         ret_dict["path"] = grasp_path
+        self._attach_pose_group_target(grasp_path, ret_dict)
 
         grasp_type, mirrored = self._determine_grasp_type(grasp_data)
         if self.ranking_enabled:
@@ -791,7 +1183,8 @@ class HumanMultiDexDataset(Dataset):
         obj_pose = grasp_data["object"]["pose"]
         sequence_id = self._get_grasp_sequence_id(grasp_data)
 
-        pc, _ = self._load_pointcloud(obj_name, obj_scale, obj_pose, mirrored, sequence_id=sequence_id)
+        pc, pc_path = self._load_pointcloud(obj_name, obj_scale, obj_pose, mirrored, sequence_id=sequence_id)
+        ret_dict["pc_path"] = pc_path
 
         return grasp_type, pc, mirrored, grasp_data
 
@@ -924,9 +1317,47 @@ class HumanMultiDexDataset(Dataset):
         return np.random.uniform(-translation_range, translation_range, size=3).astype(np.float32)
 
     def _apply_pc_noise_aug(self, pc):
-        """Add zero-mean Gaussian noise to object points during training."""
+        """Add clipped zero-mean Gaussian noise to object points during training.
+
+        Args:
+            pc: Object point cloud with shape ``(N, 3)``.
+
+        Returns:
+            Point cloud with optional clipped Gaussian jitter applied.
+        """
         noise_scale = float(getattr(self.config, "pc_noise_scale", 0.0))
         if noise_scale <= 0.0:
             return pc.astype(np.float32, copy=False)
         noise = np.random.normal(loc=0.0, scale=noise_scale, size=pc.shape).astype(np.float32)
+        clip_multiplier = float(getattr(self.config, "pc_noise_clip_multiplier", 3.0))
+        if clip_multiplier > 0.0:
+            clip_value = np.float32(clip_multiplier * noise_scale)
+            noise = np.clip(noise, -clip_value, clip_value)
         return pc.astype(np.float32, copy=False) + noise
+
+    def _apply_point_dropout_aug(self, pc):
+        """Randomly drop object points and resample to the original count.
+
+        Args:
+            pc: Object point cloud with shape ``(N, 3)``.
+
+        Returns:
+            Point cloud with the same shape as ``pc`` after optional point
+            dropout and replacement sampling. Hand targets are unchanged
+            because this augmentation only changes point visibility/density.
+        """
+        if not bool(getattr(self.config, "point_dropout_aug", False)):
+            return pc.astype(np.float32, copy=False)
+
+        dropout_ratio = float(getattr(self.config, "point_dropout_ratio", 0.0))
+        if dropout_ratio <= 0.0:
+            return pc.astype(np.float32, copy=False)
+        if dropout_ratio >= 1.0:
+            raise ValueError(f"point_dropout_ratio must be < 1.0, got {dropout_ratio}")
+
+        point_num = int(pc.shape[0])
+        keep_num = max(int(round(point_num * (1.0 - dropout_ratio))), 1)
+        keep_indices = np.random.choice(point_num, keep_num, replace=False)
+        kept_pc = pc[keep_indices]
+        resample_indices = np.random.choice(keep_num, point_num, replace=True)
+        return kept_pc[resample_indices].astype(np.float32, copy=False)

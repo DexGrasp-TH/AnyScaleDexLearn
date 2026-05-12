@@ -1,17 +1,56 @@
 human: True
 
 batch_size: 256
-max_iter: 20000
+max_iter: 10000
 lr: 0.001
 lr_min: 0.0001
 log_every: 10
-val_every: 1000
+val_every: 2500
 val_num: 10
-save_every: 5000
+save_every: 2500
 grad_clip: 10.0
+
+two_stage:
+  # When enabled, task=train runs Stage 1 and Stage 2 sequentially inside one
+  # python process. Disable this for legacy single-stage training.
+  enabled: true
+  stage1:
+    exp_suffix: stage1
+    ckpt_step: 10000
+    # Keep diffusion as the primary Stage 1 objective, while giving the shared
+    # encoder a weak Human Prior type-prior signal.
+    loss_diffusion: 1.0
+    loss_type: 0.005
+  stage2:
+    # Stage suffixes distinguish wandb/model-registry entries. Local
+    # checkpoints from both stages are saved under the user provided exp_name.
+    exp_suffix: stage2
+    # These values are consumed by task=train when it launches the frozen
+    # encoder type-predictor finetuning stage.
+    max_iter: 300
+    save_every: 50
+    val_every: 50
+    lr: 0.001
+    lr_min: 0.0001
 
 test_grasp_num: 20
 test_topk: 20
+
+ckpt_load:
+  # When true, resume optimizer state from ckpt. Disable for finetuning runs
+  # that change trainable parameters, reset iteration count, or replace heads.
+  load_optimizer: true
+  # When true, use ckpt weights as initialization and train from iteration 0.
+  reset_iter: false
+  # Non-strict loading allows intentional head replacement during finetuning.
+  strict_model: true
+  ignore_prefixes: []
+
+freeze:
+  backbone: false
+  type_classifier: false
+  grasp_type_emb: false
+  output_head: false
 
 model:
   name: HierarchicalTypeObjectiveModel
@@ -20,12 +59,16 @@ model:
   #   python dexlearn/main.py task=train data=humanMulti algo=humanMultiHierar \
   #     algo.model.type_objective=scene_ranking
   type_objective: ce
+  # When true, train only the point-cloud backbone and grasp-type predictor.
+  # Diffusion pose generation loss is skipped, which is useful for fast
+  # Human Prior type-prior ablations.
+  train_type_only: false
   backbone:
     name: WrappedMinkUNet
     out_feat_dim: 1024
     voxel_size: 0.005
   type_head:
-    hidden_dim: 256
+    hidden_dim: 64
   grasp_type_emb:
     name: LearnableTypeCond
     in_feat_dim: ${..backbone.out_feat_dim}

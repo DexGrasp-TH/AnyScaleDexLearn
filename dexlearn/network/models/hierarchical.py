@@ -242,6 +242,17 @@ class HierarchicalFeasibilityModel(torch.nn.Module):
         if input_type.ndim != 1:
             raise ValueError(f"Expected grasp_type_id to have shape (B,), got {tuple(input_type.shape)}")
 
+        # Type-only checkpoints do not train the diffusion head, so inference
+        # must export Human Prior scores without producing pose samples.
+        if getattr(self, "train_type_only", False):
+            if ((input_type < 0) | (input_type >= len(GRASP_TYPES))).any():
+                raise ValueError("Type-only sampling expects grasp_type_id in [0, 5]")
+            pred_type_id = torch.argmax(type_scores, dim=-1) + 1
+            return {
+                "pred_grasp_type_prob": type_scores.unsqueeze(1),
+                "pred_grasp_type_id": pred_type_id.unsqueeze(1),
+            }
+
         if torch.any(input_type == 0):
             if not torch.all(input_type == 0):
                 raise ValueError("Mixed 0_any and explicit grasp types are not supported in one batch")
@@ -278,6 +289,7 @@ class HierarchicalTypeObjectiveModel(torch.nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
+        self.train_type_only = bool(getattr(cfg, "train_type_only", False))
         self.type_objective = str(getattr(cfg, "type_objective", "ce")).lower()
         if self.type_objective not in {"ce", "object_bce", "scene_ranking"}:
             raise ValueError(f"Unsupported type_objective={self.type_objective}")
@@ -329,16 +341,34 @@ class HierarchicalTypeObjectiveModel(torch.nn.Module):
         return type_logits, type_scores
 
     def _compute_ce_loss(self, type_logits: torch.Tensor, data: dict) -> torch.Tensor:
-        """Compute record/scene-level 5-way softmax cross-entropy loss.
+        """Compute 5-way softmax cross-entropy loss.
 
         Args:
             type_logits: Predicted logits with shape ``(B, 5)`` for real
                 grasp types ``1..5``.
-            data: Batch dictionary containing ``grasp_type_id`` in ``[1, 5]``.
+            data: Batch dictionary containing either ``target_type_distribution``
+                as soft labels over real types ``1..5`` or hard
+                ``grasp_type_id`` labels in ``[1, 5]``.
 
         Returns:
             Scalar categorical negative-log-likelihood over the 5 real types.
         """
+        if "target_type_distribution" in data:
+            target_distribution = data["target_type_distribution"].to(
+                dtype=type_logits.dtype,
+                device=type_logits.device,
+            )
+            if target_distribution.shape != type_logits.shape:
+                raise ValueError(
+                    "target_type_distribution must match type_logits shape, got "
+                    f"{tuple(target_distribution.shape)} vs {tuple(type_logits.shape)}"
+                )
+            target_sum = target_distribution.sum(dim=-1)
+            if not torch.allclose(target_sum, torch.ones_like(target_sum), atol=1e-4):
+                raise ValueError("target_type_distribution rows must sum to 1")
+            log_probs = F.log_softmax(type_logits, dim=-1)
+            return -(target_distribution * log_probs).sum(dim=-1).mean()
+
         gt_type = data["grasp_type_id"].long()
         if (gt_type == 0).any():
             raise ValueError("Training data contains grasp_type_id = 0, which should not be used for training")
@@ -411,6 +441,11 @@ class HierarchicalTypeObjectiveModel(torch.nn.Module):
         type_logits, type_scores = self._compute_type_scores(global_feature)
         result_dict["loss_type"] = self._compute_type_loss(type_logits, data)
 
+        if self.train_type_only:
+            with torch.no_grad():
+                result_dict["metric_type_score_mean"] = type_scores.mean()
+            return result_dict
+
         batch_num, sample_num = data["grasp_type_id"].shape[0], data["right_hand_trans"].shape[1]
         assert sample_num == 1
         grasp_type_id = repeat(data["grasp_type_id"], "b -> (b t)", t=sample_num)
@@ -432,6 +467,17 @@ class HierarchicalTypeObjectiveModel(torch.nn.Module):
         input_type = data["grasp_type_id"]
         if input_type.ndim != 1:
             raise ValueError(f"Expected grasp_type_id to have shape (B,), got {tuple(input_type.shape)}")
+
+        # Type-only checkpoints do not train the diffusion head, so inference
+        # must export Human Prior scores without producing pose samples.
+        if self.train_type_only:
+            if ((input_type < 0) | (input_type >= len(GRASP_TYPES))).any():
+                raise ValueError("Type-only sampling expects grasp_type_id in [0, 5]")
+            pred_type_id = torch.argmax(type_scores, dim=-1) + 1
+            return {
+                "pred_grasp_type_prob": type_scores.unsqueeze(1),
+                "pred_grasp_type_id": pred_type_id.unsqueeze(1),
+            }
 
         if torch.any(input_type == 0):
             if not torch.all(input_type == 0):

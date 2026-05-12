@@ -243,3 +243,329 @@ to describe intentional differences from previous runs.
   - type_objective=ce[scope=record,negative=softmax]
   - type_balancing=False[sampler_alpha=0.5,loss_beta=0.25]
 - Notes: 
+## humanMulti_humanMultiHierar_debug27
+- Timestamp: `2026-05-11 20:37:57`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - data=humanMulti
+  - algo=humanMultiHierar
+  - max_iter=20000
+  - random_pc_across_sequences=False
+  - scale_aug=True[0.9,1.1]
+  - train_sampling_unit=posed_object_uniform
+  - type_objective=ce[scope=record,negative=softmax]
+  - type_balancing=False[sampler_alpha=0.5,loss_beta=0.25]
+- Notes: 
+## humanMulti_humanMultiHierar_debug29
+- Timestamp: `2026-05-11 22:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A2_A1_plus_point_dropout_0.1
+- Notes: 
+## humanMulti_humanMultiHierar_debug30
+- Timestamp: `2026-05-11 22:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A3_A1_plus_scale_aug_0.85_1.15
+- Notes: 
+## humanMulti_humanMultiHierar_debug33
+- Timestamp: `2026-05-11 22:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A5_posed_object_sampler_hard_CE_control
+- Notes: 
+## humanMulti_humanMultiHierar_debug31
+- Timestamp: `2026-05-11 22:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A4_A1_plus_clipped_jitter_sigma_0.002
+- Notes: 
+## humanMulti_humanMultiHierar_debug28
+- Timestamp: `2026-05-11 22:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A1_posed_object_soft_CE_default_aug_no_point_dropout
+- Notes: 
+## humanMulti_humanMultiHierar_debug32
+- Timestamp: `2026-05-11 22:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A0_record_uniform_hard_CE_baseline
+- Notes: 
+## humanMulti_humanMultiHierar_debug39
+- Timestamp: `2026-05-12 00:48:45`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A5_posed_object_sampler_hard_CE_control_new_object_split
+- Notes: 
+## humanMulti_humanMultiHierar_debug36
+- Timestamp: `2026-05-12 00:48:45`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A3_A1_plus_scale_aug_0.85_1.15_new_object_split
+- Notes: 
+## humanMulti_humanMultiHierar_debug35
+- Timestamp: `2026-05-12 00:48:45`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A2_A1_plus_point_dropout_0.1_new_object_split
+- Notes: 
+## humanMulti_humanMultiHierar_debug37
+- Timestamp: `2026-05-12 00:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A4_A1_plus_clipped_jitter_sigma_0.002_new_object_split
+- Notes: 
+## humanMulti_humanMultiHierar_debug38
+- Timestamp: `2026-05-12 00:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A0_record_uniform_hard_CE_baseline_new_object_split
+- Notes: 
+## humanMulti_humanMultiHierar_debug34
+- Timestamp: `2026-05-12 00:48:46`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - A1_posed_object_soft_CE_default_aug_no_point_dropout_new_object_split
+- Notes: 
+## humanMulti_humanMultiHierar_debug40
+- Timestamp: `2026-05-12 09:07:00`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `20000`
+- Key Features:
+  - data=humanMulti
+  - algo=humanMultiHierar
+  - max_iter=20000
+  - random_pc_across_sequences=False
+  - scale_aug=True[0.9,1.1]
+  - train_sampling_unit=record_uniform
+  - type_objective=ce[scope=record,negative=softmax]
+  - type_balancing=False[sampler_alpha=0.5,loss_beta=0.25]
+- Notes: 
+## humanMulti_humanMultiHierar_debug45
+- Timestamp: `2026-05-12 09:38:36`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `3000`
+- Key Features:
+  - T5_debug35_type_only_posed_object_hard_CE_3000iter_save500
+- Notes: 
+## humanMulti_humanMultiHierar_debug42
+- Timestamp: `2026-05-12 09:38:36`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `5000`
+- Key Features:
+  - T2_debug35_type_only_5000iter_save500
+- Notes: 
+## humanMulti_humanMultiHierar_debug44
+- Timestamp: `2026-05-12 09:38:36`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `3000`
+- Key Features:
+  - T4_debug35_type_only_record_uniform_soft_labels_3000iter_save500
+- Notes: 
+## humanMulti_humanMultiHierar_debug41
+- Timestamp: `2026-05-12 09:38:36`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `3000`
+- Key Features:
+  - T1_debug35_type_only_3000iter_save500
+- Notes: 
+## humanMulti_humanMultiHierar_debug43
+- Timestamp: `2026-05-12 09:38:36`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `5000`
+- Key Features:
+  - T3_debug35_type_only_5000iter_lr5e-4_save500
+- Notes: 
+## humanMulti_humanMultiHierar_debug47
+- Timestamp: `2026-05-12 10:10:37`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `500`
+- Key Features:
+  - T1_debug41_type_only_500iter_save100_hidden128_lr1e-3_posed_object
+- Notes: 
+## humanMulti_humanMultiHierar_debug50
+- Timestamp: `2026-05-12 10:10:38`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `500`
+- Key Features:
+  - T4_debug41_type_only_500iter_save100_hidden256_lr2e-4_posed_object
+- Notes: 
+## humanMulti_humanMultiHierar_debug46
+- Timestamp: `2026-05-12 10:10:38`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `500`
+- Key Features:
+  - T0_debug41_type_only_500iter_save100_hidden256_lr1e-3_posed_object
+- Notes: 
+## humanMulti_humanMultiHierar_debug51
+- Timestamp: `2026-05-12 10:10:39`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `500`
+- Key Features:
+  - T5_debug41_type_only_500iter_save100_hidden256_lr1e-3_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug49
+- Timestamp: `2026-05-12 10:10:39`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `500`
+- Key Features:
+  - T3_debug41_type_only_500iter_save100_hidden256_lr5e-4_posed_object
+- Notes: 
+## humanMulti_humanMultiHierar_debug48
+- Timestamp: `2026-05-12 10:10:39`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `500`
+- Key Features:
+  - T2_debug41_type_only_500iter_save100_hidden64_lr1e-3_posed_object
+- Notes: 
+## humanMulti_humanMultiHierar_debug56
+- Timestamp: `2026-05-12 11:00:49`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - T4_debug51_type_only_300iter_save50_hidden256_lr5e-4_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug55
+- Timestamp: `2026-05-12 11:00:49`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - T3_debug51_type_only_300iter_save50_hidden512_lr1e-3_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug57
+- Timestamp: `2026-05-12 11:00:49`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - T5_debug51_type_only_300iter_save50_hidden256_lr2e-4_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug52
+- Timestamp: `2026-05-12 11:00:49`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - T0_debug51_type_only_300iter_save50_hidden256_lr1e-3_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug54
+- Timestamp: `2026-05-12 11:00:50`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - T2_debug51_type_only_300iter_save50_hidden64_lr1e-3_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug53
+- Timestamp: `2026-05-12 11:00:50`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - T1_debug51_type_only_300iter_save50_hidden128_lr1e-3_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug59
+- Timestamp: `2026-05-12 11:28:35`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - S1_debug54_type_only_300iter_save50_hidden16_lr1e-3_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug58
+- Timestamp: `2026-05-12 11:28:35`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - S0_debug54_type_only_300iter_save50_hidden32_lr1e-3_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug60
+- Timestamp: `2026-05-12 11:55:16`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `200`
+- Key Features:
+  - debug40_step010000_frozen_encoder_new_hidden64_type_head_200iter_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug61_stage1
+- Timestamp: `2026-05-12 12:48:56`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `10000`
+- Key Features:
+  - integrated_stage1_diffusion_encoder_10000iter_save2500_loss_type0_freeze_type_head_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug61_stage2
+- Timestamp: `2026-05-12 13:33:40`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `300`
+- Key Features:
+  - integrated_stage2_frozen_stage1_encoder_train_yaml_configured_type_head_record_uniform_soft_labels
+- Notes: 
+## humanMulti_humanMultiHierar_debug62
+- Timestamp: `2026-05-12 13:56:48`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `1000`
+- Key Features:
+  - data=humanMulti
+  - algo=humanMultiHierar
+  - max_iter=1000
+  - random_pc_across_sequences=False
+  - scale_aug=True[0.9,1.1]
+  - train_sampling_unit=record_uniform
+  - type_objective=ce[scope=record,negative=softmax]
+  - train_type_only=True
+  - type_balancing=False[sampler_alpha=0.5,loss_beta=0.25]
+- Notes: 
+## humanMulti_humanMultiHierar_debug63_stage1
+- Timestamp: `2026-05-12 14:32:58`
+- Data: `humanMulti`
+- Algo: `humanMultiHierar`
+- Max Iter: `10000`
+- Key Features:
+  - integrated_stage1_diffusion_encoder_10000iter_save2500_loss_diffusion1_loss_type0.005_record_uniform_soft_labels
+- Notes: 

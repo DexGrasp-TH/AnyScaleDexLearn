@@ -30,12 +30,43 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_EXP_NAMES = ["debug26"]
+DEFAULT_EXP_NAMES = ["debug27"]
 DEFAULT_GPUS = ["2", "3", "4", "5", "6", "7"]
 DEFAULT_TEST_DATASETS = ["humanMulti"]
 DEFAULT_SAMPLE_KINDS = ["score", "pose"]
 DEFAULT_EXP_OVERRIDES = {
-    "debug26": [],
+    "debug27": [],
+    # Type-predictor-only checkpoints must keep this flag during sampling;
+    # otherwise task=sample would instantiate the pose-generating path and use
+    # an untrained diffusion head.
+    "debug40": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=256"],
+    "debug41": ["algo.model.train_type_only=true"],
+    "debug42": ["algo.model.train_type_only=true"],
+    "debug43": ["algo.model.train_type_only=true"],
+    "debug44": ["algo.model.train_type_only=true"],
+    "debug45": ["algo.model.train_type_only=true"],
+    "debug46": ["algo.model.train_type_only=true"],
+    "debug47": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=128"],
+    "debug48": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=64"],
+    "debug49": ["algo.model.train_type_only=true"],
+    "debug50": ["algo.model.train_type_only=true"],
+    "debug51": ["algo.model.train_type_only=true"],
+    "debug52": ["algo.model.train_type_only=true"],
+    "debug53": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=128"],
+    "debug54": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=64"],
+    "debug55": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=512"],
+    "debug56": ["algo.model.train_type_only=true"],
+    "debug57": ["algo.model.train_type_only=true"],
+    "debug58": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=32"],
+    "debug59": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=16"],
+    "debug60": ["algo.model.train_type_only=true", "algo.model.type_head.hidden_dim=64"],
+    # Two-stage final flow:
+    # debug61 is the diffusion-trained encoder/head checkpoint. debug62 reloads
+    # that checkpoint and trains only a new type predictor. Do not force
+    # train_type_only for debug62 sampling; 0_any still exports type scores,
+    # while explicit types should keep the Stage 1 diffusion branch.
+    "debug61": [],
+    "debug62": [],
 }
 
 SCORE_GRASP_TYPES = '["0_any"]'

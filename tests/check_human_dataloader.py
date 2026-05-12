@@ -30,6 +30,26 @@ from dexlearn.utils.util import set_seed
 from manopth.manolayer import ManoLayer
 
 
+FINGERTIP_JOINT_INDICES = {
+    "thumb": 4,
+    "index": 8,
+    "middle": 12,
+    "ring": 16,
+    "pinky": 20,
+}
+
+GRASP_TYPE_FINGERS = {
+    1: {"right": ["thumb", "index"], "left": []},
+    2: {"right": ["thumb", "index", "middle"], "left": []},
+    3: {"right": ["thumb", "index", "middle", "ring", "pinky"], "left": []},
+    4: {"right": ["thumb", "index", "middle"], "left": ["thumb", "index", "middle"]},
+    5: {
+        "right": ["thumb", "index", "middle", "ring", "pinky"],
+        "left": ["thumb", "index", "middle", "ring", "pinky"],
+    },
+}
+
+
 def cfg_select(config: DictConfig, key: str, default):
     value = OmegaConf.select(config, key)
     return default if value is None else value
@@ -48,6 +68,21 @@ def build_hand_mesh_elements(verts, faces, joints=None, color=(200, 200, 250, 25
             scene_elements.append(sphere)
 
     return scene_elements
+
+
+def target_fingertip_indices(grasp_type_id, side):
+    """Return fingertip joint indices that should be highlighted.
+
+    Args:
+        grasp_type_id: Integer grasp type id in ``[1, 5]``.
+        side: Hand side, either ``right`` or ``left``.
+
+    Returns:
+        List of MANO joint indices for fingertips involved by the grasp-type
+        label.
+    """
+    finger_names = GRASP_TYPE_FINGERS.get(int(grasp_type_id), {}).get(side, [])
+    return [FINGERTIP_JOINT_INDICES[name] for name in finger_names]
 
 
 def build_human_batch_scene_records(data, mano_layers, mano_cfg, hand_pos_source, hand_colors, device):
@@ -111,7 +146,9 @@ def build_human_batch_scene_records(data, mano_layers, mano_cfg, hand_pos_source
             v_np = verts[0].cpu().detach().numpy()
             j_np = joints[0].cpu().detach().numpy()
             f_np = mano_layers[side].th_faces.cpu().numpy()
-            scene_elements.extend(build_hand_mesh_elements(v_np, f_np, j_np, color=hand_colors[side]))
+            fingertip_indices = target_fingertip_indices(grasp_type_id, side)
+            fingertip_joints = j_np[fingertip_indices] if fingertip_indices else None
+            scene_elements.extend(build_hand_mesh_elements(v_np, f_np, fingertip_joints, color=hand_colors[side]))
 
             if hand_pos_source == "index_mcp":
                 mcp_pose = torch.eye(4, device=hand_rot_mat.device, dtype=hand_rot_mat.dtype)

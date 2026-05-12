@@ -79,8 +79,10 @@ except ModuleNotFoundError:
 
 
 EPS = 1e-12
+CE_EPS_VALUES = (1e-12, 1e-9, 1e-6, 1e-3)
 REAL_TYPE_IDS = tuple(range(1, len(GRASP_TYPES)))
 SCALE_FEATURES = ("xy_long", "xy_short", "z_height")
+GRASP_TYPE_LABELS = [name.split("_", 1)[1] for name in GRASP_TYPES[1:]]
 
 
 def _as_list(value: Any) -> list:
@@ -451,6 +453,22 @@ def scale_descriptor(points: np.ndarray) -> np.ndarray:
     return np.asarray([xy_long, xy_short, z_height], dtype=np.float64)
 
 
+def object_scale_half_diagonal(points: np.ndarray) -> float:
+    """Compute object scale as half of the axis-aligned bounding-box diagonal.
+
+    Args:
+        points: Scaled object-frame point cloud shaped ``(N, 3)``.
+
+    Returns:
+        Half of the AABB diagonal length.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Expected point cloud shape (N, 3), got {points.shape}")
+    extents = np.maximum(np.ptp(points, axis=0), EPS)
+    return float(0.5 * np.linalg.norm(extents))
+
+
 def load_point_cloud_descriptor(pc_path: str, max_points: int, cache: dict) -> np.ndarray:
     """Load a point cloud and compute its canonical scale descriptor.
 
@@ -608,6 +626,63 @@ def js_divergence(q: np.ndarray, p: np.ndarray) -> float:
     p = np.asarray(p, dtype=np.float64)
     m = 0.5 * (q + p)
     return float(0.5 * np.sum(q * (np.log(np.clip(q, EPS, None)) - np.log(np.clip(m, EPS, None)))) + 0.5 * np.sum(p * (np.log(np.clip(p, EPS, None)) - np.log(np.clip(m, EPS, None)))))
+
+
+def ce_eps_key(eps: float) -> str:
+    """Build a stable CSV key for a CE clipping epsilon.
+
+    Args:
+        eps: Probability floor used before the logarithm.
+
+    Returns:
+        Metric key for CE computed with this epsilon.
+    """
+    exponent = int(round(-math.log10(float(eps))))
+    return f"soft_label_ce_eps_1e_{exponent:02d}"
+
+
+def cross_entropy_with_eps(q: np.ndarray, p: np.ndarray, eps: float) -> float:
+    """Compute soft-label cross entropy with a configurable probability floor.
+
+    Args:
+        q: Reference probability distribution.
+        p: Predicted probability distribution.
+        eps: Probability floor applied before ``log``.
+
+    Returns:
+        Cross entropy value.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    return float(-np.sum(q * np.log(np.clip(p, float(eps), None))))
+
+
+def positive_set_cross_entropy(q: np.ndarray, p: np.ndarray, eps: float = EPS) -> float | None:
+    """Compute CE inside the human-observed positive type set.
+
+    The metric normalizes ``p`` only over types with ``q_t > 0``. It should be
+    read together with ``positive_probability_mass`` because it evaluates the
+    within-positive allocation but intentionally ignores mass assigned outside
+    the positive set.
+
+    Args:
+        q: Reference probability distribution.
+        p: Predicted probability distribution.
+        eps: Probability floor applied before positive-set normalization.
+
+    Returns:
+        Positive-set cross entropy, or ``None`` when the positive set is empty.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    positive_mask = q > 0.0
+    if not np.any(positive_mask):
+        return None
+    q_pos = q[positive_mask]
+    q_pos = q_pos / max(float(q_pos.sum()), float(eps))
+    p_pos = np.clip(p[positive_mask], float(eps), None)
+    p_pos = p_pos / max(float(p_pos.sum()), float(eps))
+    return cross_entropy_with_eps(q_pos, p_pos, eps)
 
 
 def metric_mean(rows: list[dict], key: str) -> float | None:
@@ -1272,7 +1347,7 @@ def build_human_scene_table(config) -> list[dict]:
     pc_rel_path = str(cfg_get(data_config, "pc_path", "paths.pc_path", default="vision_data/complete_pc"))
     max_points = int(getattr(config.task, "scale_max_points", 8192))
     scene_map: dict[tuple[int, str, str], dict] = {}
-    descriptor_cache: dict[tuple[str, str, str], tuple[str, np.ndarray, np.ndarray]] = {}
+    descriptor_cache: dict[tuple[str, str, str], tuple[str, np.ndarray, np.ndarray, float]] = {}
 
     for component_idx, (grasp_root, object_root) in enumerate(iter_human_roots(data_config)):
         for split in splits:
@@ -1292,7 +1367,7 @@ def build_human_scene_table(config) -> list[dict]:
                         pc_path = select_human_pointcloud(object_root, pc_rel_path, str(object_id_raw), sequence_id)
                         descriptor_key = (pc_path, json.dumps(np.asarray(grasp_data.get("object", {}).get("rel_scale", 1.0)).reshape(-1).tolist()), json.dumps(object_pose_matrix(grasp_data).reshape(-1).tolist()))
                         if descriptor_key in descriptor_cache:
-                            pc_path, canonical_descriptor, posed_descriptor = descriptor_cache[descriptor_key]
+                            pc_path, canonical_descriptor, posed_descriptor, object_scale = descriptor_cache[descriptor_key]
                         else:
                             points = np.asarray(np.load(pc_path, allow_pickle=True), dtype=np.float64).reshape(-1, 3)
                             if max_points > 0 and points.shape[0] > max_points:
@@ -1300,8 +1375,9 @@ def build_human_scene_table(config) -> list[dict]:
                                 points = points[indices]
                             scaled = scale_points(points, grasp_data.get("object", {}).get("rel_scale", 1.0))
                             canonical_descriptor = scale_descriptor(scaled)
+                            object_scale = object_scale_half_diagonal(scaled)
                             posed_descriptor = scale_descriptor(transform_points(scaled, object_pose_matrix(grasp_data)))
-                            descriptor_cache[descriptor_key] = (pc_path, canonical_descriptor, posed_descriptor)
+                            descriptor_cache[descriptor_key] = (pc_path, canonical_descriptor, posed_descriptor, object_scale)
                         scene = {
                             "component_idx": component_idx,
                             "split": split,
@@ -1311,6 +1387,7 @@ def build_human_scene_table(config) -> list[dict]:
                             "pc_path": pc_path,
                             "object_pose": object_pose_matrix(grasp_data),
                             "scale_descriptor": canonical_descriptor,
+                            "object_scale": float(object_scale),
                             "posed_descriptor": posed_descriptor,
                             "type_counts": {type_id: 0 for type_id in REAL_TYPE_IDS},
                             "grasp_paths": [],
@@ -1358,9 +1435,11 @@ def build_pose_class_labels(config, score_rows: list[dict]) -> tuple[list[dict],
         score_vectors = []
         score_scene_keys = []
         descriptors = []
+        object_scales = []
         for scene in member_scenes:
             member_scene_keys.append(scene["scene_key"])
             descriptors.append(np.asarray(scene["scale_descriptor"], dtype=np.float64))
+            object_scales.append(float(scene["object_scale"]))
             for idx, type_id in enumerate(REAL_TYPE_IDS):
                 counts[idx] += int(scene["type_counts"].get(type_id, 0))
             score_row = find_score_for_scene(score_by_scene, split, scene["scene_key"])
@@ -1372,6 +1451,7 @@ def build_pose_class_labels(config, score_rows: list[dict]) -> tuple[list[dict],
         q = counts / float(counts.sum())
         p = np.mean(np.stack(score_vectors, axis=0), axis=0) if score_vectors else None
         descriptor = np.mean(np.stack(descriptors, axis=0), axis=0)
+        object_scale = float(np.mean(object_scales))
         first = member_scenes[0]
         row = {
             "component_idx": int(component_idx),
@@ -1385,6 +1465,7 @@ def build_pose_class_labels(config, score_rows: list[dict]) -> tuple[list[dict],
             "member_scene_num": int(len(member_scene_keys)),
             "scored_scene_num": int(len(score_scene_keys)),
             "record_count": int(counts.sum()),
+            "object_scale": object_scale,
             "xy_long": float(descriptor[0]),
             "xy_short": float(descriptor[1]),
             "z_height": float(descriptor[2]),
@@ -1418,7 +1499,7 @@ def metric_row_for_pose_class(row: dict) -> dict | None:
     q = np.asarray([float(row[f"type_{type_id}_q"]) for type_id in REAL_TYPE_IDS], dtype=np.float64)
     p = np.asarray([float(row[f"type_{type_id}_p"]) for type_id in REAL_TYPE_IDS], dtype=np.float64)
     positive_mask = q > 0.0
-    ce = float(-np.sum(q * np.log(np.clip(p, EPS, None))))
+    ce = cross_entropy_with_eps(q, p, EPS)
     entropy = float(-np.sum(q * np.log(np.clip(q, EPS, None))))
     l1 = float(np.sum(np.abs(p - q)))
     p_top1 = top_k_indices(p, 1)
@@ -1431,11 +1512,13 @@ def metric_row_for_pose_class(row: dict) -> dict | None:
         "pose_class_key": row["pose_class_key"],
         "record_count": int(row["record_count"]),
         "positive_type_num": int(positive_mask.sum()),
+        "object_scale": float(row.get("object_scale", 0.5 * np.linalg.norm([float(row["xy_long"]), float(row["xy_short"]), float(row["z_height"])]))),
         "xy_long": float(row["xy_long"]),
         "xy_short": float(row["xy_short"]),
         "z_height": float(row["z_height"]),
         "soft_label_ce": ce,
         "kl_q_p": float(ce - entropy),
+        "positive_set_ce": positive_set_cross_entropy(q, p, EPS),
         "distribution_l1": l1,
         "tvd": float(0.5 * l1),
         "js_divergence": js_divergence(q, p),
@@ -1445,6 +1528,8 @@ def metric_row_for_pose_class(row: dict) -> dict | None:
         "top1_match": float(bool(p_top1 & q_top1)),
         "top2_overlap": float(len(p_top2 & q_top2) / 2.0),
     }
+    for eps in CE_EPS_VALUES:
+        out[ce_eps_key(eps)] = cross_entropy_with_eps(q, p, eps)
     for idx, type_id in enumerate(REAL_TYPE_IDS):
         out[f"type_{type_id}_q"] = float(q[idx])
         out[f"type_{type_id}_p"] = float(p[idx])
@@ -1533,6 +1618,8 @@ def summarize_metric_rows(rows: list[dict], group_name: str, group_value: str) -
     for metric in [
         "soft_label_ce",
         "kl_q_p",
+        "positive_set_ce",
+        *[ce_eps_key(eps) for eps in CE_EPS_VALUES],
         "distribution_l1",
         "tvd",
         "js_divergence",
@@ -1655,6 +1742,8 @@ def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_
         "### 指标解释",
         "- `Soft-label CE / NLL`：`-sum_t q_t log(p_t)`，衡量模型给 human observed 分布的 likelihood；越低越好。",
         "- `KL(q||p)`：`CE-H(q)`，去掉 label 自身 entropy 后的分布偏差；越低越好。",
+        "- `Positive-set CE`：只在 `q_t>0` 的 human observed positive types 内重新归一化 `p_t` 后计算 CE，衡量 positive set 内部的概率分配；越低越好，需和 PosMass 一起解读。",
+        "- `CE@eps`：用不同 `eps` 对 `p_t` 做 log 前下限裁剪后计算 CE，用于诊断平均 CE 对 `p_t≈0` 的敏感性；越低越好。",
         "- `Distribution L1 / TVD`：`sum_t |p_t-q_t|` 和其一半，直观表示概率质量错配量；越低越好。",
         "- `JS divergence`：对称、有界的分布距离，对 `p_t` 很小的情况比 KL 更稳定；越低越好。",
         "- `Positive probability mass`：`sum_{t in P(scene)} p_t`，衡量模型把多少概率放到 human observed positive types 上；越高越好。",
@@ -1662,14 +1751,16 @@ def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_
         "- `Rank agreement`：Spearman、Kendall、top-1 match、top-2 overlap，衡量五类排序是否接近 `q_t`，对 top-heavy allocator 更敏感。",
         "",
         "### Train/Test 主汇总",
-        "| split | avg | N | CE | KL | L1 | TVD | JS | PosMass | Spearman | Kendall | Top1 | Top2 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| split | avg | N | CE | KL | PosCE | CE@1e-6 | CE@1e-3 | L1 | TVD | JS | PosMass | Spearman | Kendall | Top1 | Top2 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     wanted = [row for row in summary_rows if row["group_name"] in {"scene_micro", "object_macro"} and row["group_value"] in {"train", "test"}]
     for row in wanted:
         lines.append(
             f"| {row['group_value']} | {row['group_name']} | {row['pose_class_num']} | "
             f"{format_float(row.get('soft_label_ce'))} | {format_float(row.get('kl_q_p'))} | "
+            f"{format_float(row.get('positive_set_ce'))} | {format_float(row.get(ce_eps_key(1e-6)))} | "
+            f"{format_float(row.get(ce_eps_key(1e-3)))} | "
             f"{format_float(row.get('distribution_l1'))} | {format_float(row.get('tvd'))} | "
             f"{format_float(row.get('js_divergence'))} | {format_float(row.get('positive_probability_mass'))} | "
             f"{format_float(row.get('spearman'))} | {format_float(row.get('kendall'))} | "
@@ -1709,6 +1800,202 @@ def run_human_1a(config, human_score_rows: list[dict], output_dir: str) -> tuple
     _write_csv(summary_rows, os.path.join(output_dir, "evaluation_human_metric_summary.csv"))
     _write_json(label_summary, os.path.join(output_dir, "evaluation_human_label_summary.json"))
     return human_report_lines(label_rows, metric_rows, summary_rows, output_dir), metric_rows, label_rows
+
+
+def load_scale_anchor_distributions(path: str, scope: str = "train") -> list[dict]:
+    """Load scale-anchor grasp-type distributions from HumanGraspData.
+
+    Args:
+        path: JSON path generated by HumanGraspData object-scale statistics.
+        scope: Distribution scope to load. ``train`` avoids using test labels in
+            the scale-anchor baseline. ``all`` is only for explicit diagnostics.
+
+    Returns:
+        Anchor rows with normalized five-type distributions.
+    """
+    payload = _load_json(path)
+    scope = str(scope or "train")
+    scoped_payload = payload.get("scopes", {}).get(scope)
+    if scoped_payload is not None:
+        entries = scoped_payload.get("entries", [])
+    elif scope == "all":
+        entries = payload.get("entries", [])
+    else:
+        raise ValueError(
+            f"Scale-anchor distribution JSON {path} does not contain scope={scope!r}. "
+            "Regenerate it with HumanGraspData task=stat so baseline statistics come from train only."
+        )
+    anchors = []
+    for entry in entries:
+        distribution = entry.get("distribution", {})
+        probs = np.asarray([float(distribution.get(label, 0.0)) for label in GRASP_TYPE_LABELS], dtype=np.float64)
+        total = float(probs.sum())
+        if total <= EPS:
+            continue
+        probs = probs / total
+        anchors.append(
+            {
+                "anchor_index": int(entry.get("index", len(anchors))),
+                "anchor_scale": float(entry["scale"]),
+                "anchor_interval": str(entry.get("interval", "")),
+                "anchor_total_count": int(entry.get("total_count", 0)),
+                "anchor_scope": scope,
+                "distribution": probs,
+            }
+        )
+    if not anchors:
+        raise ValueError(f"No valid scale-anchor distributions found in {path} for scope={scope!r}")
+    anchors.sort(key=lambda item: (float(item["anchor_scale"]), int(item["anchor_index"])))
+    return anchors
+
+
+def nearest_scale_anchor(object_scale: float, anchors: list[dict]) -> dict:
+    """Find the nearest scale anchor for one object scale.
+
+    Args:
+        object_scale: Object scale defined as half of AABB diagonal.
+        anchors: Anchor rows from ``load_scale_anchor_distributions``.
+
+    Returns:
+        The nearest anchor row.
+    """
+    if not anchors:
+        raise ValueError("Scale-anchor baseline requires at least one anchor")
+    return min(anchors, key=lambda item: (abs(float(item["anchor_scale"]) - float(object_scale)), int(item["anchor_index"])))
+
+
+def build_scale_anchor_baseline_predictions(label_rows: list[dict], anchors: list[dict], split: str = "test") -> list[dict]:
+    """Build baseline prediction rows by nearest object-scale anchor.
+
+    Args:
+        label_rows: Human pose-class label rows produced by ``build_pose_class_labels``.
+        anchors: Scale-anchor distribution rows.
+        split: Dataset split to evaluate, normally ``test``.
+
+    Returns:
+        Label-like rows whose ``type_*_p`` values come from the nearest anchor.
+    """
+    out = []
+    for row in label_rows:
+        if str(row.get("split", "")) != str(split):
+            continue
+        object_scale = float(row.get("object_scale", 0.5 * np.linalg.norm([float(row["xy_long"]), float(row["xy_short"]), float(row["z_height"])])))
+        anchor = nearest_scale_anchor(object_scale, anchors)
+        baseline = dict(row)
+        baseline["has_score"] = True
+        baseline["baseline_name"] = "nearest_object_scale_anchor"
+        baseline["anchor_scope"] = str(anchor.get("anchor_scope", ""))
+        baseline["object_scale"] = object_scale
+        baseline["anchor_index"] = int(anchor["anchor_index"])
+        baseline["anchor_scale"] = float(anchor["anchor_scale"])
+        baseline["anchor_interval"] = str(anchor["anchor_interval"])
+        baseline["anchor_total_count"] = int(anchor["anchor_total_count"])
+        baseline["anchor_abs_scale_delta"] = abs(float(anchor["anchor_scale"]) - object_scale)
+        for idx, type_id in enumerate(REAL_TYPE_IDS):
+            baseline[f"type_{type_id}_p"] = float(anchor["distribution"][idx])
+        out.append(baseline)
+    return out
+
+
+def scale_anchor_baseline_report_lines(
+    anchor_path: str,
+    anchor_scope: str,
+    anchors: list[dict],
+    prediction_rows: list[dict],
+    metric_rows: list[dict],
+    summary_rows: list[dict],
+    model_metric_rows: list[dict],
+    output_dir: str,
+) -> list[str]:
+    """Format the scale-anchor baseline report section.
+
+    Args:
+        anchor_path: Source scale-anchor JSON path.
+        anchor_scope: Source distribution scope, normally ``train``.
+        anchors: Loaded scale anchors.
+        prediction_rows: Baseline label/prediction rows.
+        metric_rows: Per-pose-class baseline metric rows.
+        summary_rows: Baseline aggregate rows.
+        model_metric_rows: Existing model metric rows for comparison.
+        output_dir: Directory containing CSV outputs.
+
+    Returns:
+        Markdown lines.
+    """
+    lines = [
+        f"- Baseline 来源: `{anchor_path}`",
+        f"- Baseline 统计 scope: `{anchor_scope}`。该 baseline 只使用这个 scope 内的 grasp distribution，默认使用 train 以避免 test label 泄漏。",
+        "- 对每个 test pose-class row，使用该 object 的 AABB 半对角 scale 找最近 anchor，并把该 anchor 的五类分布作为 `p_t`。",
+        f"- anchor 数量: {len(anchors)}；test baseline rows: {len(metric_rows)}。",
+        f"- baseline prediction CSV: `{os.path.join(output_dir, 'evaluation_human_scale_anchor_baseline_predictions.csv')}`",
+        f"- baseline metric CSV: `{os.path.join(output_dir, 'evaluation_human_scale_anchor_baseline_metrics.csv')}`",
+        f"- baseline summary CSV: `{os.path.join(output_dir, 'evaluation_human_scale_anchor_baseline_summary.csv')}`",
+        "",
+        "### Baseline vs Model（test）",
+        "| method | avg | N | CE | KL | PosCE | CE@1e-6 | CE@1e-3 | L1 | TVD | JS | PosMass | Spearman | Kendall | Top1 | Top2 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    model_test_rows = [row for row in model_metric_rows if str(row.get("split", "")) == "test"]
+    compare_rows = []
+    if model_test_rows:
+        compare_rows.append(("model", summarize_metric_rows(model_test_rows, "scene_micro", "test")))
+        compare_rows.append(("model", object_macro_summary(model_test_rows, "test")))
+    for row in summary_rows:
+        if row["group_name"] in {"scene_micro", "object_macro"} and row["group_value"] == "test":
+            compare_rows.append(("scale_anchor", row))
+    for method, row in compare_rows:
+        lines.append(
+            f"| {method} | {row['group_name']} | {row['pose_class_num']} | "
+            f"{format_float(row.get('soft_label_ce'))} | {format_float(row.get('kl_q_p'))} | "
+            f"{format_float(row.get('positive_set_ce'))} | {format_float(row.get(ce_eps_key(1e-6)))} | "
+            f"{format_float(row.get(ce_eps_key(1e-3)))} | "
+            f"{format_float(row.get('distribution_l1'))} | {format_float(row.get('tvd'))} | "
+            f"{format_float(row.get('js_divergence'))} | {format_float(row.get('positive_probability_mass'))} | "
+            f"{format_float(row.get('spearman'))} | {format_float(row.get('kendall'))} | "
+            f"{format_float(row.get('top1_match'))} | {format_float(row.get('top2_overlap'))} |"
+        )
+    if metric_rows:
+        mean_delta = float(np.mean([row["anchor_abs_scale_delta"] for row in metric_rows]))
+        max_delta = float(np.max([row["anchor_abs_scale_delta"] for row in metric_rows]))
+        lines.extend(["", f"- nearest-anchor scale delta mean={mean_delta:.6f}, max={max_delta:.6f}。"])
+    return lines
+
+
+def run_human_scale_anchor_baseline(config, label_rows: list[dict], model_metric_rows: list[dict], output_dir: str) -> list[str]:
+    """Run the nearest-object-scale-anchor human baseline.
+
+    Args:
+        config: Full Hydra config.
+        label_rows: Human pose-class label rows from 1A evaluation.
+        model_metric_rows: Model metric rows from 1A evaluation.
+        output_dir: Directory for CSV outputs.
+
+    Returns:
+        Markdown report lines.
+    """
+    anchor_path = _abs_path(getattr(config.task, "human_scale_anchor_distribution_json", ""))
+    if not anchor_path or not os.path.isfile(anchor_path):
+        return [f"- 跳过 scale-anchor baseline：找不到 anchor JSON `{anchor_path}`。"]
+    split = str(getattr(config.task, "human_scale_anchor_baseline_split", "test") or "test")
+    anchor_scope = str(getattr(config.task, "human_scale_anchor_distribution_scope", "train") or "train")
+    anchors = load_scale_anchor_distributions(anchor_path, scope=anchor_scope)
+    prediction_rows = build_scale_anchor_baseline_predictions(label_rows, anchors, split=split)
+    metric_rows = []
+    for prediction in prediction_rows:
+        metric = metric_row_for_pose_class(prediction)
+        if metric is None:
+            continue
+        for key in ["baseline_name", "anchor_scope", "anchor_index", "anchor_scale", "anchor_interval", "anchor_total_count", "anchor_abs_scale_delta"]:
+            metric[key] = prediction[key]
+        metric_rows.append(metric)
+    if metric_rows:
+        add_scale_buckets(metric_rows, int(getattr(config.task, "scale_bucket_count", 4)))
+    summary_rows = build_human_metric_summaries(metric_rows)
+    summary_rows.extend(train_test_gap_rows(summary_rows))
+    _write_csv(prediction_rows, os.path.join(output_dir, "evaluation_human_scale_anchor_baseline_predictions.csv"))
+    _write_csv(metric_rows, os.path.join(output_dir, "evaluation_human_scale_anchor_baseline_metrics.csv"))
+    _write_csv(summary_rows, os.path.join(output_dir, "evaluation_human_scale_anchor_baseline_summary.csv"))
+    return scale_anchor_baseline_report_lines(anchor_path, anchor_scope, anchors, prediction_rows, metric_rows, summary_rows, model_metric_rows, output_dir)
 
 
 def score_rows_with_scale(score_rows: list[dict], task_cfg, output_dir: str, prefix: str) -> list[dict]:
@@ -2264,12 +2551,21 @@ def task_evaluate(config) -> None:
     )
 
     human_metric_rows = []
+    human_label_rows = []
     if bool(getattr(config.task, "run_human_1a", True)):
         try:
-            human_lines, human_metric_rows, _ = run_human_1a(config, human_score_rows, output_dir)
+            human_lines, human_metric_rows, human_label_rows = run_human_1a(config, human_score_rows, output_dir)
             report.add_section("1A Human Train/Test 有 Label", human_lines)
         except Exception as exc:
             report.add_section("1A Human Train/Test 有 Label", [f"- 1A 运行失败：`{type(exc).__name__}: {exc}`"])
+            raise
+
+    if bool(getattr(config.task, "run_human_scale_anchor_baseline", True)):
+        try:
+            baseline_lines = run_human_scale_anchor_baseline(config, human_label_rows, human_metric_rows, output_dir)
+            report.add_section("1A-Baseline Human Scale Anchor", baseline_lines)
+        except Exception as exc:
+            report.add_section("1A-Baseline Human Scale Anchor", [f"- baseline 运行失败：`{type(exc).__name__}: {exc}`"])
             raise
 
     if bool(getattr(config.task, "run_dgn_1b", True)):

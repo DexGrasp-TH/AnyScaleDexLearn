@@ -28,6 +28,7 @@ except ImportError:
 
 VISUALIZE_MODE_OPTIONS = ("random_objects", "one_object", "one_object_multi_seq", "grasp_type")
 HUMAN_VISER_MODE_OPTIONS = ("random_objects", "one_object")
+HUMAN_VISER_SPLIT_OPTIONS = ("test", "train")
 HUMAN_SCORE_SUMMARY_MAX_RECORDS = 20
 CAPTION_ASPECTS = (
     ("scene_id", "Scene ID"),
@@ -1478,19 +1479,74 @@ def show_scenes_with_viser(
         render_current_view()
 
     if selection_controls is not None and hasattr(server, "gui"):
+        split_dropdown = None
+
+        def current_split_name():
+            """Return the selected dataset split when split filtering is enabled.
+
+            Args:
+                None.
+
+            Returns:
+                The current split dropdown value, or ``None`` when this
+                visualization mode does not expose split filtering.
+            """
+            return str(split_dropdown.value) if split_dropdown is not None else None
+
         def object_options_for_mode(mode):
             mode = normalize_visualize_mode(mode)
             if mode in {"one_object", "one_object_multi_seq"}:
                 return selection_controls["base_object_options"]
             return selection_controls["object_options"]
 
+        def selection_object_options(mode):
+            """Read object dropdown options for the current selection context.
+
+            Args:
+                mode: Current visualize mode.
+
+            Returns:
+                Object id options supplied by ``selection_controls``. Human
+                visualization may additionally scope these options by split.
+            """
+            if "object_options_for_mode" not in selection_controls:
+                return object_options_for_mode(mode)
+            if split_dropdown is not None:
+                return selection_controls["object_options_for_mode"](mode, current_split_name())
+            return selection_controls["object_options_for_mode"](mode)
+
+        def load_selection_scene_records(advance_batch=False):
+            """Load scene records from the current GUI selection state.
+
+            Args:
+                advance_batch: Whether to advance the selection batch.
+
+            Returns:
+                Scene records produced by the configured selection loader.
+            """
+            kwargs = {"advance_batch": advance_batch}
+            if split_dropdown is not None:
+                kwargs["split_name"] = current_split_name()
+            return selection_controls["load_scene_records"](
+                str(mode_dropdown.value),
+                str(object_dropdown.value),
+                str(grasp_type_dropdown.value),
+                **kwargs,
+            )
+
         with server.gui.add_folder("Selection"):
+            if "split_options" in selection_controls:
+                split_dropdown = server.gui.add_dropdown(
+                    "Split",
+                    options=selection_controls["split_options"],
+                    initial_value=selection_controls["initial_split"],
+                )
             mode_dropdown = server.gui.add_dropdown(
                 "Mode",
                 options=selection_controls["mode_options"],
                 initial_value=selection_controls["initial_mode"],
             )
-            initial_object_options = object_options_for_mode(selection_controls["initial_mode"])
+            initial_object_options = selection_object_options(selection_controls["initial_mode"])
             object_dropdown = server.gui.add_dropdown(
                 "Object",
                 options=initial_object_options,
@@ -1520,11 +1576,7 @@ def show_scenes_with_viser(
 
             def refresh_selection_widgets():
                 mode = normalize_visualize_mode(str(mode_dropdown.value))
-                object_options = (
-                    selection_controls["object_options_for_mode"](mode)
-                    if "object_options_for_mode" in selection_controls
-                    else object_options_for_mode(mode)
-                )
+                object_options = selection_object_options(mode)
                 preferred_object = object_dropdown.value if hasattr(object_dropdown, "value") else None
                 initial_object = pick_initial_object_option(object_options, preferred_object)
                 set_viser_dropdown_options(object_dropdown, object_options, initial_object)
@@ -1549,11 +1601,7 @@ def show_scenes_with_viser(
             def _on_apply_selection(event):
                 del event
                 try:
-                    new_scene_records = selection_controls["load_scene_records"](
-                        str(mode_dropdown.value),
-                        str(object_dropdown.value),
-                        str(grasp_type_dropdown.value),
-                    )
+                    new_scene_records = load_selection_scene_records()
                 except Exception as exc:
                     if status_handle is not None and hasattr(status_handle, "content"):
                         status_handle.content = f"Selection failed: `{exc}`"
@@ -1567,12 +1615,7 @@ def show_scenes_with_viser(
             def _on_next_selection_batch(event):
                 del event
                 try:
-                    new_scene_records = selection_controls["load_scene_records"](
-                        str(mode_dropdown.value),
-                        str(object_dropdown.value),
-                        str(grasp_type_dropdown.value),
-                        advance_batch=True,
-                    )
+                    new_scene_records = load_selection_scene_records(advance_batch=True)
                 except Exception as exc:
                     if status_handle is not None and hasattr(status_handle, "content"):
                         status_handle.content = f"Next batch failed: `{exc}`"
@@ -1587,6 +1630,12 @@ def show_scenes_with_viser(
             def _on_selection_mode_update(event):
                 del event
                 refresh_selection_widgets()
+
+            if split_dropdown is not None:
+                @split_dropdown.on_update
+                def _on_selection_split_update(event):
+                    del event
+                    refresh_selection_widgets()
 
             @object_dropdown.on_update
             def _on_selection_object_update(event):
@@ -1662,10 +1711,15 @@ def infer_visualize_mode(config: DictConfig):
 
 
 def get_output_dir(config: DictConfig) -> str:
-    return os.path.join(
-        config.ckpt.replace("ckpts", "tests").replace(".pth", ""),
-        config.test_data.name,
-    )
+    ckpt_path = str(config.ckpt)
+    ckpt_name = os.path.basename(ckpt_path)
+    step_name = os.path.splitext(ckpt_name)[0]
+
+    if step_name.startswith("step_"):
+        test_dir = os.path.join(str(config.output_folder), str(config.wandb.id), "tests", step_name)
+    else:
+        test_dir = ckpt_path.replace("ckpts", "tests").replace(".pth", "")
+    return os.path.join(test_dir, config.test_data.name)
 
 
 def resolve_human_dataset_path(path):
@@ -1847,6 +1901,70 @@ def build_human_visualization_index(sample_records, grasp_type_names):
         "grasp_type_names": tuple(grasp_type_names),
         "score_summary_cache": {},
     }
+
+
+def load_human_split_object_ids(config: DictConfig, split_names=HUMAN_VISER_SPLIT_OPTIONS):
+    """Load canonical human object ids for train/test split filtering.
+
+    Args:
+        config: Full Hydra config after data configs have been flattened.
+        split_names: Split names whose ``.json`` files should be read.
+
+    Returns:
+        A dictionary mapping split names to canonical object id sets. Missing
+        files produce empty sets so visualization can still fall back to the
+        splits that are present in the current saved sample directory.
+    """
+    object_path = str(getattr(config.test_data, "object_path", ""))
+    split_path = str(getattr(config.test_data, "split_path", "valid_split"))
+    split_root = os.path.join(object_path, split_path)
+    split_object_ids = {}
+    for split_name in split_names:
+        path = os.path.join(split_root, f"{split_name}.json")
+        object_ids = set()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                object_ids = {base_object_id_from_sequence(item) for item in json.load(f)}
+        except FileNotFoundError:
+            print(f"[visualize] Human split file not found: {path}")
+        except Exception as exc:
+            print(f"[visualize] Could not load human split file {path}: {exc}")
+        split_object_ids[str(split_name)] = object_ids
+    return split_object_ids
+
+
+def build_human_visualization_indices_by_split(sample_records, grasp_type_names, split_object_ids):
+    """Build one human visualization index per dataset split.
+
+    Args:
+        sample_records: Saved sample records from ``build_visualization_sample_index``.
+        grasp_type_names: Ordered grasp type names such as ``GRASP_TYPES``.
+        split_object_ids: Mapping from split name to canonical object id set.
+
+    Returns:
+        A dictionary mapping split name to a human visualization index. Records
+        whose base object id is not present in any requested split are excluded
+        to prevent train/test samples from being mixed in the UI.
+    """
+    records_by_split = {split_name: [] for split_name in split_object_ids}
+    for record in sample_records:
+        base_object_id = base_object_id_from_sequence(record["object_id"])
+        for split_name, object_ids in split_object_ids.items():
+            if base_object_id in object_ids:
+                records_by_split.setdefault(split_name, []).append(record)
+                break
+
+    indices_by_split = {}
+    for split_name, split_records in records_by_split.items():
+        if not split_records:
+            continue
+        indices_by_split[split_name] = build_human_visualization_index(split_records, grasp_type_names)
+        print(
+            f"[visualize] Human split {split_name}: "
+            f"{len(split_records)} sample record(s), "
+            f"{len(indices_by_split[split_name]['object_ids'])} object(s)."
+        )
+    return indices_by_split
 
 
 def human_object_score_summary(human_index, object_id: str, scene_path_resolver):
@@ -2163,9 +2281,41 @@ def task_visualize_human(config: DictConfig) -> None:
     if not all_sample_records:
         raise RuntimeError(f"No saved grasp files found in {output_dir}")
 
-    human_index = build_human_visualization_index(all_sample_records, GRASP_TYPES)
+    split_object_ids = load_human_split_object_ids(config)
+    human_indices_by_split = build_human_visualization_indices_by_split(
+        all_sample_records,
+        GRASP_TYPES,
+        split_object_ids,
+    )
+    if not human_indices_by_split:
+        fallback_split = str(OmegaConf.select(config, "test_data.test_split") or "test")
+        print(
+            "[visualize] Could not match saved human samples to train/test split files; "
+            f"falling back to one split named {fallback_split}."
+        )
+        human_indices_by_split = {fallback_split: build_human_visualization_index(all_sample_records, GRASP_TYPES)}
+    split_options = tuple(split for split in HUMAN_VISER_SPLIT_OPTIONS if split in human_indices_by_split)
+    split_options = split_options or tuple(sorted(human_indices_by_split.keys(), key=natural_sort_key))
+    preferred_split = str(
+        get_task_value(config, "split", OmegaConf.select(config, "test_data.test_split") or split_options[0])
+    )
+    initial_split = preferred_split if preferred_split in split_options else split_options[0]
     random_object_scene_count = 25
     one_object_per_type = 5
+
+    def get_human_index_for_split(split_name: str):
+        """Return the human visualization index for one split.
+
+        Args:
+            split_name: Dataset split selected in the UI.
+
+        Returns:
+            Human visualization index for the requested split.
+        """
+        split_name = str(split_name)
+        if split_name not in human_indices_by_split:
+            raise ValueError(f"Unknown human split {split_name}. Available splits: {list(human_indices_by_split)}")
+        return human_indices_by_split[split_name]
 
     def load_human_visualization_point_cloud(data, scene_cfg, scene_path, sample_file):
         """Load one visualization point cloud in the world frame when needed.
@@ -2325,28 +2475,65 @@ def task_visualize_human(config: DictConfig) -> None:
         if initial_mode not in HUMAN_VISER_MODE_OPTIONS:
             initial_mode = "random_objects"
 
-        object_options = human_index["object_ids"] or ("",)
-        grasp_type_options = tuple(format_grasp_type_option(idx, GRASP_TYPES) for idx in range(len(GRASP_TYPES)))
-        initial_object = pick_initial_object_option(object_options, get_task_value(config, "object_id", None))
+        initial_human_index = get_human_index_for_split(initial_split)
+        object_options = initial_human_index["object_ids"] or ("",)
+
+        def object_ids_with_pose_records(human_index):
+            return tuple(
+                object_id
+                for object_id in human_index["object_ids"]
+                if any(human_index["pose_records_by_object_and_type"].get(object_id, {}).values())
+            )
+
+        def available_grasp_type_ids(human_index):
+            grasp_type_ids = set()
+            if human_index["score_candidate_records_by_object"]:
+                grasp_type_ids.add(0)
+            for records_by_type in human_index["pose_records_by_object_and_type"].values():
+                grasp_type_ids.update(
+                    grasp_type_id for grasp_type_id, records in records_by_type.items() if records
+                )
+            return tuple(sorted(grasp_type_ids)) or (0,)
+
+        pose_object_options = object_ids_with_pose_records(initial_human_index)
+        if initial_mode == "one_object" and not pose_object_options:
+            print(
+                "[visualize] No typed human pose samples found for one_object mode; "
+                "falling back to random_objects score view."
+            )
+            initial_mode = "random_objects"
+
+        initial_object_options = pose_object_options if initial_mode == "one_object" and pose_object_options else object_options
+        grasp_type_options = tuple(
+            format_grasp_type_option(idx, GRASP_TYPES) for idx in available_grasp_type_ids(initial_human_index)
+        )
+        initial_object = pick_initial_object_option(initial_object_options, get_task_value(config, "object_id", None))
         initial_grasp_type = pick_initial_option(grasp_type_options, get_task_value(config, "target_grasp_type_id", 0))
         batch_state = {"key": None, "index": 0}
-        random_object_state = {"pool": None}
+        random_object_state = {"pool_by_split": {}}
 
-        def build_random_object_pool():
-            if random_object_state["pool"] is not None:
-                return random_object_state["pool"]
+        def object_options_for_split(split_name: str, mode: str = "random_objects"):
+            human_index = get_human_index_for_split(split_name)
+            if normalize_visualize_mode(mode) == "one_object":
+                return object_ids_with_pose_records(human_index) or ("",)
+            return human_index["object_ids"] or ("",)
+
+        def build_random_object_pool(split_name: str):
+            if split_name in random_object_state["pool_by_split"]:
+                return random_object_state["pool_by_split"][split_name]
+            human_index = get_human_index_for_split(split_name)
             object_pool = []
             for object_id in human_index["object_ids"]:
                 if human_object_score_summary(human_index, object_id, resolve_human_dataset_path) is not None:
                     object_pool.append(object_id)
             random.shuffle(object_pool)
-            random_object_state["pool"] = tuple(object_pool)
-            return random_object_state["pool"]
+            random_object_state["pool_by_split"][split_name] = tuple(object_pool)
+            return random_object_state["pool_by_split"][split_name]
 
-        def select_random_object_batch(batch_index: int, reshuffle: bool = False):
-            if reshuffle or random_object_state["pool"] is None:
-                random_object_state["pool"] = None
-            object_pool = build_random_object_pool()
+        def select_random_object_batch(split_name: str, batch_index: int, reshuffle: bool = False):
+            if reshuffle and split_name in random_object_state["pool_by_split"]:
+                random_object_state["pool_by_split"].pop(split_name, None)
+            object_pool = build_random_object_pool(split_name)
             if not object_pool:
                 return ()
             return tuple(
@@ -2357,10 +2544,12 @@ def task_visualize_human(config: DictConfig) -> None:
                 )
             )
 
-        def load_scene_records(mode, object_id, grasp_type_option, advance_batch=False):
+        def load_scene_records(mode, object_id, grasp_type_option, advance_batch=False, split_name=None):
+            split_name = str(split_name or initial_split)
+            human_index = get_human_index_for_split(split_name)
             mode = normalize_visualize_mode(mode)
             grasp_type_id = parse_grasp_type_option(grasp_type_option) if grasp_type_option else 0
-            selection_key = (mode,) if mode == "random_objects" else (mode, str(object_id))
+            selection_key = (split_name, mode) if mode == "random_objects" else (split_name, mode, str(object_id))
             selection_changed = selection_key != batch_state["key"]
             if selection_key != batch_state["key"]:
                 batch_state["key"] = selection_key
@@ -2372,6 +2561,7 @@ def task_visualize_human(config: DictConfig) -> None:
 
             if mode == "random_objects":
                 batch_object_ids = select_random_object_batch(
+                    split_name,
                     batch_state["index"],
                     reshuffle=selection_changed,
                 )
@@ -2402,6 +2592,8 @@ def task_visualize_human(config: DictConfig) -> None:
 
         return {
             "mode_options": HUMAN_VISER_MODE_OPTIONS,
+            "split_options": split_options,
+            "initial_split": initial_split,
             "initial_mode": initial_mode,
             "object_options": object_options,
             "base_object_options": object_options,
@@ -2410,7 +2602,10 @@ def task_visualize_human(config: DictConfig) -> None:
             "initial_grasp_type": initial_grasp_type,
             "load_scene_records": load_scene_records,
             "batch_state": batch_state,
-            "object_options_for_mode": lambda mode: object_options,
+            "object_options_for_mode": lambda mode, split_name=None: object_options_for_split(
+                split_name or initial_split,
+                mode,
+            ),
             "disable_object_for_mode": lambda mode: normalize_visualize_mode(mode) == "random_objects",
             "disable_grasp_type_for_mode": lambda mode: normalize_visualize_mode(mode) == "one_object",
             "disable_next_batch_for_mode": lambda mode: False,
@@ -2435,15 +2630,16 @@ def task_visualize_human(config: DictConfig) -> None:
     else:
         initial_mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_objects"))
         initial_grasp_type_id = int(get_task_value(config, "target_grasp_type_id", 0))
+        initial_human_index = get_human_index_for_split(initial_split)
         if initial_mode == "one_object":
             entry_records = sample_human_one_object_records(
-                human_index,
+                initial_human_index,
                 object_id=get_task_value(config, "object_id", None),
                 per_type_grasps=one_object_per_type,
             )
         else:
             entry_records = sample_human_random_object_records(
-                human_index,
+                initial_human_index,
                 grasp_type_id=initial_grasp_type_id,
                 max_objects=random_object_scene_count,
             )
