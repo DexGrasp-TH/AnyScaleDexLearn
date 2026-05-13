@@ -282,6 +282,9 @@ class RobotMultiDexDataset(Dataset):
         if self.mode == "train" and getattr(self.config, "pc_noise_aug", False):
             pc = self._apply_pc_noise_aug(pc)
 
+        if self.mode == "test":
+            pc = self._apply_test_pc_runtime_scale(pc)
+
         ret_dict["point_clouds"] = pc
         ret_dict["grasp_type_id"] = int(rand_grasp_type.split("_")[0])
         if self.sc_voxel_size is not None:
@@ -409,6 +412,24 @@ class RobotMultiDexDataset(Dataset):
                 ret_dict["left_hand_trans"] -= pc_centroid[None, :, :]
 
         return pc
+
+    def _apply_test_pc_runtime_scale(self, pc):
+        """Scale test point clouds for runtime-only inference conditioning.
+
+        Args:
+            pc: Centered test point cloud in physical scene units.
+
+        Returns:
+            Point cloud multiplied by ``config.pc_runtime_scale``. Training and
+            eval samples never call this helper, so their distribution is
+            unchanged.
+        """
+        runtime_scale = float(getattr(self.config, "pc_runtime_scale", 1.0))
+        if runtime_scale <= 0.0:
+            raise ValueError(f"pc_runtime_scale must be positive, got {runtime_scale}")
+        if runtime_scale == 1.0:
+            return pc.astype(np.float32, copy=False)
+        return (pc * np.float32(runtime_scale)).astype(np.float32, copy=False)
 
     def _apply_rotation_aug(self, pc, ret_dict):
         """Apply random rotation around Z axis."""

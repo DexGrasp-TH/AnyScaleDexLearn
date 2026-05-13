@@ -227,10 +227,12 @@ sampling and `<EXP_NAME>_type` for Human Prior grasp-type score sampling.
 # 1. Sample typed wrist/index-MCP poses from the diffusion checkpoint.
 # humanMultiHierar defaults to test_grasp_num=100, test_topk=20, and
 # algo.sample_selection.mode=pose_diversity.
-OMP_NUM_THREADS=4 python dexlearn/main.py \
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
   task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti \
-  exp_name=<EXP_NAME>_diffusion ckpt=007500 device=cuda:0 \
-  'test_data.grasp_type_lst=["1_right_two","2_right_three","3_right_full","4_both_three","5_both_full"]'
+  algo.batch_size=1024 \
+  'test_data.grasp_type_lst=["1_right_two","2_right_three","3_right_full","4_both_three","5_both_full"]' \
+  ckpt=007500 \
+  exp_name=<EXP_NAME>_diffusion
 
 # Optional pose candidate selection overrides:
 #   algo.sample_selection.mode=prob            # legacy log-prob top-20
@@ -238,36 +240,17 @@ OMP_NUM_THREADS=4 python dexlearn/main.py \
 #   algo.sample_selection.mode=pose_diversity  # default diverse 20 from 100
 
 # 2. Sample grasp-type scores from the type checkpoint.
-OMP_NUM_THREADS=4 python dexlearn/main.py \
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
   task=sample data=humanMulti algo=humanMultiHierar test_data=humanMulti \
-  exp_name=<EXP_NAME>_type ckpt=000300 device=cuda:0 \
   algo.model.train_type_only=true \
-  'test_data.grasp_type_lst=["0_any"]'
+  algo.batch_size=1024 \
+  'test_data.grasp_type_lst=["0_any"]' \
+  ckpt=000100 \
+  exp_name=<EXP_NAME>_type
 ```
 
-For multi-GPU batch sampling, run the helper once for poses and once for scores
-because the diffusion and type checkpoints usually use different step numbers.
 
-```bash
-# Typed pose samples.
-OMP_NUM_THREADS=4 python dexlearn/scripts/launch_multi_sample.py \
-  --exp-names <EXP_NAME>_diffusion \
-  --ckpt 010000 \
-  --gpus 0 1 2 3 \
-  --test-datasets humanMulti \
-  --sample-kinds pose
-
-# Grasp-type score samples.
-OMP_NUM_THREADS=4 python dexlearn/scripts/launch_multi_sample.py \
-  --exp-names <EXP_NAME>_type \
-  --ckpt 000300 \
-  --gpus 0 1 2 3 \
-  --test-datasets humanMulti \
-  --sample-kinds score \
-  --score-extra-overrides "algo.model.train_type_only=true"
-```
-
-### Object Human Prior Export
+### Object Human Prior Train and Export
 
 Train:
 ```bash
@@ -280,9 +263,14 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
 
 Export object-scene human prior scores and hand-position seeds for downstream
 BODex synthesis. The default task writes one 5-type budget score vector per
-scene and writes 20 unsorted pose samples per scene and grasp type. When
-`data.hand_pos_source=index_mcp`, the export stores `index_mcp_pos` and
-`wrist_quat` directly without running MANO to infer `wrist_pos`.
+scene, generates `algo.test_grasp_num` pose candidates per scene and grasp
+type, and keeps `algo.test_topk` samples according to `algo.sample_selection`.
+Set `task.robot_name` and `task.robot_size` to condition the export on a target
+robot hand. The test point cloud is scaled by `1 / task.robot_size` for human
+prior inference, while saved pose translations are mapped back to physical scene
+units. When `data.hand_pos_source=index_mcp`, the export stores
+`index_mcp_pos` and `wrist_quat` directly without running MANO to infer
+`wrist_pos`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
@@ -290,16 +278,29 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
   data=humanMulti \
   algo=humanMultiHierar \
   test_data=DGNMulti \
-  algo.batch_size=1024 # number of parallel scenes \
-  exp_name=<EXP_NAME> \
-  ckpt=<CKPT> \
+  test_data.test_split=all \
+  algo.batch_size=1024 \
+  task.skip_existing=false \
+  task.robot_name=leap_hand \
+  task.robot_size=1.8 \
+  task.score_ckpt=000100 \
+  task.pose_ckpt=007500 \
+  wandb.mode=disabled \
+  exp_name=human_prior_2 \
+  task.score_exp_name=human_prior_2_type \
+  task.pose_exp_name=human_prior_2_diffusion
 ```
 
 Outputs are written to
 `output/humanMulti_humanMultiHierar_<EXP_NAME>/obj_human_prior/step_<CKPT>/`
-unless `task.output_dir` is set. Per-scene files are stored under a subdirectory
-named after `test_data.object_path`'s final component, preserving the original
-scene id hierarchy, for example `.../step_<CKPT>/DGN_2k/<object>/<env>/<scene>.npy`.
+for single-checkpoint export, or
+`output/humanMulti_humanMultiHierar_<EXP_NAME>/obj_human_prior/step_<POSE_CKPT>_<SCORE_CKPT>/`
+for independent score/pose export, unless `task.output_dir` is set. When
+`task.score_ckpt` and `task.pose_ckpt` are both set, the top-level `ckpt`
+override is not used. Per-scene files are stored under a subdirectory named
+after `test_data.object_path`'s final component and `task.robot_name`,
+preserving the original scene id hierarchy, for example
+`.../step_<POSE_CKPT>_<SCORE_CKPT>/DGN_5k/leap_hand/<object>/<env>/<scene>.npy`.
 
 
 ### Visualize

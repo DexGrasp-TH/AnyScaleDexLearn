@@ -1535,6 +1535,8 @@ def show_scenes_with_viser(
             )
 
         with server.gui.add_folder("Selection"):
+            object_label = str(selection_controls.get("object_label", "Object"))
+            next_button_label = str(selection_controls.get("next_button_label", "Next Batch"))
             if "split_options" in selection_controls:
                 split_dropdown = server.gui.add_dropdown(
                     "Split",
@@ -1548,7 +1550,7 @@ def show_scenes_with_viser(
             )
             initial_object_options = selection_object_options(selection_controls["initial_mode"])
             object_dropdown = server.gui.add_dropdown(
-                "Object",
+                object_label,
                 options=initial_object_options,
                 initial_value=selection_controls["initial_object"],
             )
@@ -1563,14 +1565,14 @@ def show_scenes_with_viser(
                 initial_value=selection_controls["initial_grasp_type"],
             )
             apply_button = server.gui.add_button("Apply Selection")
-            next_batch_button = server.gui.add_button("Next Batch")
+            next_batch_button = server.gui.add_button(next_button_label)
             status_handle = server.gui.add_markdown("Selection loaded.") if hasattr(server.gui, "add_markdown") else None
 
             def update_object_info():
                 if object_info_handle is None or not hasattr(object_info_handle, "content"):
                     return
                 object_info_handle.content = (
-                    "Selected Object: "
+                    f"Selected {object_label}: "
                     f"{format_gui_wrappable_value(object_dropdown.value)}"
                 )
 
@@ -1623,7 +1625,10 @@ def show_scenes_with_viser(
                     return
                 batch_index = selection_controls.get("batch_state", {}).get("index", 0)
                 if status_handle is not None and hasattr(status_handle, "content"):
-                    status_handle.content = f"Loaded batch {batch_index + 1} with {len(new_scene_records)} scene(s)."
+                    status_handle.content = (
+                        f"Loaded {next_button_label.lower()} {batch_index + 1} "
+                        f"with {len(new_scene_records)} scene(s)."
+                    )
                 update_scene_records(new_scene_records)
 
             @mode_dropdown.on_update

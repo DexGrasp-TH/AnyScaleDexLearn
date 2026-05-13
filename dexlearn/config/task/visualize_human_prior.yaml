@@ -1,0 +1,23 @@
+name: visualize_human_prior
+
+# Directory produced by task=obj_human_prior_export. This may point either to
+# the obj_human_prior root or directly to one step_* export directory.
+prior_dir: output/humanMulti_humanMultiHierar_human_prior_2/obj_human_prior
+step:
+
+# Viser selection mode. The web UI can switch between these modes at runtime.
+visualize_mode: random_objects  # random_objects, one_scene
+object_id:
+scene_id:
+random_object_count: 25
+scene_option_count: 256
+one_scene_samples_per_type: 5
+
+visualizer: viser
+viser_port: 8080
+viser_scene_spacing: 0.5
+viser_display_mode: all
+viser_scene_id: 0
+
+# Point-cloud subsampling for each rendered scene.
+num_points: 1024

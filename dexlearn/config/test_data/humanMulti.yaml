@@ -7,6 +7,9 @@ num_points: 1024
 # ``0_any`` is intentionally excluded because it asks the model to predict the type.
 grasp_type_lst: ["1_right_two", "2_right_three", "3_right_full", "4_both_three", "5_both_full"]
 pc_centering: True
+# Runtime-only scale for test/inference point clouds. obj_human_prior_export
+# sets this to 1 / task.robot_size for robot-specific human prior inference.
+pc_runtime_scale: 1.0
 
 object_path: ${oc.env:AnyScaleGraspDataset}/OurHumanGraspFormat/object
 split_path: valid_split   # relative to object_path

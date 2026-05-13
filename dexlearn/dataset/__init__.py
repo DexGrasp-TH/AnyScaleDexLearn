@@ -257,6 +257,9 @@ def create_dataset(config, mode):
 
     data_config = deepcopy(config.data if mode != "test" else config.test_data)
     flatten_multidex_data_config(data_config)
+    if mode == "test" and not hasattr(data_config, "pc_runtime_scale"):
+        with open_dict(data_config):
+            data_config.pc_runtime_scale = 1.0
     apply_type_supervision_to_data_config(config, data_config, mode)
 
     object_path = cfg_get(data_config, "object_path", "paths.object_path")

@@ -15,7 +15,12 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dexlearn.dataset import GRASP_TYPES, create_test_dataloader, get_sparse_tensor
 from dexlearn.network.models import *  # noqa: F401,F403
-from dexlearn.task.sample import _decenter_human_pose
+from dexlearn.task.sample import (
+    _candidate_selection_indices,
+    _decenter_human_pose,
+    _gather_candidates,
+    _sample_selection_config,
+)
 from dexlearn.utils.config import resolve_type_supervision_config
 from dexlearn.utils.human_hand import normalize_hand_pos_source
 from dexlearn.utils.util import load_json, set_seed
@@ -57,6 +62,53 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+def export_robot_name(config: DictConfig) -> str:
+    """Read and validate the robot name used to namespace export files.
+
+    Args:
+        config: Full Hydra config containing ``task.robot_name``.
+
+    Returns:
+        Robot name that is safe to use as one path component.
+    """
+    robot_name = str(getattr(config.task, "robot_name", "shadow_hand")).strip()
+    if not robot_name:
+        raise ValueError("task.robot_name must be a non-empty string")
+    invalid_parts = {os.sep}
+    if os.altsep is not None:
+        invalid_parts.add(os.altsep)
+    if any(part in robot_name for part in invalid_parts):
+        raise ValueError(f"task.robot_name must be one path component, got {robot_name!r}")
+    return robot_name
+
+
+def export_robot_size(config: DictConfig) -> float:
+    """Read and validate the robot hand size ratio used for inference.
+
+    Args:
+        config: Full Hydra config containing ``task.robot_size``.
+
+    Returns:
+        Positive hand-size ratio relative to a human hand.
+    """
+    robot_size = float(getattr(config.task, "robot_size", 1.0))
+    if robot_size <= 0.0:
+        raise ValueError(f"task.robot_size must be positive, got {robot_size}")
+    return robot_size
+
+
+def export_pc_runtime_scale(config: DictConfig) -> float:
+    """Compute the point-cloud runtime scale for robot-specific inference.
+
+    Args:
+        config: Full Hydra config containing ``task.robot_size``.
+
+    Returns:
+        Scale applied to centered test point clouds before backbone inference.
+    """
+    return 1.0 / export_robot_size(config)
+
+
 def _checkpoint_name(ckpt_value: Any) -> str:
     """Build a checkpoint filename from a Hydra ``ckpt`` value.
 
@@ -72,6 +124,26 @@ def _checkpoint_name(ckpt_value: Any) -> str:
     if ckpt_text.startswith("step_"):
         return f"{ckpt_text}.pth"
     return f"step_{ckpt_text.zfill(6) if ckpt_text.isdigit() else ckpt_text}.pth"
+
+
+def _checkpoint_step_label(ckpt_value: Any, checkpoint_iter: int | None) -> str:
+    """Build a stable step label for output directory names.
+
+    Args:
+        ckpt_value: Checkpoint override, path, or ``None``.
+        checkpoint_iter: Training iteration stored in the checkpoint.
+
+    Returns:
+        Six-digit step text when possible, otherwise the checkpoint stem.
+    """
+    if checkpoint_iter is not None:
+        return f"{checkpoint_iter:06d}"
+    if ckpt_value is None:
+        return "unknown"
+    checkpoint_stem = os.path.splitext(_checkpoint_name(ckpt_value))[0]
+    if checkpoint_stem.startswith("step_"):
+        checkpoint_stem = checkpoint_stem[len("step_") :]
+    return checkpoint_stem
 
 
 def resolve_checkpoint_path(config: DictConfig) -> str:
@@ -185,8 +257,10 @@ def load_export_models(config: DictConfig) -> tuple[torch.nn.Module, torch.nn.Mo
         "checkpoint_iter": pose_checkpoint_iter,
         "score_checkpoint_path": score_checkpoint_path,
         "score_checkpoint_iter": score_checkpoint_iter,
+        "score_ckpt": score_config.ckpt,
         "pose_checkpoint_path": pose_checkpoint_path,
         "pose_checkpoint_iter": pose_checkpoint_iter,
+        "pose_ckpt": pose_config.ckpt,
         "uses_independent_models": True,
     }
 
@@ -207,6 +281,7 @@ def clone_config_with_grasp_types(config: DictConfig, grasp_types: list[str], sp
         pass_config.test_data.grasp_type_lst = list(grasp_types)
         pass_config.test_data.test_split = str(split_name)
         pass_config.test_data.display_grasp_type_lst = list(REAL_GRASP_TYPE_NAMES)
+        pass_config.test_data.pc_runtime_scale = export_pc_runtime_scale(config)
     return pass_config
 
 
@@ -316,16 +391,17 @@ def export_scene_dir(output_dir: str, config: DictConfig) -> str:
 
     Args:
         output_dir: Resolved task output directory.
-        config: Full Hydra config containing ``test_data.object_path``.
+        config: Full Hydra config containing ``test_data.object_path`` and
+            robot-specific export settings.
 
     Returns:
-        Directory named after the final component of the object asset path.
+        Directory named after the object asset path and robot name.
     """
     object_path = to_absolute_path(str(config.test_data.object_path)).rstrip(os.sep)
     asset_name = os.path.basename(object_path)
     if not asset_name:
         raise ValueError(f"Could not infer asset name from object_path={config.test_data.object_path}")
-    return pjoin(output_dir, asset_name)
+    return pjoin(output_dir, asset_name, export_robot_name(config))
 
 
 def scene_file_path(scene_dir: str, scene_id: str) -> str:
@@ -607,6 +683,113 @@ def unpack_pose_sample_result(result: tuple) -> tuple[torch.Tensor, torch.Tensor
     raise ValueError(f"Unsupported pose sample result length: {len(result)}")
 
 
+def rescale_human_pose_translations_for_export(robot_pose: torch.Tensor, robot_size: float) -> torch.Tensor:
+    """Map generated human pose translations back to physical scene scale.
+
+    Args:
+        robot_pose: Pose tensor whose last dimension stores right-hand
+            ``xyz+quat`` followed optionally by left-hand ``xyz+quat``.
+        robot_size: Robot hand size ratio used to shrink inference point clouds.
+
+    Returns:
+        Pose tensor with translation channels multiplied by ``robot_size``.
+        Quaternion channels are unchanged.
+    """
+    if robot_size == 1.0:
+        return robot_pose
+    if robot_pose.shape[-1] < 3:
+        return robot_pose
+    scaled_pose = robot_pose.clone()
+    scaled_pose[..., :3] = scaled_pose[..., :3] * float(robot_size)
+    if scaled_pose.shape[-1] >= 14:
+        scaled_pose[..., 7:10] = scaled_pose[..., 7:10] * float(robot_size)
+    return scaled_pose
+
+
+def export_pose_candidate_num(config: DictConfig) -> int:
+    """Read how many pose candidates should be generated before selection.
+
+    Args:
+        config: Full Hydra config containing ``algo.test_grasp_num``.
+
+    Returns:
+        Positive candidate count used before ``sample_selection`` filtering.
+    """
+    candidate_num = int(getattr(config.algo, "test_grasp_num", getattr(config.task, "samples_per_type", 20)))
+    if candidate_num <= 0:
+        raise ValueError("algo.test_grasp_num must be positive for obj_human_prior_export")
+    return candidate_num
+
+
+def export_samples_per_type(config: DictConfig) -> int:
+    """Read how many selected pose samples should be saved per grasp type.
+
+    Args:
+        config: Full Hydra config containing ``algo.test_topk`` and the legacy
+            ``task.samples_per_type`` alias.
+
+    Returns:
+        Positive selected sample count. The value must match
+        ``algo.test_topk`` so export uses the same semantics as ``sample.py``.
+    """
+    topk = int(getattr(config.algo, "test_topk", getattr(config.task, "samples_per_type", 20)))
+    samples_per_type = int(getattr(config.task, "samples_per_type", topk))
+    if topk <= 0:
+        raise ValueError("algo.test_topk must be positive for obj_human_prior_export")
+    if samples_per_type != topk:
+        raise ValueError(
+            "task.samples_per_type must match algo.test_topk. "
+            f"Got task.samples_per_type={samples_per_type}, algo.test_topk={topk}."
+        )
+    return topk
+
+
+def export_sample_selection_metadata(config: DictConfig) -> dict:
+    """Build JSON/NumPy-friendly metadata for pose candidate selection.
+
+    Args:
+        config: Full Hydra config containing ``algo.sample_selection``.
+
+    Returns:
+        Dictionary describing the generated candidate count, selected count,
+        and active selection strategy.
+    """
+    mode, translation_scale_m, rotation_weight = _sample_selection_config(config)
+    return {
+        "pose_candidate_num": export_pose_candidate_num(config),
+        "samples_per_type": export_samples_per_type(config),
+        "sample_selection_mode": mode,
+        "sample_selection_translation_scale_m": float(translation_scale_m),
+        "sample_selection_rotation_weight": float(rotation_weight),
+    }
+
+
+def select_export_pose_candidates(
+    robot_pose: torch.Tensor,
+    log_prob: torch.Tensor,
+    config: DictConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select final export candidates along the generated candidate dimension.
+
+    Args:
+        robot_pose: Candidate pose tensor shaped ``(B, N, ..., D)``.
+        log_prob: Candidate log probabilities shaped ``(B, N)``.
+        config: Full Hydra config containing ``algo.test_topk`` and
+            ``algo.sample_selection``.
+
+    Returns:
+        Tuple ``(robot_pose, log_prob)`` after candidate selection. If all
+        generated candidates are kept, the original tensors are returned
+        directly to avoid unnecessary random/top-k indexing work.
+    """
+    candidate_num = int(log_prob.shape[1])
+    topk = int(config.algo.test_topk)
+    if topk == candidate_num:
+        return robot_pose, log_prob
+    selection_indices = _candidate_selection_indices(robot_pose, log_prob, config)
+    return _gather_candidates(robot_pose, selection_indices), _gather_candidates(log_prob, selection_indices)
+
+
 def sample_fixed_types_from_features(
     config: DictConfig,
     model: torch.nn.Module,
@@ -621,7 +804,7 @@ def sample_fixed_types_from_features(
         model: Loaded hierarchical human prior model.
         data: Collated dataloader batch used for centering metadata.
         global_feature: Backbone output shaped ``(B, C)``.
-        samples_per_type: Number of pose samples per explicit grasp type.
+        samples_per_type: Number of selected pose samples per explicit grasp type.
 
     Returns:
         Tuple ``(grasp_pose, log_prob, grasp_type_ids)`` where ``grasp_pose`` is
@@ -635,22 +818,37 @@ def sample_fixed_types_from_features(
     type_ids = torch.as_tensor(REAL_GRASP_TYPE_IDS, device=global_feature.device, dtype=torch.long)
     type_num = int(type_ids.numel())
     feature_dim = int(global_feature.shape[-1])
+    candidate_num = export_pose_candidate_num(config)
+    if candidate_num < samples_per_type:
+        raise ValueError(
+            f"algo.test_grasp_num={candidate_num} is smaller than selected samples_per_type={samples_per_type}"
+        )
     global_feature_expanded = (
         global_feature[:, None, None, :]
-        .expand(batch_size, type_num, samples_per_type, feature_dim)
-        .reshape(batch_size * type_num * samples_per_type, feature_dim)
+        .expand(batch_size, type_num, candidate_num, feature_dim)
+        .reshape(batch_size * type_num * candidate_num, feature_dim)
     )
     type_ids_flat = (
         type_ids[None, :, None]
-        .expand(batch_size, type_num, samples_per_type)
-        .reshape(batch_size * type_num * samples_per_type)
+        .expand(batch_size, type_num, candidate_num)
+        .reshape(batch_size * type_num * candidate_num)
     )
     cond_feat = torch.cat([global_feature_expanded, model.grasp_type_emb(type_ids_flat)], dim=-1)
     robot_pose, log_prob = model.output_head.sample(cond_feat, type_ids_flat, 1)
 
-    robot_pose = robot_pose.reshape(batch_size, type_num, samples_per_type, *robot_pose.shape[1:])
+    robot_pose = robot_pose.reshape(batch_size, type_num, candidate_num, *robot_pose.shape[1:])
     robot_pose = robot_pose[:, :, :, 0]
+    robot_pose = robot_pose.reshape(batch_size * type_num, candidate_num, *robot_pose.shape[3:])
+    log_prob = log_prob.reshape(batch_size * type_num, candidate_num, -1)
+    if log_prob.shape[-1] != 1:
+        raise ValueError(f"Expected one log_prob per generated pose, got shape {tuple(log_prob.shape)}")
+    log_prob = log_prob[..., 0]
+
+    robot_pose, log_prob = select_export_pose_candidates(robot_pose, log_prob, config)
+
+    robot_pose = robot_pose.reshape(batch_size, type_num, samples_per_type, *robot_pose.shape[2:])
     robot_pose = robot_pose.reshape(batch_size, type_num * samples_per_type, *robot_pose.shape[3:])
+    robot_pose = rescale_human_pose_translations_for_export(robot_pose, export_robot_size(config))
     if "pc_centroid" in data:
         grasp_type_for_decenter = (
             type_ids[None, :, None]
@@ -661,10 +859,7 @@ def sample_fixed_types_from_features(
     grasp_pose = pose_tensor_to_grasp_pose(robot_pose)
     grasp_pose = grasp_pose.reshape(batch_size, type_num, samples_per_type, grasp_pose.shape[-1])
 
-    log_prob = log_prob.reshape(batch_size, type_num, samples_per_type, -1)
-    if log_prob.shape[-1] != 1:
-        raise ValueError(f"Expected one log_prob per generated pose, got shape {tuple(log_prob.shape)}")
-    log_prob = log_prob[..., 0]
+    log_prob = log_prob.reshape(batch_size, type_num, samples_per_type)
     return grasp_pose, log_prob, type_ids
 
 
@@ -693,7 +888,7 @@ def sample_scene_scores_and_fixed_type_poses(
     scene_index: list[dict] = []
     saved_scene_ids: set[str] = set()
     skip_scene_ids = skip_scene_ids or set()
-    samples_per_type = int(getattr(config.task, "samples_per_type", 20))
+    samples_per_type = export_samples_per_type(config)
     grasp_pos_source = normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist"))
     include_log_prob = bool(getattr(config.task, "include_log_prob", True))
     include_grasp_pose = bool(getattr(config.task, "include_grasp_pose", False))
@@ -785,6 +980,9 @@ def sample_scene_scores_and_fixed_type_poses(
                         "scene_id": summary["scene_id"],
                         "object_id": summary["object_id"],
                         "split": summary["split"],
+                        "robot_name": summary["robot_name"],
+                        "robot_size": summary["robot_size"],
+                        "pc_runtime_scale": summary["pc_runtime_scale"],
                         "scene_file": summary["scene_file"],
                     }
                 )
@@ -811,7 +1009,7 @@ def sample_fixed_type_wrist_poses(
     """
     pose_records: dict[str, dict[int, dict]] = {}
     skip_scene_ids = skip_scene_ids or set()
-    samples_per_type = int(getattr(config.task, "samples_per_type", 20))
+    samples_per_type = export_samples_per_type(config)
     pose_grasp_types = _as_list(getattr(config.task, "pose_grasp_types", list(REAL_GRASP_TYPE_NAMES)))
     grasp_pos_source = normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist"))
     include_log_prob = bool(getattr(config.task, "include_log_prob", True))
@@ -831,12 +1029,19 @@ def sample_fixed_type_wrist_poses(
             data = filter_batch_data(data, keep_indices, config)
             batch_metadata = [batch_metadata[index] for index in keep_indices]
 
-            result = model.sample(data, samples_per_type)
+            result = model.sample(data, export_pose_candidate_num(config))
             robot_pose, pred_grasp_type, log_prob = unpack_pose_sample_result(result)
+            if int(log_prob.shape[1]) != int(config.algo.test_topk):
+                selection_indices = _candidate_selection_indices(robot_pose, log_prob, config)
+                robot_pose = _gather_candidates(robot_pose, selection_indices)
+                log_prob = _gather_candidates(log_prob, selection_indices)
+                if pred_grasp_type is not None:
+                    pred_grasp_type = _gather_candidates(pred_grasp_type, selection_indices)
 
             grasp_type_for_decenter = pred_grasp_type if pred_grasp_type is not None else data["grasp_type_id"]
             if grasp_type_for_decenter.ndim == 1:
                 grasp_type_for_decenter = grasp_type_for_decenter.unsqueeze(1).expand(-1, robot_pose.shape[1])
+            robot_pose = rescale_human_pose_translations_for_export(robot_pose, export_robot_size(config))
             if "pc_centroid" in data:
                 robot_pose = _decenter_human_pose(robot_pose, data["pc_centroid"], grasp_type_for_decenter)
 
@@ -877,12 +1082,12 @@ def sample_fixed_type_wrist_poses(
     return pose_records
 
 
-def resolve_output_dir(config: DictConfig, checkpoint_iter: int | None) -> str:
+def resolve_output_dir(config: DictConfig, checkpoint_meta: dict) -> str:
     """Resolve the export output directory.
 
     Args:
         config: Full Hydra config.
-        checkpoint_iter: Training iteration stored in the checkpoint.
+        checkpoint_meta: Checkpoint metadata returned by ``load_export_models``.
 
     Returns:
         Absolute output directory path.
@@ -890,10 +1095,14 @@ def resolve_output_dir(config: DictConfig, checkpoint_iter: int | None) -> str:
     configured_output = getattr(config.task, "output_dir", None)
     if configured_output:
         return to_absolute_path(str(configured_output))
-    if checkpoint_iter is None:
+    if bool(checkpoint_meta["uses_independent_models"]):
+        pose_step = _checkpoint_step_label(checkpoint_meta.get("pose_ckpt"), checkpoint_meta.get("pose_checkpoint_iter"))
+        score_step = _checkpoint_step_label(checkpoint_meta.get("score_ckpt"), checkpoint_meta.get("score_checkpoint_iter"))
+        step_name = f"step_{pose_step}_{score_step}"
+    elif checkpoint_meta["checkpoint_iter"] is None:
         step_name = os.path.splitext(_checkpoint_name(config.ckpt))[0]
     else:
-        step_name = f"step_{checkpoint_iter:06d}"
+        step_name = f"step_{checkpoint_meta['checkpoint_iter']:06d}"
     return to_absolute_path(pjoin(str(config.output_folder), str(config.wandb.id), "obj_human_prior", step_name))
 
 
@@ -940,11 +1149,15 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
     Returns:
         None. Raises an exception if the file should not be reused.
     """
-    samples_per_type = int(getattr(config.task, "samples_per_type", 20))
+    samples_per_type = export_samples_per_type(config)
+    selection_metadata = export_sample_selection_metadata(config)
     required_keys = {
         "scene_id",
         "object_id",
         "split",
+        "robot_name",
+        "robot_size",
+        "pc_runtime_scale",
         "scene_path",
         "pc_path",
         "grasp_type_ids",
@@ -953,6 +1166,10 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
         "wrist_quat",
         "active_hand_mask",
         "grasp_pos_source",
+        "pose_candidate_num",
+        "sample_selection_mode",
+        "sample_selection_translation_scale_m",
+        "sample_selection_rotation_weight",
     }
     expected_source = normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist"))
     scene_source = normalize_hand_pos_source(str(scene_data.get("grasp_pos_source", expected_source)))
@@ -984,6 +1201,26 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
         raise ValueError("Existing export uses a different grasp type id order")
     if int(np.asarray(scene_data.get("samples_per_type", samples_per_type)).item()) != samples_per_type:
         raise ValueError("Existing export uses a different samples_per_type value")
+    if str(scene_data.get("robot_name")) != export_robot_name(config):
+        raise ValueError("Existing export uses a different robot_name value")
+    if not np.isclose(float(scene_data.get("robot_size")), export_robot_size(config)):
+        raise ValueError("Existing export uses a different robot_size value")
+    if not np.isclose(float(scene_data.get("pc_runtime_scale")), export_pc_runtime_scale(config)):
+        raise ValueError("Existing export uses a different pc_runtime_scale value")
+    if int(np.asarray(scene_data.get("pose_candidate_num", -1)).item()) != selection_metadata["pose_candidate_num"]:
+        raise ValueError("Existing export uses a different pose_candidate_num value")
+    if str(scene_data.get("sample_selection_mode")) != selection_metadata["sample_selection_mode"]:
+        raise ValueError("Existing export uses a different sample_selection_mode value")
+    if not np.isclose(
+        float(scene_data.get("sample_selection_translation_scale_m")),
+        selection_metadata["sample_selection_translation_scale_m"],
+    ):
+        raise ValueError("Existing export uses a different sample_selection_translation_scale_m value")
+    if not np.isclose(
+        float(scene_data.get("sample_selection_rotation_weight")),
+        selection_metadata["sample_selection_rotation_weight"],
+    ):
+        raise ValueError("Existing export uses a different sample_selection_rotation_weight value")
     validate_scene_export(scene_data, float(getattr(config.task, "quat_norm_tol", 1e-3)))
 
 
@@ -1042,6 +1279,9 @@ def scene_summary_from_data(scene_data: dict, scene_file: str) -> dict:
         "scene_id": str(scene_data["scene_id"]),
         "object_id": str(scene_data["object_id"]),
         "split": str(scene_data["split"]),
+        "robot_name": str(scene_data["robot_name"]),
+        "robot_size": float(scene_data["robot_size"]),
+        "pc_runtime_scale": float(scene_data["pc_runtime_scale"]),
         "scene_path": str(scene_data["scene_path"]),
         "pc_path": str(scene_data["pc_path"]),
         "scene_file": scene_file,
@@ -1063,7 +1303,7 @@ def build_scene_export_record(score_record: dict, pose_records: dict[int, dict],
     Returns:
         Per-scene export dictionary ready to save with ``np.save``.
     """
-    samples_per_type = int(getattr(config.task, "samples_per_type", 20))
+    samples_per_type = export_samples_per_type(config)
     missing_types = [type_id for type_id in REAL_GRASP_TYPE_IDS if type_id not in pose_records]
     if missing_types:
         raise KeyError(f"Missing pose records for scene_id={score_record['scene_id']}, type_ids={missing_types}")
@@ -1073,16 +1313,24 @@ def build_scene_export_record(score_record: dict, pose_records: dict[int, dict],
     position = np.stack([record[position_key] for record in ordered_pose_records], axis=0).astype(np.float32)
     wrist_quat = np.stack([record["wrist_quat"] for record in ordered_pose_records], axis=0).astype(np.float32)
     active_hand_mask = np.stack([record["active_hand_mask"] for record in ordered_pose_records], axis=0).astype(bool)
+    selection_metadata = export_sample_selection_metadata(config)
 
     scene_data = {
         "scene_id": score_record["scene_id"],
         "object_id": score_record["object_id"],
         "split": score_record["split"],
+        "robot_name": export_robot_name(config),
+        "robot_size": np.float32(export_robot_size(config)),
+        "pc_runtime_scale": np.float32(export_pc_runtime_scale(config)),
         "scene_path": score_record["scene_path"],
         "pc_path": score_record["pc_path"],
         "grasp_type_ids": np.asarray(REAL_GRASP_TYPE_IDS, dtype=np.int64),
         "grasp_type_names": np.asarray(REAL_GRASP_TYPE_NAMES),
         "samples_per_type": np.int64(samples_per_type),
+        "pose_candidate_num": np.int64(selection_metadata["pose_candidate_num"]),
+        "sample_selection_mode": selection_metadata["sample_selection_mode"],
+        "sample_selection_translation_scale_m": np.float32(selection_metadata["sample_selection_translation_scale_m"]),
+        "sample_selection_rotation_weight": np.float32(selection_metadata["sample_selection_rotation_weight"]),
         "score_semantics": score_semantics_from_config(config),
         "budget_scores": np.asarray(score_record["budget_scores"], dtype=np.float32),
         position_key: position,
@@ -1170,6 +1418,9 @@ def write_obj_human_prior_export(
                 "scene_id": row["scene_id"],
                 "object_id": row["object_id"],
                 "split": row["split"],
+                "robot_name": row["robot_name"],
+                "robot_size": row["robot_size"],
+                "pc_runtime_scale": row["pc_runtime_scale"],
                 "scene_path": row["scene_path"],
                 "pc_path": row["pc_path"],
                 "grasp_type_ids": row["grasp_type_ids"],
@@ -1212,19 +1463,31 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
     Returns:
         JSON-serializable manifest dictionary.
     """
+    selection_metadata = export_sample_selection_metadata(config)
     return {
         "task_name": "obj_human_prior_export",
         "checkpoint_path": checkpoint_meta["checkpoint_path"],
         "checkpoint_iter": checkpoint_meta["checkpoint_iter"],
         "uses_independent_models": bool(checkpoint_meta["uses_independent_models"]),
+        "robot_name": export_robot_name(config),
+        "robot_size": export_robot_size(config),
+        "pc_runtime_scale": export_pc_runtime_scale(config),
         "score_checkpoint_path": checkpoint_meta["score_checkpoint_path"],
         "score_checkpoint_iter": checkpoint_meta["score_checkpoint_iter"],
+        "score_ckpt": checkpoint_meta.get("score_ckpt"),
         "pose_checkpoint_path": checkpoint_meta["pose_checkpoint_path"],
         "pose_checkpoint_iter": checkpoint_meta["pose_checkpoint_iter"],
+        "pose_ckpt": checkpoint_meta.get("pose_ckpt"),
         "model_name": str(config.algo.model.name),
         "type_objective": str(getattr(config.algo.model, "type_objective", "ce")),
         "score_semantics": score_semantics_from_config(config),
-        "samples_per_type": int(getattr(config.task, "samples_per_type", 20)),
+        "samples_per_type": export_samples_per_type(config),
+        "pose_candidate_num": selection_metadata["pose_candidate_num"],
+        "sample_selection": {
+            "mode": selection_metadata["sample_selection_mode"],
+            "translation_scale_m": selection_metadata["sample_selection_translation_scale_m"],
+            "rotation_weight": selection_metadata["sample_selection_rotation_weight"],
+        },
         "object_splits": _as_list(getattr(config.task, "object_splits", [config.test_data.test_split])),
         "score_grasp_types": _as_list(getattr(config.task, "score_grasp_types", ["0_any"])),
         "pose_grasp_types": _as_list(getattr(config.task, "pose_grasp_types", list(REAL_GRASP_TYPE_NAMES))),
@@ -1254,9 +1517,11 @@ def task_obj_human_prior_export(config: DictConfig) -> None:
     config.wandb.mode = "disabled"
     if not bool(config.algo.human):
         raise ValueError("task=obj_human_prior_export expects a human prior model with algo.human=True")
+    export_robot_name(config)
+    export_robot_size(config)
 
     score_model, pose_model, checkpoint_meta = load_export_models(config)
-    output_dir = resolve_output_dir(config, checkpoint_meta["checkpoint_iter"])
+    output_dir = resolve_output_dir(config, checkpoint_meta)
     skip_existing = bool(getattr(config.task, "skip_existing", True))
     skip_scene_ids = collect_complete_scene_ids(output_dir, config) if skip_existing else set()
     if skip_scene_ids:
