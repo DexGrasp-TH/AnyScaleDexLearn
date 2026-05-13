@@ -173,25 +173,51 @@ def _pose_diversity_indices(
         the highest-probability candidate; subsequent candidates maximize their
         minimum feature distance to the already selected set.
     """
+    return _pose_diversity_indices_batched(robot_pose, log_prob, topk, translation_scale_m, rotation_weight)
+
+
+def _pose_diversity_indices_batched(
+    robot_pose: torch.Tensor,
+    log_prob: torch.Tensor,
+    topk: int,
+    translation_scale_m: float,
+    rotation_weight: float,
+) -> torch.Tensor:
+    """Select diverse candidates with batched greedy farthest-point sampling.
+
+    Args:
+        robot_pose: Candidate pose tensor shaped ``(B, N, ..., D)``.
+        log_prob: Candidate log probabilities shaped ``(B, N)``.
+        topk: Number of candidates to keep.
+        translation_scale_m: Meter scale used to normalize position channels.
+        rotation_weight: Multiplicative weight for normalized quaternion
+            channels.
+
+    Returns:
+        Long index tensor shaped ``(B, topk)``. This matches the legacy
+        per-row greedy selection while avoiding one Python loop per batch row.
+    """
     feature = _pose_diversity_feature(robot_pose, translation_scale_m, rotation_weight)
     batch_size, candidate_num = feature.shape[:2]
     selected = torch.empty((batch_size, topk), dtype=torch.long, device=robot_pose.device)
+    batch_indices = torch.arange(batch_size, dtype=torch.long, device=robot_pose.device)
 
-    for batch_index in range(batch_size):
-        batch_feature = feature[batch_index]
-        first_index = int(torch.argmax(log_prob[batch_index]).item())
-        selected[batch_index, 0] = first_index
-        chosen_mask = torch.zeros(candidate_num, dtype=torch.bool, device=robot_pose.device)
-        chosen_mask[first_index] = True
-        min_distance = torch.cdist(batch_feature[first_index : first_index + 1], batch_feature).squeeze(0)
+    first_index = torch.argmax(log_prob, dim=1)
+    selected[:, 0] = first_index
+    chosen_mask = torch.zeros((batch_size, candidate_num), dtype=torch.bool, device=robot_pose.device)
+    chosen_mask[batch_indices, first_index] = True
 
-        for out_index in range(1, topk):
-            score = min_distance.masked_fill(chosen_mask, -1.0)
-            next_index = int(torch.argmax(score).item())
-            selected[batch_index, out_index] = next_index
-            chosen_mask[next_index] = True
-            next_distance = torch.cdist(batch_feature[next_index : next_index + 1], batch_feature).squeeze(0)
-            min_distance = torch.minimum(min_distance, next_distance)
+    selected_feature = feature[batch_indices, first_index]
+    min_distance = torch.sum((feature - selected_feature[:, None, :]) ** 2, dim=-1)
+
+    for out_index in range(1, topk):
+        score = min_distance.masked_fill(chosen_mask, -1.0)
+        next_index = torch.argmax(score, dim=1)
+        selected[:, out_index] = next_index
+        chosen_mask[batch_indices, next_index] = True
+        next_feature = feature[batch_indices, next_index]
+        next_distance = torch.sum((feature - next_feature[:, None, :]) ** 2, dim=-1)
+        min_distance = torch.minimum(min_distance, next_distance)
 
     return selected
 
