@@ -302,6 +302,30 @@ after `test_data.object_path`'s final component and `task.robot_name`,
 preserving the original scene id hierarchy, for example
 `.../step_<POSE_CKPT>_<SCORE_CKPT>/DGN_5k/leap_hand/<object>/<env>/<scene>.npy`.
 
+Visualize an exported object human prior:
+```bash
+python dexlearn/main.py \
+  task=visualize_human_prior \
+  data=humanMulti \
+  algo=humanMultiHierar \
+  task.prior_dir=output/humanMulti_humanMultiHierar_human_prior_2/obj_human_prior \
+  task.step=007500_000100 \
+  task.robot_name=leap_hand
+```
+
+`visualize_human_prior` reads per-scene files directly from
+`<prior_dir>/<step>/<asset>/<robot_name>/<object>/...`; `task.robot_name` is
+required and must match the robot namespace in the export path. The export also
+writes `manifest.json`, `scene_index.json`, and `scene_budget_scores.jsonl`.
+Visualization does not depend on these summary files, but they are kept for
+reproducibility, audit/debug metadata, and downstream score evaluation.
+In the web Selection panel, Grasp Type `0_any` shows score-only records for
+`random_objects`; selecting a concrete type renders one random wrist pose of
+that type per object. In `one_scene`, `0_any` shows all real types and concrete
+types show only that row; Next Batch advances the pose sample window within the
+same scene, and Next Scene selects another random scene while preserving the
+current grasp-type selection.
+
 
 ### Visualize
 

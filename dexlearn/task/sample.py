@@ -93,28 +93,33 @@ def _decenter_robot_pose(
     return out
 
 
-def _sample_selection_config(config: DictConfig) -> tuple[str, float, float]:
+def _sample_selection_config(config: DictConfig) -> tuple[str, float, float, int | None]:
     """Read candidate selection hyperparameters from the algo config.
 
     Args:
         config: Full Hydra config used by ``task=sample``.
 
     Returns:
-        Tuple ``(mode, translation_scale_m, rotation_weight)``. ``mode`` is one
-        of ``prob``, ``random``, or ``pose_diversity``.
+        Tuple ``(mode, translation_scale_m, rotation_weight, intermediate_topk)``.
+        ``mode`` is one of ``prob``, ``random``, ``pose_diversity``,
+        ``pose_prob``, or ``prob_pose``.
     """
     selection_cfg = getattr(config.algo, "sample_selection", None)
     mode = str(getattr(selection_cfg, "mode", "prob")).strip().lower() if selection_cfg is not None else "prob"
-    valid_modes = {"prob", "random", "pose_diversity"}
+    valid_modes = {"prob", "random", "pose_diversity", "pose_prob", "prob_pose"}
     if mode not in valid_modes:
         raise ValueError(f"sample_selection.mode must be one of {sorted(valid_modes)}, got {mode!r}")
     translation_scale_m = float(getattr(selection_cfg, "translation_scale_m", 0.05)) if selection_cfg is not None else 0.05
     rotation_weight = float(getattr(selection_cfg, "rotation_weight", 1.0)) if selection_cfg is not None else 1.0
+    intermediate_topk = getattr(selection_cfg, "intermediate_topk", None) if selection_cfg is not None else None
+    intermediate_topk = None if intermediate_topk is None else int(intermediate_topk)
     if translation_scale_m <= 0.0:
         raise ValueError("sample_selection.translation_scale_m must be positive")
     if rotation_weight < 0.0:
         raise ValueError("sample_selection.rotation_weight must be non-negative")
-    return mode, translation_scale_m, rotation_weight
+    if intermediate_topk is not None and intermediate_topk <= 0:
+        raise ValueError("sample_selection.intermediate_topk must be positive when set")
+    return mode, translation_scale_m, rotation_weight, intermediate_topk
 
 
 def _pose_diversity_feature(
@@ -234,7 +239,7 @@ def _candidate_selection_indices(robot_pose: torch.Tensor, log_prob: torch.Tenso
     Returns:
         Long index tensor shaped ``(B, K)`` selecting candidates along dim 1.
     """
-    mode, translation_scale_m, rotation_weight = _sample_selection_config(config)
+    mode, translation_scale_m, rotation_weight, intermediate_topk = _sample_selection_config(config)
     candidate_num = int(log_prob.shape[1])
     topk = int(config.algo.test_topk)
     if topk <= 0:
@@ -247,7 +252,58 @@ def _candidate_selection_indices(robot_pose: torch.Tensor, log_prob: torch.Tenso
     if mode == "random":
         random_scores = torch.rand(log_prob.shape, device=log_prob.device, dtype=log_prob.dtype)
         return torch.topk(random_scores, topk, dim=1).indices
-    return _pose_diversity_indices(robot_pose, log_prob, topk, translation_scale_m, rotation_weight)
+    if mode == "pose_diversity":
+        return _pose_diversity_indices(robot_pose, log_prob, topk, translation_scale_m, rotation_weight)
+
+    intermediate_topk = _resolve_intermediate_topk(intermediate_topk, candidate_num, topk)
+    if mode == "pose_prob":
+        pose_indices = _pose_diversity_indices(
+            robot_pose,
+            log_prob,
+            intermediate_topk,
+            translation_scale_m,
+            rotation_weight,
+        )
+        pose_log_prob = _gather_candidates(log_prob, pose_indices)
+        second_indices = torch.topk(pose_log_prob, topk, dim=1).indices
+        return torch.gather(pose_indices, dim=1, index=second_indices)
+    if mode == "prob_pose":
+        prob_indices = torch.topk(log_prob, intermediate_topk, dim=1).indices
+        prob_robot_pose = _gather_candidates(robot_pose, prob_indices)
+        prob_log_prob = _gather_candidates(log_prob, prob_indices)
+        second_indices = _pose_diversity_indices(
+            prob_robot_pose,
+            prob_log_prob,
+            topk,
+            translation_scale_m,
+            rotation_weight,
+        )
+        return torch.gather(prob_indices, dim=1, index=second_indices)
+    raise ValueError(f"Unhandled sample_selection.mode={mode!r}")
+
+
+def _resolve_intermediate_topk(intermediate_topk: int | None, candidate_num: int, final_topk: int) -> int:
+    """Resolve the intermediate candidate count for two-stage selection modes.
+
+    Args:
+        intermediate_topk: Configured first-stage count ``N``.
+        candidate_num: Number of generated candidates.
+        final_topk: Final saved candidate count ``M``.
+
+    Returns:
+        Valid first-stage count ``N`` satisfying ``M <= N <= candidate_num``.
+    """
+    if intermediate_topk is None:
+        raise ValueError("sample_selection.intermediate_topk must be set for pose_prob/prob_pose modes")
+    if intermediate_topk < final_topk:
+        raise ValueError(
+            f"sample_selection.intermediate_topk={intermediate_topk} must be >= algo.test_topk={final_topk}"
+        )
+    if intermediate_topk > candidate_num:
+        raise ValueError(
+            f"sample_selection.intermediate_topk={intermediate_topk} exceeds generated candidate count {candidate_num}"
+        )
+    return int(intermediate_topk)
 
 
 def _gather_candidates(value: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:

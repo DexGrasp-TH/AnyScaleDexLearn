@@ -754,11 +754,12 @@ def export_sample_selection_metadata(config: DictConfig) -> dict:
         Dictionary describing the generated candidate count, selected count,
         and active selection strategy.
     """
-    mode, translation_scale_m, rotation_weight = _sample_selection_config(config)
+    mode, translation_scale_m, rotation_weight, intermediate_topk = _sample_selection_config(config)
     return {
         "pose_candidate_num": export_pose_candidate_num(config),
         "samples_per_type": export_samples_per_type(config),
         "sample_selection_mode": mode,
+        "sample_selection_intermediate_topk": intermediate_topk,
         "sample_selection_translation_scale_m": float(translation_scale_m),
         "sample_selection_rotation_weight": float(rotation_weight),
     }
@@ -1168,6 +1169,7 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
         "grasp_pos_source",
         "pose_candidate_num",
         "sample_selection_mode",
+        "sample_selection_intermediate_topk",
         "sample_selection_translation_scale_m",
         "sample_selection_rotation_weight",
     }
@@ -1211,6 +1213,8 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
         raise ValueError("Existing export uses a different pose_candidate_num value")
     if str(scene_data.get("sample_selection_mode")) != selection_metadata["sample_selection_mode"]:
         raise ValueError("Existing export uses a different sample_selection_mode value")
+    if scene_data.get("sample_selection_intermediate_topk") != selection_metadata["sample_selection_intermediate_topk"]:
+        raise ValueError("Existing export uses a different sample_selection_intermediate_topk value")
     if not np.isclose(
         float(scene_data.get("sample_selection_translation_scale_m")),
         selection_metadata["sample_selection_translation_scale_m"],
@@ -1329,6 +1333,7 @@ def build_scene_export_record(score_record: dict, pose_records: dict[int, dict],
         "samples_per_type": np.int64(samples_per_type),
         "pose_candidate_num": np.int64(selection_metadata["pose_candidate_num"]),
         "sample_selection_mode": selection_metadata["sample_selection_mode"],
+        "sample_selection_intermediate_topk": selection_metadata["sample_selection_intermediate_topk"],
         "sample_selection_translation_scale_m": np.float32(selection_metadata["sample_selection_translation_scale_m"]),
         "sample_selection_rotation_weight": np.float32(selection_metadata["sample_selection_rotation_weight"]),
         "score_semantics": score_semantics_from_config(config),
@@ -1485,6 +1490,7 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
         "pose_candidate_num": selection_metadata["pose_candidate_num"],
         "sample_selection": {
             "mode": selection_metadata["sample_selection_mode"],
+            "intermediate_topk": selection_metadata["sample_selection_intermediate_topk"],
             "translation_scale_m": selection_metadata["sample_selection_translation_scale_m"],
             "rotation_weight": selection_metadata["sample_selection_rotation_weight"],
         },

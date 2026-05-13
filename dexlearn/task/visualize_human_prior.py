@@ -119,22 +119,23 @@ def resolve_prior_step_dir(config: DictConfig) -> str:
     return prior_dir
 
 
-def list_prior_scene_files(prior_dir: str) -> list[str]:
-    """List per-scene export files under an object human-prior directory.
+def requested_robot_name(config: DictConfig) -> str:
+    """Read the required robot namespace selected for visualization.
 
     Args:
-        prior_dir: Step directory produced by ``obj_human_prior_export``.
+        config: Full Hydra config containing ``task.robot_name``.
 
     Returns:
-        Sorted scene ``.npy`` file paths.
+        Robot name string used as the export-path namespace.
     """
-    ignored_names = {"manifest.npy", "scene_index.npy"}
-    scene_files = []
-    for scene_file in glob(os.path.join(prior_dir, "**", "*.npy"), recursive=True):
-        if os.path.basename(scene_file) in ignored_names:
-            continue
-        scene_files.append(scene_file)
-    return sorted(scene_files, key=natural_sort_key)
+    robot_name = get_task_value(config, "robot_name", None)
+    if robot_name is None or str(robot_name).strip() == "":
+        raise ValueError("task.robot_name must be set for task=visualize_human_prior.")
+    robot_name = str(robot_name).strip()
+    invalid_parts = (os.sep, "/", "\\")
+    if any(part in robot_name for part in invalid_parts):
+        raise ValueError(f"task.robot_name must be one path component, got {robot_name!r}")
+    return robot_name
 
 
 def list_subdirs(path: str) -> list[str]:
@@ -153,40 +154,28 @@ def list_subdirs(path: str) -> list[str]:
     return sorted(children, key=natural_sort_key)
 
 
-def has_direct_npy(path: str) -> bool:
-    """Check whether a directory directly contains any ``.npy`` file.
-
-    Args:
-        path: Directory to inspect.
-
-    Returns:
-        ``True`` when at least one direct child is an ``.npy`` file.
-    """
-    try:
-        return any(entry.is_file() and entry.name.endswith(".npy") for entry in os.scandir(path))
-    except FileNotFoundError:
-        return False
-
-
-def discover_object_roots(prior_dir: str) -> dict[str, str]:
+def discover_object_roots(prior_dir: str, robot_name: str) -> dict[str, str]:
     """Discover object directories without scanning every scene export.
 
     Args:
         prior_dir: Step directory produced by ``obj_human_prior_export``.
+        robot_name: Required robot namespace to select in the export layout.
 
     Returns:
         Mapping from object id to object root directory. For the DGN export
-        layout this scans only ``step_*/DGN_5k/<object_id>`` directories.
+        layout this scans only ``step_*/DGN_5k/<robot>/<object_id>``.
     """
     object_roots: dict[str, str] = {}
-    direct_dirs = list_subdirs(prior_dir)
-    for direct_dir in direct_dirs:
-        child_dirs = list_subdirs(direct_dir)
-        if child_dirs and not has_direct_npy(direct_dir):
-            for object_root in child_dirs:
-                object_roots.setdefault(os.path.basename(object_root), object_root)
+    for asset_dir in list_subdirs(prior_dir):
+        asset_children = list_subdirs(asset_dir)
+        if not asset_children:
             continue
-        object_roots.setdefault(os.path.basename(direct_dir), direct_dir)
+
+        robot_dir = os.path.join(asset_dir, robot_name)
+        if not os.path.isdir(robot_dir):
+            continue
+        for object_root in list_subdirs(robot_dir):
+            object_roots.setdefault(os.path.basename(object_root), object_root)
     return dict(sorted(object_roots.items(), key=lambda item: natural_sort_key(item[0])))
 
 
@@ -251,7 +240,6 @@ def load_object_scene_records(prior_index: dict, object_id: str) -> list[dict]:
     scene_files = [
         scene_file
         for scene_file in glob(os.path.join(object_root, "**", "*.npy"), recursive=True)
-        if os.path.basename(scene_file) not in {"manifest.npy", "scene_index.npy"}
     ]
     scene_files = sorted(scene_files, key=natural_sort_key)
     if not scene_files:
@@ -351,24 +339,19 @@ def random_scene_record(prior_index: dict) -> dict:
     return record
 
 
-def build_prior_index(prior_dir: str) -> dict:
+def build_prior_index(prior_dir: str, robot_name: str) -> dict:
     """Build a lightweight index over per-scene object human-prior exports.
 
     Args:
         prior_dir: Step directory produced by ``obj_human_prior_export``.
+        robot_name: Required robot namespace to visualize.
 
     Returns:
         Dictionary with sorted scene records and object-id lookup tables.
     """
-    object_roots = discover_object_roots(prior_dir)
+    object_roots = discover_object_roots(prior_dir, robot_name=robot_name)
     if not object_roots:
-        scene_files = list_prior_scene_files(prior_dir)
-        if not scene_files:
-            raise RuntimeError(f"No per-scene object human-prior .npy files found in {prior_dir}")
-        object_roots = {
-            os.path.splitext(os.path.basename(scene_file))[0]: os.path.dirname(scene_file)
-            for scene_file in scene_files
-        }
+        raise RuntimeError(f"No object human-prior exports found for task.robot_name={robot_name} in {prior_dir}")
 
     return {
         "prior_dir": prior_dir,
@@ -376,6 +359,7 @@ def build_prior_index(prior_dir: str) -> dict:
         "object_scene_cache": {},
         "scene_record_by_id": {},
         "object_options": tuple(sorted(object_roots.keys(), key=natural_sort_key)),
+        "robot_name": robot_name,
     }
 
 
@@ -572,7 +556,26 @@ def build_score_scene_record(record: dict, scene_data: dict, pc: np.ndarray) -> 
         "caption": caption,
         "label_caption": label,
         "viser_all_label": record["object_id"],
+        "source_scene_id": record["scene_id"],
+        "source_object_id": record["object_id"],
     }
+
+
+def grasp_type_index(scene_data: dict, grasp_type_id: int) -> int:
+    """Find the row index for an exported grasp type id.
+
+    Args:
+        scene_data: Loaded per-scene export dictionary.
+        grasp_type_id: Real grasp type id in ``1..5``.
+
+    Returns:
+        Zero-based index into pose arrays for the requested grasp type.
+    """
+    grasp_type_ids = np.asarray(scene_data.get("grasp_type_ids", REAL_GRASP_TYPE_IDS), dtype=np.int64).reshape(-1)
+    matches = np.where(grasp_type_ids == int(grasp_type_id))[0]
+    if len(matches) == 0:
+        raise KeyError(f"grasp_type_id={grasp_type_id} not found in scene export.")
+    return int(matches[0])
 
 
 def build_pose_scene_record(
@@ -634,6 +637,8 @@ def build_pose_scene_record(
         "caption": caption,
         "label_caption": label,
         "viser_all_label": f"{GRASP_TYPES[grasp_type_id]} | {sample_index + 1}",
+        "source_scene_id": record["scene_id"],
+        "source_object_id": record["object_id"],
         "viser_grid_row": grasp_type_index,
         "viser_grid_col": sample_index,
         "viser_grid_rows": len(grasp_type_ids),
@@ -698,6 +703,21 @@ def one_scene_record(prior_index: dict, scene_id: str | None = None, random_next
     return find_scene_record(prior_index, str(scene_id))
 
 
+def one_scene_grid_row(grasp_type_index_value: int, target_grasp_type_id: int) -> int:
+    """Resolve the displayed row for one-scene pose records.
+
+    Args:
+        grasp_type_index_value: Zero-based row index in the exported pose array.
+        target_grasp_type_id: Selected grasp type id. ``0`` means all real
+            grasp types are visible.
+
+    Returns:
+        Grid row used by the shared viser renderer. A concrete selected type is
+        displayed as a single-row grid, while ``0_any`` preserves export rows.
+    """
+    return 0 if int(target_grasp_type_id) != 0 else int(grasp_type_index_value)
+
+
 def build_scene_records(
     prior_index: dict,
     mode: str,
@@ -705,6 +725,7 @@ def build_scene_records(
     batch_index: int,
     config: DictConfig,
     mano_layers: dict | None = None,
+    grasp_type_id: int = 0,
 ) -> list[dict]:
     """Build renderer scene records for the selected visualization mode.
 
@@ -715,6 +736,8 @@ def build_scene_records(
         batch_index: Zero-based page index.
         config: Full Hydra config.
         mano_layers: Optional MANO layers required for pose rendering.
+        grasp_type_id: Selected grasp type. ``0`` means score-only in
+            ``random_objects`` and all real types in ``one_scene``.
 
     Returns:
         Scene records consumed by shared visualization renderers.
@@ -726,26 +749,17 @@ def build_scene_records(
         selected = random_object_records(prior_index, int(get_task_value(config, "random_object_count", 25)), batch_index)
         for record in progress_iter(selected, desc="Building score scenes", total=len(selected)):
             scene_data, pc = load_record_scene_payload(record, num_points)
-            scene_records.append(build_score_scene_record(record, scene_data, pc))
-        return scene_records
-
-    if mode != "one_scene":
-        raise ValueError(f"Unsupported visualize_human_prior mode={mode}.")
-    if mano_layers is None:
-        raise ValueError("MANO layers are required for one_scene pose visualization.")
-
-    record = one_scene_record(prior_index, scene_id=object_id, random_next=batch_index > 0)
-    scene_data, pc = load_record_scene_payload(record, num_points)
-    position_key = str(scene_data.get("export_position_key", "index_mcp_pos"))
-    if position_key not in scene_data:
-        position_key = "index_mcp_pos" if "index_mcp_pos" in scene_data else "wrist_pos"
-    pose_array = np.asarray(scene_data[position_key])
-    samples_per_type = min(
-        int(get_task_value(config, "one_scene_samples_per_type", get_task_value(config, "one_object_samples_per_type", 5))),
-        pose_array.shape[1],
-    )
-    for grasp_type_index in range(pose_array.shape[0]):
-        for sample_index in range(samples_per_type):
+            if int(grasp_type_id) == 0:
+                scene_records.append(build_score_scene_record(record, scene_data, pc))
+                continue
+            if mano_layers is None:
+                raise ValueError("MANO layers are required for random_objects pose visualization.")
+            type_index = grasp_type_index(scene_data, int(grasp_type_id))
+            position_key = str(scene_data.get("export_position_key", "index_mcp_pos"))
+            if position_key not in scene_data:
+                position_key = "index_mcp_pos" if "index_mcp_pos" in scene_data else "wrist_pos"
+            sample_count = np.asarray(scene_data[position_key]).shape[1]
+            sample_index = random.randrange(int(sample_count))
             scene_records.append(
                 build_pose_scene_record(
                     record,
@@ -753,11 +767,66 @@ def build_scene_records(
                     pc,
                     mano_layers,
                     str(config.device),
-                    grasp_type_index,
+                    type_index,
                     sample_index,
-                    samples_per_type,
+                    1,
                 )
             )
+            scene_records[-1]["viser_grid_row"] = 0
+            scene_records[-1]["viser_grid_col"] = 0
+            scene_records[-1]["viser_grid_rows"] = 1
+            scene_records[-1]["viser_grid_cols"] = 1
+        return scene_records
+
+    if mode != "one_scene":
+        raise ValueError(f"Unsupported visualize_human_prior mode={mode}.")
+    if mano_layers is None:
+        raise ValueError("MANO layers are required for one_scene pose visualization.")
+
+    record = one_scene_record(prior_index, scene_id=object_id, random_next=False)
+    prior_index["scene_record_by_id"][record["scene_id"]] = record
+    scene_data, pc = load_record_scene_payload(record, num_points)
+    position_key = str(scene_data.get("export_position_key", "index_mcp_pos"))
+    if position_key not in scene_data:
+        position_key = "index_mcp_pos" if "index_mcp_pos" in scene_data else "wrist_pos"
+    pose_array = np.asarray(scene_data[position_key])
+    visible_samples_per_type = min(
+        int(get_task_value(config, "one_scene_samples_per_type", get_task_value(config, "one_object_samples_per_type", 5))),
+        pose_array.shape[1],
+    )
+    if visible_samples_per_type <= 0:
+        raise ValueError("task.one_scene_samples_per_type must be positive.")
+    batch_start = (max(0, int(batch_index)) * visible_samples_per_type) % pose_array.shape[1]
+    sample_indices = [
+        (batch_start + offset) % pose_array.shape[1]
+        for offset in range(min(visible_samples_per_type, pose_array.shape[1]))
+    ]
+    if int(grasp_type_id) == 0:
+        type_indices = range(pose_array.shape[0])
+    else:
+        type_indices = [grasp_type_index(scene_data, int(grasp_type_id))]
+    for grasp_type_index_value in type_indices:
+        for grid_col, sample_index in enumerate(sample_indices):
+            scene_records.append(
+                build_pose_scene_record(
+                    record,
+                    scene_data,
+                    pc,
+                    mano_layers,
+                    str(config.device),
+                    int(grasp_type_index_value),
+                    sample_index,
+                    len(sample_indices),
+                )
+            )
+            scene_records[-1]["viser_grid_col"] = grid_col
+            scene_records[-1]["viser_grid_row"] = one_scene_grid_row(
+                int(grasp_type_index_value),
+                int(grasp_type_id),
+            )
+            scene_records[-1]["viser_grid_rows"] = 1 if int(grasp_type_id) != 0 else pose_array.shape[0]
+            scene_records[-1]["viser_grid_cols"] = len(sample_indices)
+            scene_records[-1]["caption"] = f"{scene_records[-1]['caption']} | batch={batch_index + 1}"
     return scene_records
 
 
@@ -785,8 +854,8 @@ def build_prior_selection_controls(prior_index: dict, config: DictConfig, mano_l
         )
     else:
         initial_object = pick_initial_object_option(object_options, get_task_value(config, "object_id", None))
-    grasp_type_options = tuple(format_grasp_type_option(idx, GRASP_TYPES) for idx in REAL_GRASP_TYPE_IDS)
-    initial_grasp_type = pick_initial_option(grasp_type_options, 1)
+    grasp_type_options = tuple(format_grasp_type_option(idx, GRASP_TYPES) for idx in range(len(GRASP_TYPES)))
+    initial_grasp_type = pick_initial_option(grasp_type_options, get_task_value(config, "target_grasp_type_id", 0))
     batch_state = {"key": None, "index": 0}
 
     def load_scene_records(mode, object_id, grasp_type_option, advance_batch=False, split_name=None):
@@ -795,38 +864,83 @@ def build_prior_selection_controls(prior_index: dict, config: DictConfig, mano_l
         Args:
             mode: Selected UI visualization mode.
             object_id: Selected object id.
-            grasp_type_option: Unused grasp-type dropdown value kept for the
-                shared viser control contract.
-            advance_batch: Whether to advance to the next object/scene page.
+            grasp_type_option: Selected grasp type. ``0_any`` shows score-only
+                records in random-object mode.
+            advance_batch: Whether to advance to the next object page or
+                one-scene pose sample page.
             split_name: Unused split name kept for the shared control contract.
 
         Returns:
             Scene records for the requested selection.
         """
         del split_name
-        if grasp_type_option:
-            parse_grasp_type_option(grasp_type_option)
+        target_grasp_type_id = parse_grasp_type_option(grasp_type_option) if grasp_type_option else 0
         mode = normalize_prior_visualize_mode(mode)
-        selection_key = mode if mode == "random_objects" else (mode, str(object_id))
+        selection_key = (mode, str(object_id), int(target_grasp_type_id))
         if selection_key != batch_state["key"]:
             batch_state["key"] = selection_key
             batch_state["index"] = 0
         elif advance_batch:
             batch_state["index"] += 1
         mano_layers = None
-        if mode == "one_scene":
+        if mode == "one_scene" or int(target_grasp_type_id) != 0:
             if mano_layers_state.get("value") is None:
-                print("[visualize_human_prior] Initializing MANO layers for one_scene pose view.")
+                print("[visualize_human_prior] Initializing MANO layers for pose view.")
                 mano_layers_state["value"] = create_mano_layers(str(config.device))
             mano_layers = mano_layers_state["value"]
-        return build_scene_records(
+        scene_records = build_scene_records(
             prior_index,
             mode,
             str(object_id),
             batch_state["index"],
             config,
             mano_layers=mano_layers,
+            grasp_type_id=int(target_grasp_type_id),
         )
+        if mode == "one_scene" and scene_records:
+            batch_state["current_object"] = str(scene_records[0].get("source_scene_id", object_id))
+        elif mode == "random_objects":
+            batch_state["current_object"] = str(object_id)
+        return scene_records
+
+    def load_action_scene_records(mode, object_id, grasp_type_option, action_name: str, split_name=None):
+        """Load scene records for human-prior-specific Selection actions.
+
+        Args:
+            mode: Selected UI visualization mode.
+            object_id: Selected object id or scene id.
+            grasp_type_option: Selected grasp type option.
+            action_name: Button action label. ``Next Scene`` selects another
+                random scene while keeping the current grasp type.
+            split_name: Unused split name kept for the shared control contract.
+
+        Returns:
+            Scene records for the requested action.
+        """
+        del split_name
+        mode = normalize_prior_visualize_mode(mode)
+        if mode != "one_scene" or str(action_name) != "Next Scene":
+            return load_scene_records(mode, object_id, grasp_type_option, advance_batch=True)
+
+        target_grasp_type_id = parse_grasp_type_option(grasp_type_option) if grasp_type_option else 0
+        random_record = one_scene_record(prior_index, random_next=True)
+        batch_state["key"] = (mode, random_record["scene_id"], int(target_grasp_type_id))
+        batch_state["index"] = 0
+        if mano_layers_state.get("value") is None:
+            print("[visualize_human_prior] Initializing MANO layers for pose view.")
+            mano_layers_state["value"] = create_mano_layers(str(config.device))
+        scene_records = build_scene_records(
+            prior_index,
+            mode,
+            random_record["scene_id"],
+            batch_state["index"],
+            config,
+            mano_layers=mano_layers_state["value"],
+            grasp_type_id=int(target_grasp_type_id),
+        )
+        if scene_records:
+            batch_state["current_object"] = str(scene_records[0].get("source_scene_id", random_record["scene_id"]))
+        return scene_records
 
     return {
         "mode_options": HUMAN_PRIOR_VISER_MODE_OPTIONS,
@@ -842,10 +956,13 @@ def build_prior_selection_controls(prior_index: dict, config: DictConfig, mano_l
             scene_options(prior_index, config) if normalize_prior_visualize_mode(mode) == "one_scene" else object_options
         ),
         "object_label": "Scene",
-        "next_button_label": "Next Scene",
+        "next_button_label": "Next Batch",
+        "extra_action_button_label": "Next Scene",
         "disable_object_for_mode": lambda mode: normalize_prior_visualize_mode(mode) == "random_objects",
-        "disable_grasp_type_for_mode": lambda mode: True,
+        "disable_grasp_type_for_mode": lambda mode: False,
         "disable_next_batch_for_mode": lambda mode: False,
+        "disable_extra_action_for_mode": lambda mode: normalize_prior_visualize_mode(mode) != "one_scene",
+        "load_action_scene_records": load_action_scene_records,
     }
 
 
@@ -867,8 +984,11 @@ def task_visualize_human_prior(config: DictConfig) -> None:
 
     prior_dir = resolve_prior_step_dir(config)
     print(f"[visualize_human_prior] Visualizing object human-prior export: {prior_dir}")
-    prior_index = build_prior_index(prior_dir)
+    robot_name = requested_robot_name(config)
+    prior_index = build_prior_index(prior_dir, robot_name=robot_name)
     print(f"[visualize_human_prior] Indexed {len(prior_index['object_options'])} object(s) lazily.")
+    if robot_name:
+        print(f"[visualize_human_prior] Robot namespace: {robot_name}")
     mano_layers_state = {"value": None}
 
     viser_port = int(get_task_value(config, "viser_port", 8080))

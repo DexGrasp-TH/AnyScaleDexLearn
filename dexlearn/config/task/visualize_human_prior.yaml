@@ -4,6 +4,9 @@ name: visualize_human_prior
 # the obj_human_prior root or directly to one step_* export directory.
 prior_dir: output/humanMulti_humanMultiHierar_human_prior_2/obj_human_prior
 step:
+# Required robot namespace inside the export step, matching
+# obj_human_prior/<step>/<asset>/<robot_name>/<object>/...
+robot_name:
 
 # Viser selection mode. The web UI can switch between these modes at runtime.
 visualize_mode: random_objects  # random_objects, one_scene
@@ -11,7 +14,13 @@ object_id:
 scene_id:
 random_object_count: 25
 scene_option_count: 256
+# Number of wrist pose samples shown per grasp type on each one_scene page.
+# The Selection panel's Next Batch button advances this sample window; Next
+# Scene selects another random scene while keeping the current grasp type.
 one_scene_samples_per_type: 5
+# Initial Grasp Type dropdown value. 0_any is score-only for random_objects and
+# all real grasp types for one_scene; ids 1..5 render wrist poses for that type.
+target_grasp_type_id: 0
 
 visualizer: viser
 viser_port: 8080

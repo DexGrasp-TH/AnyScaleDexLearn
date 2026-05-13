@@ -1534,6 +1534,25 @@ def show_scenes_with_viser(
                 **kwargs,
             )
 
+        def load_selection_action_records(action_name: str):
+            """Load scene records for a custom Selection-panel action.
+
+            Args:
+                action_name: Name of the action requested by the caller.
+
+            Returns:
+                Scene records produced by the configured action loader.
+            """
+            kwargs = {"action_name": str(action_name)}
+            if split_dropdown is not None:
+                kwargs["split_name"] = current_split_name()
+            return selection_controls["load_action_scene_records"](
+                str(mode_dropdown.value),
+                str(object_dropdown.value),
+                str(grasp_type_dropdown.value),
+                **kwargs,
+            )
+
         with server.gui.add_folder("Selection"):
             object_label = str(selection_controls.get("object_label", "Object"))
             next_button_label = str(selection_controls.get("next_button_label", "Next Batch"))
@@ -1566,6 +1585,10 @@ def show_scenes_with_viser(
             )
             apply_button = server.gui.add_button("Apply Selection")
             next_batch_button = server.gui.add_button(next_button_label)
+            extra_action_button = None
+            extra_action_label = str(selection_controls.get("extra_action_button_label", ""))
+            if extra_action_label and "load_action_scene_records" in selection_controls:
+                extra_action_button = server.gui.add_button(extra_action_label)
             status_handle = server.gui.add_markdown("Selection loaded.") if hasattr(server.gui, "add_markdown") else None
 
             def update_object_info():
@@ -1575,6 +1598,32 @@ def show_scenes_with_viser(
                     f"Selected {object_label}: "
                     f"{format_gui_wrappable_value(object_dropdown.value)}"
                 )
+
+            def sync_current_object_selection():
+                """Reflect a loader-updated object/scene id in the Selection UI.
+
+                Args:
+                    None.
+
+                Returns:
+                    None. The object dropdown and markdown panel are updated
+                    when the selection loader publishes ``current_object``.
+                """
+                batch_state = selection_controls.get("batch_state", {})
+                current_object = batch_state.get("current_object")
+                if current_object is None:
+                    update_object_info()
+                    return
+                current_object = str(current_object)
+                options = selection_object_options(str(mode_dropdown.value))
+                if current_object not in [str(option) for option in options]:
+                    options = tuple(list(options) + [current_object])
+                    set_viser_dropdown_options(object_dropdown, options)
+                try:
+                    object_dropdown.value = current_object
+                except Exception as exc:
+                    print(f"[{log_prefix}] Could not update selected {object_label}: {exc}")
+                update_object_info()
 
             def refresh_selection_widgets():
                 mode = normalize_visualize_mode(str(mode_dropdown.value))
@@ -1595,6 +1644,10 @@ def show_scenes_with_viser(
                     next_batch_button.disabled = bool(
                         selection_controls.get("disable_next_batch_for_mode", lambda current_mode: False)(mode)
                     )
+                if extra_action_button is not None and hasattr(extra_action_button, "disabled"):
+                    extra_action_button.disabled = bool(
+                        selection_controls.get("disable_extra_action_for_mode", lambda current_mode: False)(mode)
+                    )
                 update_object_info()
 
             refresh_selection_widgets()
@@ -1611,6 +1664,7 @@ def show_scenes_with_viser(
                     return
                 if status_handle is not None and hasattr(status_handle, "content"):
                     status_handle.content = f"Loaded {len(new_scene_records)} scene(s)."
+                sync_current_object_selection()
                 update_scene_records(new_scene_records)
 
             @next_batch_button.on_click
@@ -1629,7 +1683,26 @@ def show_scenes_with_viser(
                         f"Loaded {next_button_label.lower()} {batch_index + 1} "
                         f"with {len(new_scene_records)} scene(s)."
                     )
+                sync_current_object_selection()
                 update_scene_records(new_scene_records)
+
+            if extra_action_button is not None:
+                @extra_action_button.on_click
+                def _on_extra_selection_action(event):
+                    del event
+                    try:
+                        new_scene_records = load_selection_action_records(extra_action_label)
+                    except Exception as exc:
+                        if status_handle is not None and hasattr(status_handle, "content"):
+                            status_handle.content = f"{extra_action_label} failed: `{exc}`"
+                        print(f"[{log_prefix}] {extra_action_label} failed: {exc}")
+                        return
+                    if status_handle is not None and hasattr(status_handle, "content"):
+                        status_handle.content = (
+                            f"Loaded {extra_action_label.lower()} with {len(new_scene_records)} scene(s)."
+                        )
+                    sync_current_object_selection()
+                    update_scene_records(new_scene_records)
 
             @mode_dropdown.on_update
             def _on_selection_mode_update(event):

@@ -80,7 +80,12 @@ sample_selection:
   # random: keep a random subset from the generated candidate pool.
   # pose_diversity: seed with the highest-log-prob sample, then greedily add
   #   candidates that maximize pose-space distance to the selected set.
+  # pose_prob: first keep `intermediate_topk` candidates with pose_diversity,
+  #   then keep final `test_topk` candidates by log-probability.
+  # prob_pose: first keep `intermediate_topk` candidates by log-probability,
+  #   then keep final `test_topk` candidates with pose_diversity.
   mode: pose_diversity
+  intermediate_topk: 50
   translation_scale_m: 0.05
   rotation_weight: 1.0
 
