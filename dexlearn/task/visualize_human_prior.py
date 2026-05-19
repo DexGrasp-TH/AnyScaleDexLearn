@@ -85,57 +85,22 @@ def normalize_prior_visualize_mode(mode: str) -> str:
     return aliases.get(str(mode), str(mode))
 
 
-def resolve_prior_step_dir(config: DictConfig) -> str:
-    """Resolve the object human-prior export directory to visualize.
+def resolve_prior_export_dir(config: DictConfig) -> str:
+    """Resolve the robot-specific object human-prior export directory.
 
     Args:
-        config: Full Hydra config containing ``task.prior_dir`` and optional
-            ``task.step``.
+        config: Full Hydra config containing ``task.prior_dir``.
 
     Returns:
-        Absolute path to a directory containing per-scene ``.npy`` files.
+        Absolute path whose direct children are object export directories.
     """
     prior_dir = to_absolute_path(str(get_task_value(config, "prior_dir", "")))
     if not prior_dir:
         raise ValueError("task.prior_dir must be set for task=visualize_human_prior.")
 
-    step = get_task_value(config, "step", None)
-    if step:
-        step_name = str(step)
-        if step_name.isdigit():
-            step_name = f"step_{int(step_name):06d}"
-        if not step_name.startswith("step_"):
-            step_name = f"step_{step_name}"
-        prior_dir = os.path.join(prior_dir, step_name)
-    elif os.path.basename(prior_dir).startswith("step_"):
-        pass
-    else:
-        step_dirs = [path for path in glob(os.path.join(prior_dir, "step_*")) if os.path.isdir(path)]
-        if step_dirs:
-            prior_dir = sorted(step_dirs, key=natural_sort_key)[-1]
-
     if not os.path.isdir(prior_dir):
         raise FileNotFoundError(f"Object human-prior export directory not found: {prior_dir}")
     return prior_dir
-
-
-def requested_robot_name(config: DictConfig) -> str:
-    """Read the required robot namespace selected for visualization.
-
-    Args:
-        config: Full Hydra config containing ``task.robot_name``.
-
-    Returns:
-        Robot name string used as the export-path namespace.
-    """
-    robot_name = get_task_value(config, "robot_name", None)
-    if robot_name is None or str(robot_name).strip() == "":
-        raise ValueError("task.robot_name must be set for task=visualize_human_prior.")
-    robot_name = str(robot_name).strip()
-    invalid_parts = (os.sep, "/", "\\")
-    if any(part in robot_name for part in invalid_parts):
-        raise ValueError(f"task.robot_name must be one path component, got {robot_name!r}")
-    return robot_name
 
 
 def list_subdirs(path: str) -> list[str]:
@@ -154,28 +119,20 @@ def list_subdirs(path: str) -> list[str]:
     return sorted(children, key=natural_sort_key)
 
 
-def discover_object_roots(prior_dir: str, robot_name: str) -> dict[str, str]:
+def discover_object_roots(prior_dir: str) -> dict[str, str]:
     """Discover object directories without scanning every scene export.
 
     Args:
-        prior_dir: Step directory produced by ``obj_human_prior_export``.
-        robot_name: Required robot namespace to select in the export layout.
+        prior_dir: Robot-specific export directory produced by
+            ``obj_human_prior_export``. This should be shaped like
+            ``obj_human_prior/<step>/<asset>/<robot_name>``.
 
     Returns:
-        Mapping from object id to object root directory. For the DGN export
-        layout this scans only ``step_*/DGN_5k/<robot>/<object_id>``.
+        Mapping from object id to object root directory.
     """
     object_roots: dict[str, str] = {}
-    for asset_dir in list_subdirs(prior_dir):
-        asset_children = list_subdirs(asset_dir)
-        if not asset_children:
-            continue
-
-        robot_dir = os.path.join(asset_dir, robot_name)
-        if not os.path.isdir(robot_dir):
-            continue
-        for object_root in list_subdirs(robot_dir):
-            object_roots.setdefault(os.path.basename(object_root), object_root)
+    for object_root in list_subdirs(prior_dir):
+        object_roots.setdefault(os.path.basename(object_root), object_root)
     return dict(sorted(object_roots.items(), key=lambda item: natural_sort_key(item[0])))
 
 
@@ -339,19 +296,19 @@ def random_scene_record(prior_index: dict) -> dict:
     return record
 
 
-def build_prior_index(prior_dir: str, robot_name: str) -> dict:
+def build_prior_index(prior_dir: str) -> dict:
     """Build a lightweight index over per-scene object human-prior exports.
 
     Args:
-        prior_dir: Step directory produced by ``obj_human_prior_export``.
-        robot_name: Required robot namespace to visualize.
+        prior_dir: Robot-specific export directory produced by
+            ``obj_human_prior_export``.
 
     Returns:
         Dictionary with sorted scene records and object-id lookup tables.
     """
-    object_roots = discover_object_roots(prior_dir, robot_name=robot_name)
+    object_roots = discover_object_roots(prior_dir)
     if not object_roots:
-        raise RuntimeError(f"No object human-prior exports found for task.robot_name={robot_name} in {prior_dir}")
+        raise RuntimeError(f"No object human-prior exports found in task.prior_dir={prior_dir}")
 
     return {
         "prior_dir": prior_dir,
@@ -359,7 +316,6 @@ def build_prior_index(prior_dir: str, robot_name: str) -> dict:
         "object_scene_cache": {},
         "scene_record_by_id": {},
         "object_options": tuple(sorted(object_roots.keys(), key=natural_sort_key)),
-        "robot_name": robot_name,
     }
 
 
@@ -982,13 +938,10 @@ def task_visualize_human_prior(config: DictConfig) -> None:
     if visualizer == "viser" and not VISER_AVAILABLE:
         raise ImportError("viser is not installed. Install it before using task=visualize_human_prior.")
 
-    prior_dir = resolve_prior_step_dir(config)
+    prior_dir = resolve_prior_export_dir(config)
     print(f"[visualize_human_prior] Visualizing object human-prior export: {prior_dir}")
-    robot_name = requested_robot_name(config)
-    prior_index = build_prior_index(prior_dir, robot_name=robot_name)
+    prior_index = build_prior_index(prior_dir)
     print(f"[visualize_human_prior] Indexed {len(prior_index['object_options'])} object(s) lazily.")
-    if robot_name:
-        print(f"[visualize_human_prior] Robot namespace: {robot_name}")
     mano_layers_state = {"value": None}
 
     viser_port = int(get_task_value(config, "viser_port", 8080))

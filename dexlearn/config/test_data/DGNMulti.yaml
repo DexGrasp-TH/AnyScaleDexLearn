@@ -13,7 +13,7 @@ pc_centering: True
 # sets this to 1 / task.robot_size for robot-specific human prior inference.
 pc_runtime_scale: 1.0
 
-object_path: ${data_folder}/object/DGN_5k
+object_path: ${data_folder}/object/DGN_2k
 split_path: valid_split   # relative to object_path
 
 pc_source: complete   # 'partial' for partial_pc**.npy, 'complete' for processed_data/<obj>/complete_point_cloud.npy

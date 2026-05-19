@@ -84,7 +84,7 @@ sample_selection:
   #   then keep final `test_topk` candidates by log-probability.
   # prob_pose: first keep `intermediate_topk` candidates by log-probability,
   #   then keep final `test_topk` candidates with pose_diversity.
-  mode: pose_diversity
+  mode: prob_pose
   intermediate_topk: 50
   translation_scale_m: 0.05
   rotation_weight: 1.0

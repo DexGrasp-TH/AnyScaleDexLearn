@@ -308,15 +308,17 @@ python dexlearn/main.py \
   task=visualize_human_prior \
   data=humanMulti \
   algo=humanMultiHierar \
-  task.prior_dir=output/humanMulti_humanMultiHierar_human_prior_2/obj_human_prior \
-  task.step=007500_000100 \
-  task.robot_name=leap_hand
+  task.prior_dir=output/humanMulti_humanMultiHierar_human_prior_2/obj_human_prior/step_007500_000100/DGN_2k/shadow
 ```
 
-`visualize_human_prior` reads per-scene files directly from
-`<prior_dir>/<step>/<asset>/<robot_name>/<object>/...`; `task.robot_name` is
-required and must match the robot namespace in the export path. The export also
-writes `manifest.json`, `scene_index.json`, and `scene_budget_scores.jsonl`.
+For this task, `dexlearn/config/task/visualize_human_prior.yaml` should set
+`task.prior_dir` to the full robot-specific export directory, such as
+`output/humanMulti_humanMultiHierar_human_prior_2/obj_human_prior/step_007500_000100/DGN_2k/shadow`.
+`visualize_human_prior` then reads per-scene files directly from
+`<prior_dir>/<object>/...`. Do not pass separate `task.step` or
+`task.robot_name` overrides for visualization; the step, asset set, and robot
+namespace are already encoded in the full path. The export also writes
+`manifest.json`, `scene_index.json`, and `scene_budget_scores.jsonl`.
 Visualization does not depend on these summary files, but they are kept for
 reproducibility, audit/debug metadata, and downstream score evaluation.
 In the web Selection panel, Grasp Type `0_any` shows score-only records for

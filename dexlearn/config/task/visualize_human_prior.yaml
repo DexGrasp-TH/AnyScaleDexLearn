@@ -1,12 +1,9 @@
 name: visualize_human_prior
 
-# Directory produced by task=obj_human_prior_export. This may point either to
-# the obj_human_prior root or directly to one step_* export directory.
-prior_dir: output/humanMulti_humanMultiHierar_human_prior_2/obj_human_prior
-step:
-# Required robot namespace inside the export step, matching
+# Full robot-specific directory produced by task=obj_human_prior_export.
+# The direct children of this path must be object directories, matching:
 # obj_human_prior/<step>/<asset>/<robot_name>/<object>/...
-robot_name:
+prior_dir: output/humanMulti_humanMultiHierar_human_prior_2/obj_human_prior/step_007500_000100/DGN_2k/shadow
 
 # Viser selection mode. The web UI can switch between these modes at runtime.
 visualize_mode: random_objects  # random_objects, one_scene
