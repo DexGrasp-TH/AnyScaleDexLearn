@@ -135,6 +135,10 @@ Generate robot grasps from a trained checkpoint.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
+
+# Override the availability score threshold used when grasp_type_id=0 samples
+# all model-predicted available real grasp types. The default is 0.5.
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME> task.availability_score_threshold=0.35
 ```
 
 ### Visualize
@@ -142,7 +146,7 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample algo=robotMultiHierar
 Visualize sampled robot grasps. The current visualization sampler is controlled by `task.visualize_mode`; the old group-balanced grasp-type cycling behavior is deprecated.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=visualize algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME> wandb.mode=disabled
 
 # e.g., python dexlearn/main.py task=visualize algo=robotMultiHierar data=leapMulti test_data=leapMulti exp_name=dataset_full_1
 
@@ -281,7 +285,7 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
   test_data.test_split=all \
   algo.batch_size=1024 \
   task.skip_existing=false \
-  task.robot_name=leap_hand \
+  task.robot_name=leap \
   task.robot_size=1.8 \
   task.score_ckpt=000100 \
   task.pose_ckpt=007500 \

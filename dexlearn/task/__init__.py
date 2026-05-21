@@ -8,3 +8,4 @@ from .diffusion_eval import task_diffusion_eval
 from .scene_budget import task_scene_budget
 from .obj_human_prior_export import task_obj_human_prior_export
 from .visualize_human_prior import task_visualize_human_prior
+from .robot_type_eval import task_robot_type_eval

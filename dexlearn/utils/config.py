@@ -81,14 +81,15 @@ def _infer_type_objective(config):
         Canonical objective name, or ``None`` when the config is not a human
         multi-type hierarchical setup.
     """
-    explicit = OmegaConf.select(config, "algo.model.type_objective")
-    if explicit is not None:
-        return normalize_type_objective(explicit)
-
     model_name = str(OmegaConf.select(config, "algo.model.name") or "")
     data_type = str(OmegaConf.select(config, "data.dataset_type") or "")
     if data_type != "HumanMultiDexDataset":
         return None
+
+    explicit = OmegaConf.select(config, "algo.model.type_objective")
+    if explicit is not None:
+        return normalize_type_objective(explicit)
+
     if model_name in {"HierarchicalModel", "HierarchicalTypeCEModel"}:
         return "ce"
     if model_name == "HierarchicalTypeObjectiveModel":
@@ -161,8 +162,14 @@ def apply_type_supervision_to_data_config(config, data_config, mode):
         The mutated ``data_config``.
     """
     resolve_type_supervision_config(config)
+    data_type = str(OmegaConf.select(config, "data.dataset_type") or "")
+    if data_type != "HumanMultiDexDataset":
+        return data_config
+
     objective = OmegaConf.select(config, "algo.model.type_objective")
     if objective is None or mode == "test":
+        return data_config
+    if objective not in TYPE_OBJECTIVE_DEFAULTS:
         return data_config
 
     supervision_cfg = OmegaConf.select(config, "algo.supervision")
@@ -237,6 +244,9 @@ def flatten_multidex_data_config(config):
         "type_balancing.loss_weight.enabled": "type_loss_weight_enabled",
         "type_balancing.loss_weight.beta": "type_loss_weight_beta",
         "type_balancing.loss_weight.reference": "type_loss_weight_reference",
+        "type_availability.enabled": "type_availability_enabled",
+        "type_availability.min_count": "type_availability_min_count",
+        "type_availability.min_ratio": "type_availability_min_ratio",
         "human_hand.position_source": "hand_pos_source",
         "human_hand.load_mano_params": "load_mano_params",
         "test.split": "test_split",

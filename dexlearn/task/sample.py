@@ -4,7 +4,7 @@ import argparse
 
 import torch
 import hydra
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import OmegaConf, DictConfig, open_dict
 from tqdm import tqdm
 import torch.nn.functional as F
 
@@ -93,22 +93,76 @@ def _decenter_robot_pose(
     return out
 
 
-def _sample_selection_config(config: DictConfig) -> tuple[str, float, float, int | None]:
+def _apply_sample_availability_threshold(config: DictConfig) -> float | None:
+    """Apply the optional sample-time grasp-type availability threshold.
+
+    Args:
+        config: Full Hydra config used by ``task=sample``. The function mutates
+            ``config.algo.model.type_availability.score_threshold`` when
+            ``task.availability_score_threshold`` is set.
+
+    Returns:
+        The effective availability threshold for availability-trained robot
+        sampling, or ``None`` when the selected model does not use availability
+        sampling.
+    """
+    model_cfg = getattr(config.algo, "model", None)
+    if model_cfg is None:
+        return None
+
+    task_cfg = getattr(config, "task", None)
+    task_threshold = getattr(task_cfg, "availability_score_threshold", None) if task_cfg is not None else None
+    type_objective = str(getattr(model_cfg, "type_objective", "")).strip().lower()
+    availability_cfg = getattr(model_cfg, "type_availability", None)
+
+    if task_threshold is not None:
+        if type_objective != "availability":
+            raise ValueError("task.availability_score_threshold requires algo.model.type_objective=availability")
+        threshold = float(task_threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("task.availability_score_threshold must be in [0, 1]")
+        if availability_cfg is None:
+            with open_dict(model_cfg):
+                model_cfg.type_availability = {}
+            availability_cfg = model_cfg.type_availability
+        # Keep the model as the single source of truth after task-level parsing.
+        with open_dict(availability_cfg):
+            availability_cfg.score_threshold = threshold
+        return threshold
+
+    if type_objective != "availability" or availability_cfg is None:
+        return None
+
+    threshold = float(getattr(availability_cfg, "score_threshold", 0.5))
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("algo.model.type_availability.score_threshold must be in [0, 1]")
+    return threshold
+
+
+def _sample_selection_config(config: DictConfig) -> tuple[bool, str, str, float, float, int | None]:
     """Read candidate selection hyperparameters from the algo config.
 
     Args:
         config: Full Hydra config used by ``task=sample``.
 
     Returns:
-        Tuple ``(mode, translation_scale_m, rotation_weight, intermediate_topk)``.
-        ``mode`` is one of ``prob``, ``random``, ``pose_diversity``,
-        ``pose_prob``, or ``prob_pose``.
+        Tuple ``(enabled, scope, mode, translation_scale_m, rotation_weight,
+        intermediate_topk)``. ``scope`` is ``global`` or ``per_type``.
+        ``mode`` is one of ``prob``, ``topk``, ``random``,
+        ``pose_diversity``, ``pose_prob``, or ``prob_pose``.
     """
     selection_cfg = getattr(config.algo, "sample_selection", None)
+    enabled = bool(getattr(selection_cfg, "enabled", True)) if selection_cfg is not None else True
+    scope = str(getattr(selection_cfg, "scope", "global")).strip().lower() if selection_cfg is not None else "global"
     mode = str(getattr(selection_cfg, "mode", "prob")).strip().lower() if selection_cfg is not None else "prob"
-    valid_modes = {"prob", "random", "pose_diversity", "pose_prob", "prob_pose"}
+    valid_scopes = {"global", "per_type"}
+    valid_modes = {"prob", "topk", "random", "pose_diversity", "pose_prob", "prob_pose"}
+    if scope not in valid_scopes:
+        raise ValueError(f"sample_selection.scope must be one of {sorted(valid_scopes)}, got {scope!r}")
     if mode not in valid_modes:
         raise ValueError(f"sample_selection.mode must be one of {sorted(valid_modes)}, got {mode!r}")
+    if enabled and scope == "per_type" and mode in {"pose_diversity", "pose_prob", "prob_pose"}:
+        raise ValueError("sample_selection.scope=per_type currently supports mode=topk/prob/random only")
     translation_scale_m = float(getattr(selection_cfg, "translation_scale_m", 0.05)) if selection_cfg is not None else 0.05
     rotation_weight = float(getattr(selection_cfg, "rotation_weight", 1.0)) if selection_cfg is not None else 1.0
     intermediate_topk = getattr(selection_cfg, "intermediate_topk", None) if selection_cfg is not None else None
@@ -119,7 +173,22 @@ def _sample_selection_config(config: DictConfig) -> tuple[str, float, float, int
         raise ValueError("sample_selection.rotation_weight must be non-negative")
     if intermediate_topk is not None and intermediate_topk <= 0:
         raise ValueError("sample_selection.intermediate_topk must be positive when set")
-    return mode, translation_scale_m, rotation_weight, intermediate_topk
+    return enabled, scope, mode, translation_scale_m, rotation_weight, intermediate_topk
+
+
+def _candidate_valid_mask(log_prob: torch.Tensor) -> torch.Tensor:
+    """Identify generated candidates that are allowed to be saved.
+
+    Args:
+        log_prob: Candidate log probabilities shaped ``(B, N)``. Availability
+            sampling marks unavailable types with the dtype minimum value.
+
+    Returns:
+        Boolean mask shaped ``(B, N)`` where ``True`` means the candidate is
+        available for selection or direct saving.
+    """
+    invalid_threshold = torch.finfo(log_prob.dtype).min / 2.0
+    return torch.isfinite(log_prob) & (log_prob > invalid_threshold)
 
 
 def _pose_diversity_feature(
@@ -227,7 +296,12 @@ def _pose_diversity_indices_batched(
     return selected
 
 
-def _candidate_selection_indices(robot_pose: torch.Tensor, log_prob: torch.Tensor, config: DictConfig) -> torch.Tensor:
+def _candidate_selection_indices(
+    robot_pose: torch.Tensor,
+    log_prob: torch.Tensor,
+    config: DictConfig,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Choose which sampled candidates should be saved.
 
     Args:
@@ -235,42 +309,55 @@ def _candidate_selection_indices(robot_pose: torch.Tensor, log_prob: torch.Tenso
         log_prob: Candidate log probabilities shaped ``(B, N)``.
         config: Full Hydra config with ``algo.test_topk`` and optional
             ``algo.sample_selection`` fields.
+        valid_mask: Optional boolean tensor shaped ``(B, N)``. Invalid
+            candidates are excluded before selection.
 
     Returns:
         Long index tensor shaped ``(B, K)`` selecting candidates along dim 1.
     """
-    mode, translation_scale_m, rotation_weight, intermediate_topk = _sample_selection_config(config)
+    _, _, mode, translation_scale_m, rotation_weight, intermediate_topk = _sample_selection_config(config)
     candidate_num = int(log_prob.shape[1])
     topk = int(config.algo.test_topk)
     if topk <= 0:
         raise ValueError("algo.test_topk must be positive")
     if topk > candidate_num:
         raise ValueError(f"algo.test_topk={topk} exceeds generated candidate count {candidate_num}")
+    if valid_mask is None:
+        valid_mask = torch.ones_like(log_prob, dtype=torch.bool)
+    if valid_mask.shape != log_prob.shape:
+        raise ValueError(f"valid_mask must match log_prob shape, got {tuple(valid_mask.shape)} vs {tuple(log_prob.shape)}")
+    valid_count = valid_mask.sum(dim=1)
+    if torch.any(valid_count < topk):
+        min_valid = int(valid_count.min().detach().cpu().item())
+        raise ValueError(f"algo.test_topk={topk} exceeds available candidate count {min_valid} for at least one scene")
 
-    if mode == "prob":
-        return torch.topk(log_prob, topk, dim=1).indices
+    masked_log_prob = log_prob.masked_fill(~valid_mask, torch.finfo(log_prob.dtype).min)
+
+    if mode in {"prob", "topk"}:
+        return torch.topk(masked_log_prob, topk, dim=1).indices
     if mode == "random":
         random_scores = torch.rand(log_prob.shape, device=log_prob.device, dtype=log_prob.dtype)
+        random_scores = random_scores.masked_fill(~valid_mask, -1.0)
         return torch.topk(random_scores, topk, dim=1).indices
     if mode == "pose_diversity":
-        return _pose_diversity_indices(robot_pose, log_prob, topk, translation_scale_m, rotation_weight)
+        return _pose_diversity_indices(robot_pose, masked_log_prob, topk, translation_scale_m, rotation_weight)
 
     intermediate_topk = _resolve_intermediate_topk(intermediate_topk, candidate_num, topk)
     if mode == "pose_prob":
         pose_indices = _pose_diversity_indices(
             robot_pose,
-            log_prob,
+            masked_log_prob,
             intermediate_topk,
             translation_scale_m,
             rotation_weight,
         )
-        pose_log_prob = _gather_candidates(log_prob, pose_indices)
+        pose_log_prob = _gather_candidates(masked_log_prob, pose_indices)
         second_indices = torch.topk(pose_log_prob, topk, dim=1).indices
         return torch.gather(pose_indices, dim=1, index=second_indices)
     if mode == "prob_pose":
-        prob_indices = torch.topk(log_prob, intermediate_topk, dim=1).indices
+        prob_indices = torch.topk(masked_log_prob, intermediate_topk, dim=1).indices
         prob_robot_pose = _gather_candidates(robot_pose, prob_indices)
-        prob_log_prob = _gather_candidates(log_prob, prob_indices)
+        prob_log_prob = _gather_candidates(masked_log_prob, prob_indices)
         second_indices = _pose_diversity_indices(
             prob_robot_pose,
             prob_log_prob,
@@ -323,14 +410,106 @@ def _gather_candidates(value: torch.Tensor, indices: torch.Tensor) -> torch.Tens
     return torch.gather(value, dim=1, index=gather_index)
 
 
+def _per_type_selection_mask(
+    pred_grasp_type: torch.Tensor,
+    log_prob: torch.Tensor,
+    valid_mask: torch.Tensor,
+    config: DictConfig,
+) -> torch.Tensor:
+    """Select candidates independently within each predicted grasp type.
+
+    Args:
+        pred_grasp_type: Candidate grasp-type ids shaped ``(B, N)``.
+        log_prob: Candidate log probabilities shaped ``(B, N)``.
+        valid_mask: Boolean availability mask shaped ``(B, N)``.
+        config: Full Hydra config containing ``algo.test_topk`` and
+            ``algo.sample_selection.mode``.
+
+    Returns:
+        Boolean mask shaped ``(B, N)``. A ``True`` entry means the candidate
+        should be saved by ``Logger.save_samples``.
+    """
+    _, _, mode, _, _, _ = _sample_selection_config(config)
+    if pred_grasp_type is None:
+        raise ValueError("sample_selection.scope=per_type requires pred_grasp_type_id from model.sample")
+    if pred_grasp_type.shape != log_prob.shape:
+        raise ValueError(
+            f"pred_grasp_type must match log_prob shape for per-type selection, "
+            f"got {tuple(pred_grasp_type.shape)} vs {tuple(log_prob.shape)}"
+        )
+    if mode not in {"prob", "topk", "random"}:
+        raise ValueError("sample_selection.scope=per_type supports mode=topk/prob/random")
+
+    topk = int(config.algo.test_topk)
+    if topk <= 0:
+        raise ValueError("algo.test_topk must be positive")
+
+    selected = torch.zeros_like(valid_mask, dtype=torch.bool)
+    for type_id in torch.unique(pred_grasp_type[valid_mask]).detach().cpu().tolist():
+        type_mask = valid_mask & (pred_grasp_type == int(type_id))
+        type_count = type_mask.sum(dim=1)
+        active_rows = type_count > 0
+        if not torch.any(active_rows):
+            continue
+        if torch.any(type_count[active_rows] < topk):
+            min_valid = int(type_count[active_rows].min().detach().cpu().item())
+            raise ValueError(
+                f"algo.test_topk={topk} exceeds per-type candidate count {min_valid} "
+                f"for grasp_type_id={int(type_id)}"
+            )
+
+        scores = torch.rand(log_prob.shape, device=log_prob.device, dtype=log_prob.dtype) if mode == "random" else log_prob
+        scores = scores.masked_fill(~type_mask, torch.finfo(log_prob.dtype).min)
+        indices = torch.topk(scores, topk, dim=1).indices
+        row_mask = active_rows[:, None].expand_as(indices)
+        type_selected = torch.zeros_like(selected, dtype=torch.bool)
+        type_selected.scatter_(1, indices, row_mask)
+        selected = selected | type_selected
+    return selected & valid_mask
+
+
+def _sample_save_mask(
+    robot_pose: torch.Tensor,
+    log_prob: torch.Tensor,
+    pred_grasp_type: torch.Tensor | None,
+    config: DictConfig,
+) -> torch.Tensor:
+    """Build the final candidate mask used by sample saving.
+
+    Args:
+        robot_pose: Candidate pose tensor shaped ``(B, N, ..., D)``.
+        log_prob: Candidate log probabilities shaped ``(B, N)``.
+        pred_grasp_type: Optional candidate grasp-type ids shaped ``(B, N)``.
+        config: Full Hydra config containing ``algo.sample_selection``.
+
+    Returns:
+        Boolean mask shaped ``(B, N)``. The logger saves only candidates whose
+        mask entry is ``True``.
+    """
+    enabled, scope, _, _, _, _ = _sample_selection_config(config)
+    valid_mask = _candidate_valid_mask(log_prob)
+    if not enabled:
+        return valid_mask
+    if scope == "per_type":
+        return _per_type_selection_mask(pred_grasp_type, log_prob, valid_mask, config)
+
+    selected_indices = _candidate_selection_indices(robot_pose, log_prob, config, valid_mask=valid_mask)
+    selected_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+    selected_mask.scatter_(1, selected_indices, True)
+    return selected_mask & valid_mask
+
+
 def task_sample(config: DictConfig):
     resolve_type_supervision_config(config)
+    availability_threshold = _apply_sample_availability_threshold(config)
     set_seed(config.seed)
     config.wandb.mode = "disabled"
     logger = Logger(config)
     test_loader = create_test_dataloader(config)
 
     model = eval(config.algo.model.name)(config.algo.model)
+    if availability_threshold is not None:
+        print(f"Using grasp-type availability score_threshold={availability_threshold:.4f}")
 
     # load ckpt if exists
     if config.ckpt is not None:
@@ -383,13 +562,19 @@ def task_sample(config: DictConfig):
                 robot_pose, log_prob = result
                 pred_grasp_type = None
 
-            topk_indices = _candidate_selection_indices(robot_pose, log_prob, config)
-            robot_pose = _gather_candidates(robot_pose, topk_indices)
-            log_prob = _gather_candidates(log_prob, topk_indices)
-            if pred_grasp_type is not None:
-                pred_grasp_type = _gather_candidates(pred_grasp_type, topk_indices)
-            if pred_grasp_type_prob is not None:
-                pred_grasp_type_prob = _gather_candidates(pred_grasp_type_prob, topk_indices)
+            selection_enabled, selection_scope, _, _, _, _ = _sample_selection_config(config)
+            if selection_enabled and selection_scope == "global":
+                valid_mask = _candidate_valid_mask(log_prob)
+                topk_indices = _candidate_selection_indices(robot_pose, log_prob, config, valid_mask=valid_mask)
+                robot_pose = _gather_candidates(robot_pose, topk_indices)
+                log_prob = _gather_candidates(log_prob, topk_indices)
+                candidate_valid_mask = torch.ones_like(log_prob, dtype=torch.bool)
+                if pred_grasp_type is not None:
+                    pred_grasp_type = _gather_candidates(pred_grasp_type, topk_indices)
+                if pred_grasp_type_prob is not None:
+                    pred_grasp_type_prob = _gather_candidates(pred_grasp_type_prob, topk_indices)
+            else:
+                candidate_valid_mask = _sample_save_mask(robot_pose, log_prob, pred_grasp_type, config)
 
             if "pc_centroid" in data:
                 grasp_type_for_decenter = pred_grasp_type if pred_grasp_type is not None else data["grasp_type_id"]
@@ -405,6 +590,7 @@ def task_sample(config: DictConfig):
                 save_dict = {
                     "grasp_pose": robot_pose[..., 0, :],
                     "grasp_error": -log_prob,
+                    "candidate_valid_mask": candidate_valid_mask,
                     "scene_path": data["scene_path"],
                     "pc_path": data["pc_path"],
                     "grasp_pos_source": grasp_pos_source,
@@ -415,6 +601,7 @@ def task_sample(config: DictConfig):
                     "grasp_qpos": robot_pose[..., 1, :],
                     "squeeze_qpos": robot_pose[..., 2, :],
                     "grasp_error": -log_prob,
+                    "candidate_valid_mask": candidate_valid_mask,
                     "scene_path": data["scene_path"],
                 }
 

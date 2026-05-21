@@ -110,13 +110,22 @@ class Logger:
             path = pjoin(self.save_test_dir, f"step_{str(step).zfill(6)}", suffix)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             for k, v in dic.items():
-                if type(v).__module__ == "torch":
+                if k != "candidate_valid_mask" and type(v).__module__ == "torch":
                     torch_key = k
                     break
 
+            candidate_valid_mask = dic.get("candidate_valid_mask", None)
+            saved_index = 0
             for j in range(dic[torch_key].shape[1]):
+                # ``candidate_valid_mask`` allows each batch row to save a
+                # different number of generated grasps while tensors remain
+                # padded to a common candidate dimension.
+                if candidate_valid_mask is not None and not bool(candidate_valid_mask[i, j].detach().cpu().item()):
+                    continue
                 save_dict = {}
                 for k, v in dic.items():
+                    if k == "candidate_valid_mask":
+                        continue
                     if k in ["scene_path", "pc_path"]:
                         save_dict[k] = v[i]
                     elif k in ["grasp_type_id"]:
@@ -129,5 +138,6 @@ class Logger:
                         save_dict[k] = v
                     else:
                         raise NotImplementedError
-                path_j = path.split(".npy")[0] + f"_{j}.npy"
+                path_j = path.split(".npy")[0] + f"_{saved_index}.npy"
                 np.save(path_j, save_dict)
+                saved_index += 1

@@ -1,0 +1,4 @@
+# Optional sample-time override for availability-trained robot grasp sampling.
+# Null keeps algo.model.type_availability.score_threshold, whose
+# robotMultiHierar default is 0.5.
+availability_score_threshold: 0.90

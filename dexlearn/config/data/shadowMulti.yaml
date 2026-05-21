@@ -15,8 +15,21 @@ paths:
   pc_path: vision_data/azure_kinect_dk
 
 point_cloud:
+  # Number of object point-cloud points sampled per dataset item.
   num_points: 1024
+  # Options: true loads indexed point-cloud files into memory at dataset init;
+  # false loads point clouds lazily in __getitem__ and is better for quick debug runs.
   preload: true
+  # Options:
+  #   partial  - use paths.pc_path/<scene_id>/partial_pc**.npy.
+  #   complete - use object processed_data/<object_id>/complete_point_cloud.npy
+  #              and transform it into the scene frame with scene_cfg.
+  source: partial
+
+type_availability:
+  enabled: true
+  min_count: 1
+  min_ratio: 0.05
 
 augmentation:
   pc_centering: true

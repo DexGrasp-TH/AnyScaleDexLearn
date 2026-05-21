@@ -657,3 +657,14 @@ to describe intentional differences from previous runs.
 - Key Features:
   - independent_from_scratch_diffusion_only_shared_arch_10000iter_record_uniform_soft_labels
 - Notes: 
+## leapspMulti_robotMultiHierar_debug0
+- Timestamp: `2026-05-20 20:05:16`
+- Data: `leapspMulti`
+- Algo: `robotMultiHierar`
+- Max Iter: `50000`
+- Key Features:
+  - data=leapspMulti
+  - algo=robotMultiHierar
+  - max_iter=50000
+  - type_objective=availability[scope=None,negative=None]
+- Notes: 

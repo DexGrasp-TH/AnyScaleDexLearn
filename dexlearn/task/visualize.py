@@ -26,7 +26,8 @@ except ImportError:
     VISER_AVAILABLE = False
 
 
-VISUALIZE_MODE_OPTIONS = ("random_objects", "one_object", "one_object_multi_seq", "grasp_type")
+VISUALIZE_MODE_OPTIONS = ("random_objects", "one_scene", "one_object", "one_object_multi_seq", "grasp_type")
+ROBOT_VISER_MODE_OPTIONS = ("random_objects", "one_scene", "grasp_type")
 HUMAN_VISER_MODE_OPTIONS = ("random_objects", "one_object")
 HUMAN_VISER_SPLIT_OPTIONS = ("test", "train")
 HUMAN_SCORE_SUMMARY_MAX_RECORDS = 20
@@ -71,6 +72,8 @@ def normalize_visualize_mode(mode: str):
     aliases = {
         "random": "random_objects",
         "random_object": "random_objects",
+        "scene": "one_scene",
+        "single_scene": "one_scene",
         "object": "one_object",
         "single_object": "one_object",
         "multi_seq": "one_object_multi_seq",
@@ -519,8 +522,10 @@ def annotate_scene_labels(records, mode: str):
     for record in records:
         record.pop("viser_all_label", None)
         record.pop("viser_spatial_group", None)
+        record.pop("visualize_mode", None)
 
     for idx, record in enumerate(records):
+        record["visualize_mode"] = mode
         record["viser_all_label"] = f"{idx} | {canonical_object_id(record['object_id'])}"
         if mode == "one_object_multi_seq":
             record["viser_spatial_group"] = canonical_object_id(record["object_id"])
@@ -533,10 +538,243 @@ def prefix_caption_with_viser_label(sample_record, caption: str):
 
 
 def copy_viser_record_metadata(sample_record, scene_record):
-    for key in ("viser_all_label", "viser_spatial_group"):
+    for key in (
+        "viser_all_label",
+        "viser_spatial_group",
+        "viser_grid_row",
+        "viser_grid_col",
+        "viser_grid_rows",
+        "viser_grid_cols",
+    ):
         if key in sample_record:
             scene_record[key] = sample_record[key]
     return scene_record
+
+
+def robot_type_score_for_record(record, grasp_type_id: int):
+    """Read the availability score for one robot grasp type from a scene record.
+
+    Args:
+        record: Robot scene record that may contain ``pred_grasp_type_prob``.
+        grasp_type_id: Real grasp type id. Type ids ``1..5`` map to score
+            vector entries ``0..4``.
+
+    Returns:
+        The matching availability score as a float, or ``None`` when no
+        compatible score is available.
+    """
+    if "pred_grasp_type_prob" not in record:
+        return None
+    scores = np.asarray(record["pred_grasp_type_prob"]).reshape(-1)
+    score_index = int(grasp_type_id) - 1
+    if score_index < 0 or score_index >= scores.shape[0]:
+        return None
+    return float(scores[score_index])
+
+
+def format_robot_type_score_label(grasp_type_id: int, score, grasp_type_names=None):
+    """Format a compact robot row label with grasp type and availability score.
+
+    Args:
+        grasp_type_id: Real grasp type id.
+        score: Optional availability score for the requested grasp type.
+        grasp_type_names: Optional ordered grasp type names including
+            ``0_any``.
+
+    Returns:
+        Compact label text suitable for the Viser scene label.
+    """
+    if grasp_type_names is not None and 0 <= int(grasp_type_id) < len(grasp_type_names):
+        type_text = grasp_type_names[int(grasp_type_id)]
+    else:
+        type_text = f"type_{int(grasp_type_id)}"
+    if score is None:
+        return f"{type_text} | score=n/a"
+    return f"{type_text} | score={float(score):.3f}"
+
+
+def format_robot_availability_markdown(score_vector, grasp_type_names=None):
+    """Format robot scene availability scores for the Viser side panel.
+
+    Args:
+        score_vector: Availability scores aligned with real grasp types
+            ``1..5``. Vectors that include ``0_any`` are also accepted.
+        grasp_type_names: Optional ordered grasp type names including
+            ``0_any``.
+
+    Returns:
+        Markdown text with one compact line per real grasp type, or an empty
+        string when the score vector is unavailable or incompatible.
+    """
+    if score_vector is None:
+        return ""
+    scores = np.asarray(score_vector, dtype=np.float64).reshape(-1)
+    if grasp_type_names is not None and scores.shape[0] == len(grasp_type_names):
+        scores = scores[1:]
+    real_type_num = (len(grasp_type_names) - 1) if grasp_type_names is not None else 5
+    if scores.shape[0] < real_type_num:
+        return ""
+
+    lines = ["**Availability Score**"]
+    for type_offset in range(real_type_num):
+        grasp_type_id = type_offset + 1
+        if grasp_type_names is not None and grasp_type_id < len(grasp_type_names):
+            type_name = grasp_type_names[grasp_type_id]
+        else:
+            type_name = f"type_{grasp_type_id}"
+        lines.append(f"- `{type_name}`: `{float(scores[type_offset]):.3f}`")
+    return "\n".join(lines)
+
+
+def find_robot_availability_score_vector(scene_records):
+    """Find one predicted robot availability score vector from scene records.
+
+    Args:
+        scene_records: Built Viser scene records for one selected robot scene
+            page.
+
+    Returns:
+        The first ``pred_grasp_type_prob`` vector found in the records, or
+        ``None`` when no score vector is available.
+    """
+    for record in scene_records:
+        if "pred_grasp_type_prob" in record:
+            return record["pred_grasp_type_prob"]
+    return None
+
+
+def robot_mesh_link_prefixes_for_grasp_type(grasp_type_id, hide_inactive_single_hand_mesh: bool = True):
+    """Choose robot mesh link prefixes for a predicted grasp type.
+
+    Args:
+        grasp_type_id: Robot grasp type id aligned with ``GRASP_TYPES``.
+            Types ``1..3`` are right-hand-only and types ``4..5`` are
+            bimanual.
+        hide_inactive_single_hand_mesh: Whether to skip inactive left-hand
+            mesh for right-hand-only grasp types.
+
+    Returns:
+        Tuple of link-name prefixes to export, or ``None`` to export all robot
+        visual links.
+    """
+    if not hide_inactive_single_hand_mesh:
+        return None
+    try:
+        grasp_type_id = int(grasp_type_id)
+    except (TypeError, ValueError):
+        return None
+    if grasp_type_id in {1, 2, 3}:
+        return ("rh_",)
+    return None
+
+
+def robot_mesh_filter_for_grasp_type(
+    grasp_type_id,
+    hide_inactive_single_hand_mesh: bool = True,
+    visual_scope: str = "full",
+    fingertip_link_names=None,
+):
+    """Choose robot visual mesh filters for one predicted grasp type.
+
+    Args:
+        grasp_type_id: Robot grasp type id aligned with ``GRASP_TYPES``.
+        hide_inactive_single_hand_mesh: Whether right-hand-only grasp types
+            should skip left-hand visual links.
+        visual_scope: Mesh scope for Viser upload. ``full`` keeps the selected
+            hand/full bimanual mesh, while ``fingertips`` keeps only LEAP
+            fingertip visual links for the selected active hands.
+        fingertip_link_names: Robot-specific fingertip visual link names
+            loaded from the data/test_data config.
+
+    Returns:
+        Dictionary with ``include_link_prefixes`` and ``include_link_names``.
+        Values may be ``None`` when no filtering should be applied.
+    """
+    visual_scope = str(visual_scope or "full").lower()
+    include_link_prefixes = robot_mesh_link_prefixes_for_grasp_type(
+        grasp_type_id,
+        hide_inactive_single_hand_mesh=hide_inactive_single_hand_mesh,
+    )
+    include_link_names = None
+    if visual_scope == "fingertips":
+        if not fingertip_link_names:
+            raise ValueError(
+                "task.robot_mesh_visual_scope=fingertips requires "
+                "test_data.robot_fingertip_link_names or data.robot_fingertip_link_names."
+            )
+        include_link_names = frozenset(str(link_name) for link_name in fingertip_link_names)
+    elif visual_scope not in {"full", "hand"}:
+        raise ValueError(
+            f"Unsupported task.robot_mesh_visual_scope={visual_scope}. "
+            "Expected one of ['full', 'fingertips']."
+        )
+    return {
+        "include_link_prefixes": include_link_prefixes,
+        "include_link_names": include_link_names,
+    }
+
+
+def get_robot_fingertip_link_names(config: DictConfig):
+    """Read robot-specific fingertip visual link names from config.
+
+    Args:
+        config: Hydra config containing optional ``test_data`` and ``data``
+            robot visualization fields.
+
+    Returns:
+        A tuple of fingertip link names. ``test_data`` takes priority because
+        robot visualization is driven by sampled test-data records.
+    """
+    link_names = (
+        OmegaConf.select(config, "test_data.robot_fingertip_link_names")
+        or OmegaConf.select(config, "data.robot_fingertip_link_names")
+        or ()
+    )
+    return tuple(str(link_name) for link_name in link_names)
+
+
+def apply_one_scene_grasp_type_grid(scene_records, real_type_num: int = 5, grasp_type_names=None):
+    """Arrange one-scene robot samples into grasp-type rows for Viser.
+
+    Args:
+        scene_records: Scene records built from samples in a single saved
+            scene. Records may contain ``pred_grasp_type_id`` or
+            ``grasp_type_id`` metadata.
+        real_type_num: Number of real grasp types. The current robot model
+            uses type ids ``1..5``; id ``0`` is an any-type request.
+        grasp_type_names: Optional ordered grasp type names including
+            ``0_any``. Used for compact row labels.
+
+    Returns:
+        The same scene record list after adding Viser grid row/column metadata.
+    """
+    if not scene_records:
+        return scene_records
+
+    column_counts = {row: 0 for row in range(real_type_num)}
+    for record in scene_records:
+        grasp_type_id = record.get("pred_grasp_type_id", record.get("grasp_type_id", 1))
+        try:
+            grasp_type_id = int(grasp_type_id)
+            row = grasp_type_id - 1
+        except (TypeError, ValueError):
+            grasp_type_id = 1
+            row = 0
+        row = int(np.clip(row, 0, real_type_num - 1))
+        col = column_counts[row]
+        column_counts[row] += 1
+        type_score = robot_type_score_for_record(record, grasp_type_id)
+        record["viser_grid_row"] = row
+        record["viser_grid_col"] = col
+        record["viser_grid_rows"] = real_type_num
+        record["label_caption"] = format_robot_type_score_label(grasp_type_id, type_score, grasp_type_names)
+        if type_score is not None:
+            record["pred_grasp_type_score"] = type_score
+
+    grid_cols = max(1, max(column_counts.values()))
+    for record in scene_records:
+        record["viser_grid_cols"] = grid_cols
+    return scene_records
 
 
 def select_visualization_samples(output_dir: str, config: DictConfig, scene_path_resolver=None):
@@ -803,6 +1041,7 @@ def build_selection_record_index(sample_records, is_our_human_grasp_format=False
     records_by_object = {}
     records_by_base_object = {}
     records_by_random_group = {}
+    records_by_scene = {}
     record_iter = progress_iter(sample_records, desc="Building visualization selection index", total=len(sample_records))
     for record in record_iter:
         object_id = canonical_object_id(record["object_id"])
@@ -811,11 +1050,13 @@ def build_selection_record_index(sample_records, is_our_human_grasp_format=False
         records_by_object.setdefault(object_id, []).append(record)
         records_by_base_object.setdefault(base_object_id, []).append(record)
         records_by_random_group.setdefault(random_group_id, []).append(record)
+        records_by_scene.setdefault(object_id, []).append(record)
 
     for grouped_records in (
         list(records_by_object.values())
         + list(records_by_base_object.values())
         + list(records_by_random_group.values())
+        + list(records_by_scene.values())
     ):
         grouped_records.sort(key=lambda record: record["sample_file"])
 
@@ -824,12 +1065,76 @@ def build_selection_record_index(sample_records, is_our_human_grasp_format=False
         "records_by_object": records_by_object,
         "records_by_base_object": records_by_base_object,
         "records_by_random_group": records_by_random_group,
+        "records_by_scene": records_by_scene,
         "random_group_ids": tuple(sorted(records_by_random_group.keys(), key=natural_sort_key)),
         "object_ids": tuple(sorted(records_by_object.keys(), key=natural_sort_key)),
         "base_object_ids": tuple(sorted(records_by_base_object.keys(), key=natural_sort_key)),
+        "scene_ids": tuple(sorted(records_by_scene.keys(), key=natural_sort_key)),
         "grasp_type_records": {},
         "grasp_type_scan_complete": False,
     }
+
+
+def get_indexed_scene_records(selection_index, scene_id):
+    """Return records for one saved robot scene id.
+
+    Args:
+        selection_index: Selection index from ``build_selection_record_index``.
+        scene_id: Scene id selected in the web UI or provided by config.
+
+    Returns:
+        A sorted list of records saved under the selected scene directory.
+    """
+    scene_id = canonical_object_id(scene_id)
+    scene_records = selection_index["records_by_scene"].get(scene_id)
+    if scene_records is not None:
+        return scene_records
+    return get_indexed_object_records(selection_index, scene_id)
+
+
+def select_one_scene_grasp_type_batch(records, max_grasps_per_type: int, batch_index: int):
+    """Select one page of robot one-scene records with per-type limits.
+
+    Args:
+        records: Saved sample records belonging to one scene.
+        max_grasps_per_type: Maximum number of samples to show for each real
+            grasp type on one page. Non-positive values keep all samples.
+        batch_index: Zero-based page index. Pages wrap when ``batch_index``
+            exceeds the number of available per-type pages.
+
+    Returns:
+        A list of selected records. Grasp type ids are loaded only for records
+        in the selected scene, so startup indexing can remain payload-free.
+    """
+    records = sorted(list(records), key=lambda record: record["sample_file"])
+    if max_grasps_per_type <= 0:
+        return records
+
+    populate_grasp_type_ids(records)
+    grouped = {}
+    for record in records:
+        grasp_type_id = record.get("grasp_type_id")
+        group_key = int(grasp_type_id) if grasp_type_id is not None else 0
+        grouped.setdefault(group_key, []).append(record)
+    if not grouped:
+        return []
+
+    page_count = max(int(np.ceil(len(group_records) / float(max_grasps_per_type))) for group_records in grouped.values())
+    page_count = max(1, page_count)
+    page_index = max(0, int(batch_index)) % page_count
+
+    selected = []
+    for grasp_type_id in sorted(grouped.keys()):
+        group_records = grouped[grasp_type_id]
+        start = page_index * max_grasps_per_type
+        end = start + max_grasps_per_type
+        selected.extend(group_records[start:end])
+
+    for record in selected:
+        record["one_scene_batch_index"] = page_index
+        record["one_scene_batch_count"] = page_count
+        record["one_scene_max_grasps_per_type"] = int(max_grasps_per_type)
+    return selected
 
 
 def get_indexed_object_records(selection_index, object_id):
@@ -954,6 +1259,14 @@ def select_visualization_records_from_index(
         for group_id in group_ids:
             group_records = selection_index["records_by_random_group"][group_id]
             selected.append(random.choice(group_records))
+    elif mode == "one_scene":
+        if object_id is None:
+            raise ValueError("task.object_id must be set to a scene id when task.visualize_mode=one_scene.")
+        selected = select_one_scene_grasp_type_batch(
+            get_indexed_scene_records(selection_index, object_id),
+            max_grasps_per_type=max(0, int(max_grasps)),
+            batch_index=batch_index,
+        )
     elif mode == "one_object":
         if object_id is None:
             raise ValueError("task.object_id must be set when task.visualize_mode=one_object.")
@@ -1050,22 +1363,58 @@ def build_viser_selection_controls(
     is_our_human_grasp_format=False,
 ):
     selection_index = build_selection_record_index(sample_records, is_our_human_grasp_format=is_our_human_grasp_format)
-    mode_options = (
-        VISUALIZE_MODE_OPTIONS
-        if is_our_human_grasp_format
-        else tuple(mode for mode in VISUALIZE_MODE_OPTIONS if mode != "one_object_multi_seq")
-    )
+    mode_options = VISUALIZE_MODE_OPTIONS if is_our_human_grasp_format else ROBOT_VISER_MODE_OPTIONS
     object_options = selection_index["object_ids"] or ("",)
     base_object_options = selection_index["base_object_ids"] or object_options
+    scene_options = selection_index["scene_ids"] or object_options
     grasp_type_options = build_grasp_type_options(sample_records, grasp_type_names)
     initial_mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_objects"))
+    if not is_our_human_grasp_format and initial_mode == "one_object":
+        initial_mode = "one_scene"
     if initial_mode not in mode_options:
         initial_mode = "random_objects"
-    initial_object_options = base_object_options if initial_mode in {"one_object", "one_object_multi_seq"} else object_options
+    initial_object_options = scene_options if initial_mode == "one_scene" else object_options
+    if initial_mode in {"one_object", "one_object_multi_seq"}:
+        initial_object_options = base_object_options
     initial_object = pick_initial_object_option(initial_object_options, get_task_value(config, "object_id", None))
     initial_grasp_type = pick_initial_option(grasp_type_options, get_task_value(config, "target_grasp_type_id", None))
     max_grasps = int(get_task_value(config, "max_grasps", 20))
+    one_scene_max_grasps_per_type = int(get_task_value(config, "one_scene_max_grasps_per_type", 5))
     batch_state = {"key": None, "index": 0}
+
+    def random_scene_id(scene_id):
+        """Return a random scene id different from the current scene when possible.
+
+        Args:
+            scene_id: Current scene id shown in robot ``one_scene`` mode.
+
+        Returns:
+            Scene id selected from the indexed saved scenes. When only one
+            scene exists, the current scene is returned.
+        """
+        scene_ids = selection_index["scene_ids"]
+        if not scene_ids:
+            return scene_id
+        scene_id = canonical_object_id(scene_id)
+        candidates = [item for item in scene_ids if canonical_object_id(item) != scene_id]
+        return random.choice(candidates or scene_ids)
+
+    def object_options_for_mode(mode):
+        """Return the relevant Object/Scene dropdown options for one mode.
+
+        Args:
+            mode: Visualization mode selected in the Viser UI.
+
+        Returns:
+            Tuple of dropdown options. Robot ``one_scene`` exposes scene ids;
+            legacy object modes expose base object ids.
+        """
+        mode = normalize_visualize_mode(mode)
+        if mode == "one_scene":
+            return scene_options
+        if mode in {"one_object", "one_object_multi_seq"}:
+            return base_object_options
+        return object_options
 
     def load_scene_records(mode, object_id, grasp_type_option, advance_batch=False):
         mode = normalize_visualize_mode(mode)
@@ -1081,24 +1430,66 @@ def build_viser_selection_controls(
         selected_records = select_visualization_records_from_index(
             selection_index,
             mode,
-            max_grasps,
+            one_scene_max_grasps_per_type if mode == "one_scene" else max_grasps,
             object_id=object_id,
             target_grasp_type_id=target_grasp_type_id,
             is_our_human_grasp_format=is_our_human_grasp_format,
             batch_index=batch_state["index"],
         )
-        return build_scene_records(selected_records)
+        if mode == "one_scene":
+            batch_state["current_object"] = str(object_id)
+        scene_records = build_scene_records(selected_records)
+        if mode == "one_scene":
+            score_vector = find_robot_availability_score_vector(scene_records)
+            batch_state["selection_info"] = format_robot_availability_markdown(score_vector, grasp_type_names)
+        else:
+            batch_state["selection_info"] = ""
+        return scene_records
+
+    def load_action_scene_records(mode, object_id, grasp_type_option, action_name: str):
+        """Load scene records for custom robot Selection-panel actions.
+
+        Args:
+            mode: Current visualization mode.
+            object_id: Current object or scene id selected in the UI.
+            grasp_type_option: Current grasp-type dropdown option.
+            action_name: Action requested by the UI, currently ``Next Scene``.
+
+        Returns:
+            Scene records produced by the selected action.
+        """
+        mode = normalize_visualize_mode(mode)
+        if mode != "one_scene":
+            return load_scene_records(mode, object_id, grasp_type_option, advance_batch=True)
+        action_name = str(action_name).strip().lower()
+        if action_name != "next scene":
+            raise ValueError(f"Unsupported selection action: {action_name}")
+        next_scene_id = random_scene_id(object_id)
+        batch_state["key"] = None
+        batch_state["index"] = 0
+        batch_state["current_object"] = str(next_scene_id)
+        return load_scene_records(mode, next_scene_id, grasp_type_option, advance_batch=False)
 
     return {
         "mode_options": mode_options,
         "initial_mode": initial_mode,
         "object_options": object_options,
         "base_object_options": base_object_options,
+        "scene_options": scene_options,
         "initial_object": initial_object,
         "grasp_type_options": grasp_type_options,
         "initial_grasp_type": initial_grasp_type,
         "load_scene_records": load_scene_records,
+        "load_action_scene_records": load_action_scene_records,
         "batch_state": batch_state,
+        "object_label": "Scene ID",
+        "next_button_label": "Next Batch",
+        "extra_action_button_label": "Next Scene",
+        "object_options_for_mode": object_options_for_mode,
+        "disable_object_for_mode": lambda mode: normalize_visualize_mode(mode) not in {"one_scene", "one_object", "one_object_multi_seq"},
+        "disable_grasp_type_for_mode": lambda mode: normalize_visualize_mode(mode) == "one_scene",
+        "disable_next_batch_for_mode": lambda mode: normalize_visualize_mode(mode) != "one_scene",
+        "disable_extra_action_for_mode": lambda mode: normalize_visualize_mode(mode) != "one_scene",
     }
 
 
@@ -1594,10 +1985,15 @@ def show_scenes_with_viser(
             def update_object_info():
                 if object_info_handle is None or not hasattr(object_info_handle, "content"):
                     return
-                object_info_handle.content = (
+                batch_state = selection_controls.get("batch_state", {})
+                selection_info = str(batch_state.get("selection_info", "") or "")
+                content = (
                     f"Selected {object_label}: "
                     f"{format_gui_wrappable_value(object_dropdown.value)}"
                 )
+                if selection_info:
+                    content = f"{content}\n\n{selection_info}"
+                object_info_handle.content = content
 
             def sync_current_object_selection():
                 """Reflect a loader-updated object/scene id in the Selection UI.
@@ -2815,28 +3211,65 @@ def load_robot_visualization_pc(sample_file: str, scene_cfg: dict, config: DictC
 
 
 def solve_stage_pose(stage_qpos: np.ndarray, robot_assets: dict, device: str):
+    """Solve one robot stage pose from a saved robot qpos vector.
+
+    Args:
+        stage_qpos: Saved robot stage qpos with right-hand and left-hand
+            halves concatenated.
+        robot_assets: Dictionary returned by ``build_robot_components``.
+        device: Torch device used by the IK helper.
+
+    Returns:
+        Tuple ``(robot_pose, right_ok, left_ok)`` for a single sample.
+    """
+    robot_pose, right_ok, left_ok = solve_stage_pose_batch(
+        np.asarray(stage_qpos, dtype=np.float32).reshape(1, -1),
+        robot_assets,
+        device,
+    )
+    return robot_pose, bool(right_ok[0]), bool(left_ok[0])
+
+
+def solve_stage_pose_batch(stage_qpos_batch: np.ndarray, robot_assets: dict, device: str):
+    """Solve one robot stage pose for a batch of saved robot qpos vectors.
+
+    Args:
+        stage_qpos_batch: Array shaped ``(B, D)`` where each row stores
+            right-hand and left-hand qpos halves.
+        robot_assets: Dictionary returned by ``build_robot_components``.
+        device: Torch device used by the IK helper.
+
+    Returns:
+        Tuple ``(robot_pose, right_success, left_success)``. ``robot_pose`` is
+        shaped ``(B, 7 + joint_num)`` and success arrays are boolean numpy
+        arrays shaped ``(B,)``.
+    """
     import torch
     from pytorch3d import transforms as pttf
 
-    half_dim = stage_qpos.shape[0] // 2
-    right_qpos = torch.from_numpy(stage_qpos[:half_dim]).to(device=device, dtype=torch.float32).unsqueeze(0)
-    left_qpos = torch.from_numpy(stage_qpos[half_dim:]).to(device=device, dtype=torch.float32).unsqueeze(0)
+    stage_qpos_batch = np.asarray(stage_qpos_batch, dtype=np.float32)
+    if stage_qpos_batch.ndim != 2:
+        raise ValueError(f"stage_qpos_batch must have shape (B, D), got {stage_qpos_batch.shape}")
+    half_dim = stage_qpos_batch.shape[1] // 2
+    right_qpos = torch.from_numpy(stage_qpos_batch[:, :half_dim]).to(device=device, dtype=torch.float32)
+    left_qpos = torch.from_numpy(stage_qpos_batch[:, half_dim:]).to(device=device, dtype=torch.float32)
 
     right_trans, right_quat, right_joint = right_qpos[:, :3], right_qpos[:, 3:7], right_qpos[:, 7:]
     left_trans, left_quat, left_joint = left_qpos[:, :3], left_qpos[:, 3:7], left_qpos[:, 7:]
 
-    right_matrix = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0)
+    batch_size = int(stage_qpos_batch.shape[0])
+    right_matrix = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
     right_matrix[:, :3, :3] = pttf.quaternion_to_matrix(right_quat)
     right_matrix[:, :3, 3] = right_trans
 
-    left_matrix = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0)
+    left_matrix = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
     left_matrix[:, :3, :3] = pttf.quaternion_to_matrix(left_quat)
     left_matrix[:, :3, 3] = left_trans
 
     right_sol = robot_assets["robot_helper"].solve_ik_batch(robot_assets["wrist_link_names"][0], right_matrix)
     left_sol = robot_assets["robot_helper"].solve_ik_batch(robot_assets["wrist_link_names"][1], left_matrix)
 
-    combined_q = torch.zeros((1, len(robot_assets["joint_names"])), device=device, dtype=torch.float32)
+    combined_q = torch.zeros((batch_size, len(robot_assets["joint_names"])), device=device, dtype=torch.float32)
     right_q = right_sol["q"].to(device=device, dtype=combined_q.dtype)
     left_q = left_sol["q"].to(device=device, dtype=combined_q.dtype)
     combined_q[:, robot_assets["right_arm_indices"]] = right_q[:, robot_assets["right_arm_indices"]]
@@ -2844,10 +3277,12 @@ def solve_stage_pose(stage_qpos: np.ndarray, robot_assets: dict, device: str):
     combined_q[:, robot_assets["right_hand_indices"]] = right_joint
     combined_q[:, robot_assets["left_hand_indices"]] = left_joint
 
-    robot_pose = torch.zeros((1, 7 + combined_q.shape[-1]), device=device, dtype=torch.float32)
+    robot_pose = torch.zeros((batch_size, 7 + combined_q.shape[-1]), device=device, dtype=torch.float32)
     robot_pose[:, 3] = 1.0
     robot_pose[:, 7:] = combined_q
-    return robot_pose, right_sol["success"][0].item(), left_sol["success"][0].item()
+    right_success = right_sol["success"].detach().cpu().numpy().astype(bool).reshape(-1)
+    left_success = left_sol["success"].detach().cpu().numpy().astype(bool).reshape(-1)
+    return robot_pose, right_success, left_success
 
 
 def task_visualize_robot(config: DictConfig) -> None:
@@ -2881,9 +3316,38 @@ def task_visualize_robot(config: DictConfig) -> None:
     robot_assets = build_robot_components(config)
     stage_names = ["grasp_qpos"]
     stage_colors = [(255, 120, 120, 180)]
+    robot_axis_mesh = trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3)
+    robot_pc_cache = {}
+    hide_inactive_single_hand_mesh = bool(get_task_value(config, "hide_inactive_single_hand_mesh", True))
+    robot_mesh_visual_scope = str(get_task_value(config, "robot_mesh_visual_scope", "full")).lower()
+    robot_fingertip_link_names = get_robot_fingertip_link_names(config)
+
+    def load_cached_robot_visualization_pc(sample_file: str, scene_cfg: dict):
+        """Load one robot visualization point cloud with per-session caching.
+
+        Args:
+            sample_file: Saved sample path used to recover the source partial
+                point-cloud path.
+            scene_cfg: Scene configuration payload referenced by the sample.
+
+        Returns:
+            Subsampled point cloud array used by the robot visualization. The
+            same source pc path is subsampled once and then reused across
+            candidates from the same scene.
+        """
+        pc_path = recover_pc_path(sample_file, scene_cfg, config)
+        if pc_path not in robot_pc_cache:
+            raw_pc = np.load(pc_path, allow_pickle=True)
+            idx = np.random.choice(raw_pc.shape[0], config.test_data.num_points, replace=True)
+            robot_pc_cache[pc_path] = raw_pc[idx]
+        return robot_pc_cache[pc_path]
 
     def build_robot_scene_records(sample_records):
         scene_records = []
+        one_scene_mode = bool(sample_records) and all(
+            normalize_visualize_mode(record.get("visualize_mode", "")) == "one_scene" for record in sample_records
+        )
+        pending_entries = []
         record_iter = progress_iter(sample_records, desc="Building robot visualization scenes", total=len(sample_records))
         for sample_record in record_iter:
             load_visualization_record_payload(sample_record, scene_path_resolver=robot_scene_path_resolver)
@@ -2897,45 +3361,96 @@ def task_visualize_robot(config: DictConfig) -> None:
             if not scene_cfg:
                 raise RuntimeError(f"Scene config is unavailable for sample: {sample_file}")
 
-            pc = load_robot_visualization_pc(sample_file, scene_cfg, config)
+            pc = load_cached_robot_visualization_pc(sample_file, scene_cfg)
             scene_elements = [
                 trimesh.points.PointCloud(pc, colors=[255, 165, 0, 255]),
-                trimesh.creation.axis(origin_size=0.01, axis_radius=0.001, axis_length=0.3),
+                robot_axis_mesh,
             ]
+            pending_entries.append(
+                {
+                    "sample_record": sample_record,
+                    "sample_file": sample_file,
+                    "data": data,
+                    "scene_elements": scene_elements,
+                    "ik_status": [],
+                    "mesh_filter": robot_mesh_filter_for_grasp_type(
+                        extract_grasp_type_id(data),
+                        hide_inactive_single_hand_mesh=hide_inactive_single_hand_mesh,
+                        visual_scope=robot_mesh_visual_scope,
+                        fingertip_link_names=robot_fingertip_link_names,
+                    ),
+                }
+            )
 
-            ik_status = []
+        if pending_entries:
             for stage_name, color in zip(stage_names, stage_colors):
-                robot_pose, right_ok, left_ok = solve_stage_pose(data[stage_name], robot_assets, config.device)
+                stage_qpos_batch = np.stack(
+                    [np.asarray(entry["data"][stage_name], dtype=np.float32).reshape(-1) for entry in pending_entries],
+                    axis=0,
+                )
+                robot_pose, right_ok, left_ok = solve_stage_pose_batch(stage_qpos_batch, robot_assets, config.device)
                 robot_assets["robot_visualizer"].set_robot_parameters(robot_pose, joint_names=robot_assets["joint_names"])
-                scene_elements.append(robot_assets["robot_visualizer"].get_robot_trimesh_data(i=0, color=color))
-                ik_status.append(f"{stage_name} IK: R={int(right_ok)} L={int(left_ok)}")
+                for entry_idx, entry in enumerate(pending_entries):
+                    entry["scene_elements"].append(
+                        robot_assets["robot_visualizer"].get_robot_trimesh_data(
+                            i=entry_idx,
+                            color=color,
+                            **entry["mesh_filter"],
+                        )
+                    )
+                    entry["ik_status"].append(
+                        f"{stage_name} IK: R={int(right_ok[entry_idx])} L={int(left_ok[entry_idx])}"
+                    )
+
+        for entry in pending_entries:
+            sample_record = entry["sample_record"]
+            sample_file = entry["sample_file"]
+            data = entry["data"]
 
             caption = f"{os.path.basename(sample_file)} | err={float(data['grasp_error']):.4f}"
+            grasp_type_id = None
+            pred_grasp_type_id = None
             if "grasp_type_id" in data:
                 grasp_type_id = int(data["grasp_type_id"])
                 caption = f"{caption} | grasp_type_id={GRASP_TYPES[grasp_type_id]}"
             if "pred_grasp_type_id" in data:
                 pred_grasp_type_id = int(data["pred_grasp_type_id"])
                 caption = f"{caption} | pred_grasp_type_id={GRASP_TYPES[pred_grasp_type_id]}"
+            pred_grasp_type_prob = None
             if "pred_grasp_type_prob" in data:
                 pred_grasp_type_prob = np.asarray(data["pred_grasp_type_prob"]).reshape(-1)
                 prob_str = ", ".join([f"{p:.3f}" for p in pred_grasp_type_prob.tolist()])
                 caption = f"{caption} | pred_grasp_type_prob=[{prob_str}]"
+                if pred_grasp_type_id is not None and 0 < pred_grasp_type_id <= pred_grasp_type_prob.shape[0]:
+                    type_score = float(pred_grasp_type_prob[pred_grasp_type_id - 1])
+                    caption = f"{caption} | pred_grasp_type_score={type_score:.3f}"
             if bool(get_task_value(config, "show_ik_status", True)):
-                caption = f"{caption} | {' ; '.join(ik_status)}"
+                caption = f"{caption} | {' ; '.join(entry['ik_status'])}"
             caption = prefix_caption_with_viser_label(sample_record, caption)
 
             scene_record = {
-                "elements": scene_elements,
+                "elements": entry["scene_elements"],
                 "caption": caption,
                 "camera_distance": float(get_task_value(config, "camera_distance", 1.0)),
                 "smooth": False,
             }
+            if grasp_type_id is not None:
+                scene_record["grasp_type_id"] = grasp_type_id
+            if pred_grasp_type_id is not None:
+                scene_record["pred_grasp_type_id"] = pred_grasp_type_id
+            if pred_grasp_type_prob is not None:
+                scene_record["pred_grasp_type_prob"] = pred_grasp_type_prob
             copy_viser_record_metadata(sample_record, scene_record)
             if visualizer == "trimesh":
                 show_scenes_with_trimesh([scene_record])
             else:
                 scene_records.append(scene_record)
+        if one_scene_mode:
+            apply_one_scene_grasp_type_grid(
+                scene_records,
+                real_type_num=len(GRASP_TYPES) - 1,
+                grasp_type_names=GRASP_TYPES,
+            )
         return scene_records
 
     if visualizer == "viser":

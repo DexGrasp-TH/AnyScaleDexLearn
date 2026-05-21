@@ -29,12 +29,21 @@ class RobotMultiDexDataset(Dataset):
         self.pc_path_dict = {}
         self.pc_data_dict = {}
         self.scene_cfg_dict = {}
+        self.scene_type_counts_dict = {}
+        self.scene_type_availability_dict = {}
         self.object_pc_folder = pjoin(config.object_path, config.pc_path)
         self.complete_pc_folder = pjoin(config.object_path, "processed_data")
         self.preload_point_clouds = getattr(config, "preload_point_clouds", False)
         self.pc_source = str(getattr(config, "pc_source", "partial")).lower()
         if self.pc_source not in {"partial", "complete"}:
             raise ValueError(f"Unsupported pc_source={self.pc_source}. Expected one of ['partial', 'complete'].")
+        self.type_availability_enabled = bool(getattr(config, "type_availability_enabled", True))
+        self.type_availability_min_count = int(getattr(config, "type_availability_min_count", 1))
+        self.type_availability_min_ratio = float(getattr(config, "type_availability_min_ratio", 0.05))
+        if self.type_availability_min_count < 1:
+            raise ValueError("type_availability_min_count must be >= 1")
+        if not 0.0 <= self.type_availability_min_ratio <= 1.0:
+            raise ValueError("type_availability_min_ratio must be in [0, 1]")
 
         if mode == "test":
             self.grasp_type_lst = (
@@ -64,8 +73,10 @@ class RobotMultiDexDataset(Dataset):
                 for grasp_path in sorted_paths:
                     scene_id = self._scene_id_from_grasp_path(grasp_path, obj_id)
                     self.grasp_scene_id_dict[grasp_path] = scene_id
+                    self._add_scene_type_count(scene_id, grasp_path)
                     scene_ids.add(scene_id)
                 self.obj_id_lst.append(obj_id)
+        self._finalize_scene_type_availability()
         self._index_point_cloud_paths(scene_ids)
 
         self.data_num = sum(len(paths) for paths in self.grasp_path_dict.values())
@@ -132,6 +143,92 @@ class RobotMultiDexDataset(Dataset):
         path_parts = relative_path.split(os.sep)
         obj_idx = path_parts.index(obj_id)
         return os.path.splitext(os.path.join(*path_parts[obj_idx:]))[0]
+
+    def _grasp_type_id_from_token(self, token):
+        """Map a path or file token to a grasp-type id.
+
+        Args:
+            token: Grasp-type token such as ``right_two`` or ``1_right_two``.
+
+        Returns:
+            Integer type id when the token matches ``GRASP_TYPES``; otherwise
+            ``None`` so callers can try a slower fallback.
+        """
+        token = str(token)
+        for type_id, grasp_type in enumerate(GRASP_TYPES):
+            if token == grasp_type or grasp_type.endswith(token):
+                return type_id
+        return None
+
+    def _grasp_type_id_from_grasp_path(self, grasp_path):
+        """Infer the grasp-type id for one indexed grasp file.
+
+        Args:
+            grasp_path: Absolute path to a grasp ``.npy`` file.
+
+        Returns:
+            Integer grasp-type id aligned with ``GRASP_TYPES``.
+        """
+        relative_path = os.path.relpath(grasp_path, self.config.grasp_path)
+        path_parts = relative_path.split(os.sep)
+        if path_parts:
+            type_id = self._grasp_type_id_from_token(path_parts[0])
+            if type_id is not None:
+                return type_id
+
+        grasp_data = np.load(grasp_path, allow_pickle=True).item()
+        raw_grasp_type = grasp_data.get("grasp_type")
+        if raw_grasp_type is None:
+            raise KeyError(f"Could not infer grasp_type from path or file: {grasp_path}")
+        raw_grasp_type = np.asarray(raw_grasp_type).reshape(-1)[0]
+        type_id = self._grasp_type_id_from_token(raw_grasp_type)
+        if type_id is None:
+            raise ValueError(f"Unsupported grasp_type={raw_grasp_type!r} in {grasp_path}")
+        return type_id
+
+    def _add_scene_type_count(self, scene_id, grasp_path):
+        """Accumulate per-scene grasp-type file counts during path indexing.
+
+        Args:
+            scene_id: Scene identifier derived from the grasp path.
+            grasp_path: Indexed grasp file path used to infer the grasp type.
+
+        Returns:
+            None. Counts are stored in ``scene_type_counts_dict``.
+        """
+        if not self.type_availability_enabled:
+            return
+        type_id = self._grasp_type_id_from_grasp_path(grasp_path)
+        if type_id == 0:
+            return
+        if scene_id not in self.scene_type_counts_dict:
+            self.scene_type_counts_dict[scene_id] = np.zeros(len(GRASP_TYPES), dtype=np.int64)
+        self.scene_type_counts_dict[scene_id][type_id] += 1
+
+    def _finalize_scene_type_availability(self):
+        """Convert scene-level type counts into binary availability targets.
+
+        Args:
+            None.
+
+        Returns:
+            None. Availability targets are stored as 5D float arrays for real
+            grasp types ``1..5``.
+        """
+        if not self.type_availability_enabled:
+            return
+        for scene_id, counts in self.scene_type_counts_dict.items():
+            real_counts = counts[1:].astype(np.float32)
+            total_count = float(real_counts.sum())
+            if total_count <= 0.0:
+                availability = np.zeros(len(GRASP_TYPES) - 1, dtype=np.float32)
+            else:
+                ratios = real_counts / total_count
+                availability = (
+                    (real_counts >= self.type_availability_min_count)
+                    & (ratios >= self.type_availability_min_ratio)
+                ).astype(np.float32)
+            self.scene_type_availability_dict[scene_id] = availability
 
     def _scene_id_from_scene_cfg(self, scene_cfg, scene_path):
         scene_id = scene_cfg.get("scene_id")
@@ -325,6 +422,11 @@ class RobotMultiDexDataset(Dataset):
         scene_id = self.grasp_scene_id_dict[grasp_path]
         raw_grasp_type = str(grasp_data["grasp_type"][0])
         grasp_type = next((gt for gt in GRASP_TYPES if gt.endswith(raw_grasp_type)), GRASP_TYPES[0])
+        if self.type_availability_enabled:
+            if scene_id not in self.scene_type_availability_dict:
+                raise KeyError(f"Missing scene type availability target for scene_id={scene_id}")
+            ret_dict["target_type_availability"] = self.scene_type_availability_dict[scene_id]
+            ret_dict["scene_type_counts"] = self.scene_type_counts_dict[scene_id][1:].astype(np.float32)
 
         # read point cloud
         pc_path_lst = self.pc_path_dict[scene_id]
