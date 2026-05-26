@@ -9,10 +9,10 @@ model:
   joint_num: 44 # bimanual shadow hands
 
 paths:
-  grasp_path: ${oc.env:AnyScaleGraspDataset}/BimanBODex_1k/shadow
+  grasp_path: ${oc.env:AnyScaleGraspDataset}/human_DGN2k_full/shadow
   object_path: ${oc.env:AnyScaleGraspDataset}/object/DGN_2k
   split_path: valid_split
-  pc_path: vision_data/azure_kinect_dk
+  pc_path: vision_data/three_realsense_d435_random4096
 
 point_cloud:
   # Number of object point-cloud points sampled per dataset item.

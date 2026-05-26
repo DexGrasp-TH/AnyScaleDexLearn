@@ -3,6 +3,7 @@ import os
 import json
 import random
 import re
+from glob import escape as glob_escape
 from glob import glob
 
 import hydra
@@ -88,6 +89,20 @@ def normalize_visualize_mode(mode: str):
 
 def list_sample_files(output_dir: str):
     return sorted(glob(os.path.join(output_dir, "**/*.npy"), recursive=True))
+
+
+def is_configured_path(value) -> bool:
+    """Return whether a config value names a real user-provided path.
+
+    Args:
+        value: Raw OmegaConf value that may be ``None`` or an empty string.
+
+    Returns:
+        ``True`` when the value should be interpreted as a configured path.
+    """
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"", "none", "null"}
 
 
 def infer_sample_group_from_sample_path(output_dir: str, sample_file: str):
@@ -236,6 +251,73 @@ def load_visualization_record_payload(record: dict, scene_path_resolver=None, lo
     return record
 
 
+def make_visualization_sample_record(output_dir: str, sample_file: str):
+    """Create a lightweight visualization record for one saved sample file.
+
+    Args:
+        output_dir: Directory that contains saved visualization samples.
+        sample_file: Path to one saved ``.npy`` sample file.
+
+    Returns:
+        A sample record with path-derived metadata. The heavy sample payload is
+        loaded later only if this record is selected for display.
+    """
+    return {
+        "sample_file": sample_file,
+        "data": None,
+        "scene_path": "",
+        "scene_cfg": {},
+        "sample_group": infer_sample_group_from_sample_path(output_dir, sample_file),
+        "object_id": infer_object_id_from_sample_path(output_dir, sample_file),
+        "grasp_type_id": None,
+    }
+
+
+def build_visualization_sample_records(
+    output_dir: str,
+    sample_files,
+    scene_path_resolver=None,
+    load_payload: bool = True,
+    load_scene_cfg: bool = True,
+    log_prefix: str = "Indexing saved visualization samples",
+):
+    """Build visualization records from an explicit saved-sample file list.
+
+    Args:
+        output_dir: Directory that contains saved visualization samples.
+        sample_files: Iterable of saved ``.npy`` sample paths to index.
+        scene_path_resolver: Optional callable used to resolve saved scene
+            paths when payloads are loaded.
+        load_payload: Whether to load every sample file while indexing.
+        load_scene_cfg: Whether to load every scene config while indexing.
+        log_prefix: Progress-bar description for the indexing pass.
+
+    Returns:
+        A list of visualization sample records.
+    """
+    sample_records = []
+    sample_files = sorted(sample_files, key=natural_sort_key)
+    file_iter = progress_iter(sample_files, desc=log_prefix, total=len(sample_files))
+    for idx, sample_file in enumerate(file_iter, 1):
+        record = make_visualization_sample_record(output_dir, sample_file)
+        if not load_payload:
+            sample_records.append(record)
+            continue
+        try:
+            load_visualization_record_payload(
+                record,
+                scene_path_resolver=scene_path_resolver,
+                load_scene_cfg=load_scene_cfg,
+            )
+        except Exception as exc:
+            print(f"[visualize] Skipping unreadable sample {sample_file}: {exc}")
+            continue
+        if idx % 50000 == 0:
+            print(f"[visualize] Indexed {idx}/{len(sample_files)} sample file(s).")
+        sample_records.append(record)
+    return sample_records
+
+
 def build_visualization_sample_index(
     output_dir: str,
     scene_path_resolver=None,
@@ -260,32 +342,13 @@ def build_visualization_sample_index(
         f"[visualize] Found {len(sample_files)} saved sample file(s) in {output_dir}. "
         f"load_payload={load_payload}, load_scene_cfg={load_scene_cfg}"
     )
-    file_iter = progress_iter(sample_files, desc="Indexing saved visualization samples", total=len(sample_files))
-    for idx, sample_file in enumerate(file_iter, 1):
-        record = {
-            "sample_file": sample_file,
-            "data": None,
-            "scene_path": "",
-            "scene_cfg": {},
-            "sample_group": infer_sample_group_from_sample_path(output_dir, sample_file),
-            "object_id": infer_object_id_from_sample_path(output_dir, sample_file),
-            "grasp_type_id": None,
-        }
-        if not load_payload:
-            sample_records.append(record)
-            continue
-        try:
-            load_visualization_record_payload(
-                record,
-                scene_path_resolver=scene_path_resolver,
-                load_scene_cfg=load_scene_cfg,
-            )
-        except Exception as exc:
-            print(f"[visualize] Skipping unreadable sample {sample_file}: {exc}")
-            continue
-        if idx % 50000 == 0:
-            print(f"[visualize] Indexed {idx}/{len(sample_files)} sample file(s).")
-        sample_records.append(record)
+    sample_records = build_visualization_sample_records(
+        output_dir,
+        sample_files,
+        scene_path_resolver=scene_path_resolver,
+        load_payload=load_payload,
+        load_scene_cfg=load_scene_cfg,
+    )
     return sample_records
 
 
@@ -816,6 +879,12 @@ def select_visualization_records(
         selected = []
         for selected_object_id in object_ids:
             selected.append(random.choice(grouped[selected_object_id]))
+
+    elif mode == "one_scene":
+        if object_id is None:
+            raise ValueError("task.object_id must be set to a scene id when task.visualize_mode=one_scene.")
+        selected = [record for record in records if object_id_matches(record["object_id"], object_id)]
+        selected = select_one_scene_grasp_type_batch(selected, max_grasps, 0 if batch_index is None else batch_index)
 
     elif mode == "one_object":
         if object_id is None:
@@ -3210,6 +3279,176 @@ def load_robot_visualization_pc(sample_file: str, scene_cfg: dict, config: DictC
     return raw_pc[idx]
 
 
+def get_robot_target_pc_file(config: DictConfig):
+    """Read the optional robot visualization target point-cloud file.
+
+    Args:
+        config: Full Hydra config for ``task=visualize``.
+
+    Returns:
+        The configured target path string, or ``None`` when no target file was
+        requested. ``pc_file`` and ``sample_file`` are accepted as aliases for
+        quick command-line overrides.
+    """
+    for key in ("target_pc_file", "pc_file", "sample_file"):
+        value = OmegaConf.select(config, f"task.{key}")
+        if is_configured_path(value):
+            return str(value).strip()
+    return None
+
+
+def is_path_inside(path: str, root: str) -> bool:
+    """Check whether one path is inside a root directory.
+
+    Args:
+        path: Candidate filesystem path.
+        root: Root directory used for containment checking.
+
+    Returns:
+        ``True`` when ``path`` is equal to or contained by ``root``.
+    """
+    path_abs = os.path.abspath(path)
+    root_abs = os.path.abspath(root)
+    try:
+        return os.path.commonpath([path_abs, root_abs]) == root_abs
+    except ValueError:
+        return False
+
+
+def resolve_robot_target_pc_scene(target_pc_file: str, config: DictConfig):
+    """Infer scene id and point-cloud basename from a configured target file.
+
+    Args:
+        target_pc_file: Absolute path, dataset-relative path, or
+            ``scene_id/point_cloud.npy`` value from the task config.
+        config: Full Hydra config with ``test_data.object_path`` and
+            ``test_data.pc_path``.
+
+    Returns:
+        A tuple ``(scene_id, pc_basename)`` used to locate saved robot samples
+        for this source point-cloud file.
+    """
+    target_pc_file = str(target_pc_file).strip()
+    pc_basename = os.path.basename(target_pc_file)
+    if not pc_basename:
+        raise ValueError("task.target_pc_file must include a point-cloud file name.")
+
+    object_path = str(config.test_data.object_path)
+    pc_path = str(config.test_data.pc_path)
+    object_pc_root = os.path.abspath(os.path.join(object_path, pc_path))
+    object_root = os.path.abspath(object_path)
+
+    candidate_paths = []
+    if os.path.isabs(target_pc_file):
+        candidate_paths.append(target_pc_file)
+    else:
+        candidate_paths.extend(
+            [
+                os.path.join(object_pc_root, target_pc_file),
+                os.path.join(object_root, target_pc_file),
+                os.path.abspath(target_pc_file),
+            ]
+        )
+
+    existing_path = next((path for path in candidate_paths if os.path.exists(path)), None)
+    if existing_path is not None and is_path_inside(existing_path, object_pc_root):
+        rel_path = os.path.relpath(existing_path, object_pc_root)
+        scene_id = os.path.dirname(rel_path)
+        return canonical_object_id(scene_id), pc_basename
+    if existing_path is not None and is_path_inside(existing_path, object_root):
+        rel_path = os.path.relpath(existing_path, object_root).replace("\\", "/")
+    else:
+        rel_path = target_pc_file.replace("\\", "/").lstrip("/")
+
+    pc_prefix = pc_path.replace("\\", "/").strip("/")
+    if pc_prefix and rel_path.startswith(f"{pc_prefix}/"):
+        rel_path = rel_path[len(pc_prefix) + 1 :]
+    elif pc_prefix and f"/{pc_prefix}/" in rel_path:
+        rel_path = rel_path.split(f"/{pc_prefix}/", 1)[1]
+
+    scene_id = os.path.dirname(rel_path)
+    scene_id = canonical_object_id(scene_id)
+    if not scene_id:
+        raise ValueError(
+            "task.target_pc_file must include its scene directory, for example "
+            "core_bottle_x/tabletop_ur10e/scale002_pose000_0/partial_pc_01_0.npy."
+        )
+    return scene_id, pc_basename
+
+
+def build_robot_target_file_sample_index(
+    output_dir: str,
+    target_pc_file: str,
+    config: DictConfig,
+    scene_path_resolver=None,
+    load_payload: bool = False,
+):
+    """Index saved robot samples generated from one source point-cloud file.
+
+    Args:
+        output_dir: Saved sample root for the current checkpoint and test data.
+        target_pc_file: Source point-cloud file configured by the user.
+        config: Full Hydra config for resolving dataset-relative paths.
+        scene_path_resolver: Optional callable used to resolve saved scene
+            paths when payloads are loaded.
+        load_payload: Whether to load selected saved samples immediately.
+
+    Returns:
+        Visualization sample records for saved grasps matching the target
+        point-cloud file.
+    """
+    direct_candidates = []
+    if os.path.isabs(target_pc_file):
+        direct_candidates.append(target_pc_file)
+    else:
+        direct_candidates.append(os.path.join(output_dir, target_pc_file))
+        direct_candidates.append(os.path.abspath(target_pc_file))
+    direct_sample_file = next(
+        (
+            path
+            for path in direct_candidates
+            if os.path.isfile(path) and is_path_inside(path, output_dir)
+        ),
+        None,
+    )
+    if direct_sample_file is not None:
+        sample_files = [direct_sample_file]
+        print(f"[visualize] Using one configured saved sample file: {direct_sample_file}")
+        return build_visualization_sample_records(
+            output_dir,
+            sample_files,
+            scene_path_resolver=scene_path_resolver,
+            load_payload=load_payload,
+            load_scene_cfg=True,
+            log_prefix="Indexing configured robot sample file",
+        )
+
+    scene_id, pc_basename = resolve_robot_target_pc_scene(target_pc_file, config)
+    pc_stem = os.path.splitext(pc_basename)[0]
+    scene_glob = glob_escape(scene_id)
+    stem_glob = glob_escape(pc_stem)
+    patterns = [
+        os.path.join(glob_escape(output_dir), "*", scene_glob, f"{stem_glob}.npy"),
+        os.path.join(glob_escape(output_dir), "*", scene_glob, f"{stem_glob}_*.npy"),
+    ]
+    sample_files = sorted(
+        {sample_file for pattern in patterns for sample_file in glob(pattern)},
+        key=natural_sort_key,
+    )
+    print(
+        f"[visualize] Found {len(sample_files)} saved sample file(s) for target_pc_file={target_pc_file} "
+        f"(scene_id={scene_id}, pc={pc_basename}). load_payload={load_payload}, load_scene_cfg=True"
+    )
+    return build_visualization_sample_records(
+        output_dir,
+        sample_files,
+        scene_path_resolver=scene_path_resolver,
+        load_payload=load_payload,
+        load_scene_cfg=True,
+        log_prefix="Indexing configured robot target file samples",
+    )
+
+
 def solve_stage_pose(stage_qpos: np.ndarray, robot_assets: dict, device: str):
     """Solve one robot stage pose from a saved robot qpos vector.
 
@@ -3305,13 +3544,24 @@ def task_visualize_robot(config: DictConfig) -> None:
 
     output_dir = get_output_dir(config)
     robot_scene_path_resolver = lambda path: resolve_robot_dataset_path(path, config.test_data.object_path)
-    all_sample_records = build_visualization_sample_index(
-        output_dir,
-        scene_path_resolver=robot_scene_path_resolver,
-        load_payload=False,
-    )
+    target_pc_file = get_robot_target_pc_file(config)
+    if target_pc_file is not None:
+        all_sample_records = build_robot_target_file_sample_index(
+            output_dir,
+            target_pc_file,
+            config,
+            scene_path_resolver=robot_scene_path_resolver,
+            load_payload=False,
+        )
+    else:
+        all_sample_records = build_visualization_sample_index(
+            output_dir,
+            scene_path_resolver=robot_scene_path_resolver,
+            load_payload=False,
+        )
     if not all_sample_records:
-        raise RuntimeError(f"No saved grasp files found in {output_dir}")
+        target_hint = f" for target_pc_file={target_pc_file}" if target_pc_file is not None else ""
+        raise RuntimeError(f"No saved grasp files found in {output_dir}{target_hint}")
 
     robot_assets = build_robot_components(config)
     stage_names = ["grasp_qpos"]
@@ -3476,11 +3726,16 @@ def task_visualize_robot(config: DictConfig) -> None:
             selection_controls=selection_controls,
         )
     else:
+        initial_mode = normalize_visualize_mode(get_task_value(config, "visualize_mode", "random_objects"))
+        initial_object = get_task_value(config, "object_id", None)
+        if target_pc_file is not None and initial_mode == "one_object":
+            initial_mode = "one_scene"
+            initial_object = pick_initial_object_option(list_available_object_ids(all_sample_records), initial_object)
         initial_sample_records = select_visualization_records(
             all_sample_records,
-            get_task_value(config, "visualize_mode", "random_objects"),
+            initial_mode,
             int(get_task_value(config, "max_grasps", 20)),
-            get_task_value(config, "object_id", None),
+            initial_object,
             get_task_value(config, "target_grasp_type_id", None),
             is_our_human_grasp_format=is_our_human_grasp_format,
         )

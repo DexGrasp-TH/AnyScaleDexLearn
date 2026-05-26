@@ -10,6 +10,12 @@ one_scene_max_grasps_per_type: 5
 object_id: obj_0_seq_0
 target_grasp_type_id: 1
 
+# Optional robot source point-cloud file. When set, task=visualize indexes
+# only saved grasps generated from this file instead of scanning the full
+# saved sample directory. The value may be absolute, relative to
+# test_data.object_path/test_data.pc_path, or scene_id/partial_pc_x.npy.
+target_pc_file:
+
 num_samples_per_group: 20
 include_groups:
 

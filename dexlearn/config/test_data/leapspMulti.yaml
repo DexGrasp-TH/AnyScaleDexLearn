@@ -14,7 +14,8 @@ grasp_path: ${oc.env:AnyScaleGraspDataset}/human_DGN2k_full/leap_sp
 object_path: ${oc.env:AnyScaleGraspDataset}/object/DGN_2k
 split_path: valid_split   # relative to object_path
 pc_source: partial   # 'partial' for partial_pc**.npy, 'complete' for processed_data/<obj>/complete_point_cloud.npy
-pc_path: vision_data/three_realsense_d435_random4096    # relative to object_path, used for partial point clouds
+# pc_path: vision_data/three_realsense_d435_random4096    # relative to object_path, used for partial point clouds
+pc_path: vision_data/single_realsense_d435_random4096
 
 test_split: test
 test_scene_cfg: tabletop_ur10e/**.npy

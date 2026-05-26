@@ -13,7 +13,7 @@ grad_clip: 10.0
 # Number of diffusion candidates generated for each requested real grasp type.
 # With availability sampling and grasp_type_id=0, the model generates this many
 # candidates for each real type 1..5 before optional filtering.
-test_grasp_num: 10
+test_grasp_num: 100
 
 # Number of candidates kept when sample_selection.enabled=true.
 # scope=global: keep this many candidates for the whole scene.
@@ -25,7 +25,7 @@ sample_selection:
   # In availability mode this means available_type_count * test_grasp_num
   # saved grasps for grasp_type_id=0.
   # true: run an additional selection step controlled by scope/mode below.
-  enabled: false
+  enabled: true
   # Used only when enabled=true.
   # global keeps the legacy behavior: all available types share one candidate
   # pool, so each scene saves test_topk grasps.
@@ -46,7 +46,7 @@ model:
   name: HierarchicalModel
   type_objective: availability
   type_availability:
-    score_threshold: 0.5
+    score_threshold: 0.9
     min_available_types: 1
     use_score_prior: true
   backbone:

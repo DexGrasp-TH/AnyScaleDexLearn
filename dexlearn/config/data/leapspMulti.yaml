@@ -13,6 +13,7 @@ paths:
   object_path: ${oc.env:AnyScaleGraspDataset}/object/DGN_2k
   split_path: valid_split
   pc_path: vision_data/three_realsense_d435_random4096
+  # pc_path: vision_data/single_realsense_d435_random4096
 
 point_cloud:
   # Number of object point-cloud points sampled per dataset item.

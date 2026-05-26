@@ -668,3 +668,25 @@ to describe intentional differences from previous runs.
   - max_iter=50000
   - type_objective=availability[scope=None,negative=None]
 - Notes: 
+## leapspMulti_robotMultiHierar_debug1
+- Timestamp: `2026-05-23 20:21:10`
+- Data: `leapspMulti`
+- Algo: `robotMultiHierar`
+- Max Iter: `50000`
+- Key Features:
+  - data=leapspMulti
+  - algo=robotMultiHierar
+  - max_iter=50000
+  - type_objective=availability[scope=None,negative=None]
+- Notes: 
+## shadowMulti_robotMultiHierar_debug0
+- Timestamp: `2026-05-24 23:44:12`
+- Data: `shadowMulti`
+- Algo: `robotMultiHierar`
+- Max Iter: `50000`
+- Key Features:
+  - data=shadowMulti
+  - algo=robotMultiHierar
+  - max_iter=50000
+  - type_objective=availability[scope=None,negative=None]
+- Notes: 

@@ -4,7 +4,7 @@ import argparse
 
 import torch
 import hydra
-from omegaconf import OmegaConf, DictConfig, open_dict
+from omegaconf import DictConfig
 from tqdm import tqdm
 import torch.nn.functional as F
 
@@ -91,52 +91,6 @@ def _decenter_robot_pose(
         dtype=out.dtype
     )
     return out
-
-
-def _apply_sample_availability_threshold(config: DictConfig) -> float | None:
-    """Apply the optional sample-time grasp-type availability threshold.
-
-    Args:
-        config: Full Hydra config used by ``task=sample``. The function mutates
-            ``config.algo.model.type_availability.score_threshold`` when
-            ``task.availability_score_threshold`` is set.
-
-    Returns:
-        The effective availability threshold for availability-trained robot
-        sampling, or ``None`` when the selected model does not use availability
-        sampling.
-    """
-    model_cfg = getattr(config.algo, "model", None)
-    if model_cfg is None:
-        return None
-
-    task_cfg = getattr(config, "task", None)
-    task_threshold = getattr(task_cfg, "availability_score_threshold", None) if task_cfg is not None else None
-    type_objective = str(getattr(model_cfg, "type_objective", "")).strip().lower()
-    availability_cfg = getattr(model_cfg, "type_availability", None)
-
-    if task_threshold is not None:
-        if type_objective != "availability":
-            raise ValueError("task.availability_score_threshold requires algo.model.type_objective=availability")
-        threshold = float(task_threshold)
-        if not 0.0 <= threshold <= 1.0:
-            raise ValueError("task.availability_score_threshold must be in [0, 1]")
-        if availability_cfg is None:
-            with open_dict(model_cfg):
-                model_cfg.type_availability = {}
-            availability_cfg = model_cfg.type_availability
-        # Keep the model as the single source of truth after task-level parsing.
-        with open_dict(availability_cfg):
-            availability_cfg.score_threshold = threshold
-        return threshold
-
-    if type_objective != "availability" or availability_cfg is None:
-        return None
-
-    threshold = float(getattr(availability_cfg, "score_threshold", 0.5))
-    if not 0.0 <= threshold <= 1.0:
-        raise ValueError("algo.model.type_availability.score_threshold must be in [0, 1]")
-    return threshold
 
 
 def _sample_selection_config(config: DictConfig) -> tuple[bool, str, str, float, float, int | None]:
@@ -501,15 +455,12 @@ def _sample_save_mask(
 
 def task_sample(config: DictConfig):
     resolve_type_supervision_config(config)
-    availability_threshold = _apply_sample_availability_threshold(config)
     set_seed(config.seed)
     config.wandb.mode = "disabled"
     logger = Logger(config)
     test_loader = create_test_dataloader(config)
 
     model = eval(config.algo.model.name)(config.algo.model)
-    if availability_threshold is not None:
-        print(f"Using grasp-type availability score_threshold={availability_threshold:.4f}")
 
     # load ckpt if exists
     if config.ckpt is not None:

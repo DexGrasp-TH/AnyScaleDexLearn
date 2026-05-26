@@ -137,8 +137,8 @@ Generate robot grasps from a trained checkpoint.
 CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME>
 
 # Override the availability score threshold used when grasp_type_id=0 samples
-# all model-predicted available real grasp types. The default is 0.5.
-CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME> task.availability_score_threshold=0.35
+# all model-predicted available real grasp types. The robotMultiHierar default is 0.5.
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py task=sample algo=robotMultiHierar data=<DATA_NAME> test_data=<TEST_DATA_NAME> exp_name=<EXP_NAME> algo.model.type_availability.score_threshold=0.35
 ```
 
 ### Visualize
