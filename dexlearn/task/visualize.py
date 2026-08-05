@@ -1670,13 +1670,49 @@ def add_scene_elements_to_viser(server, scene_elements, scene_name: str, offset)
     return handles
 
 
-def add_scene_label_to_viser(server, scene_name: str, caption: str, offset, log_prefix: str):
-    label_position = np.asarray(offset, dtype=np.float32) + np.asarray([0.0, 0.0, 0.35], dtype=np.float32)
+def add_scene_label_to_viser(
+    server,
+    scene_name: str,
+    caption: str,
+    offset,
+    log_prefix: str,
+    label_font_size_mode: str = "screen",
+    label_font_screen_scale: float = 0.8,
+    label_height_offset: float = 0.35,
+):
+    """Add one scene label to Viser with optional font controls.
+
+    Args:
+        server: Active Viser server.
+        scene_name: Unique scene node name prefix.
+        caption: Label text to show.
+        offset: Scene translation offset applied in the grid view.
+        log_prefix: Prefix used by fallback console logging.
+        label_font_size_mode: Viser label font sizing mode.
+        label_font_screen_scale: Screen-space font scale passed to Viser.
+        label_height_offset: World-space z offset added above each scene.
+
+    Returns:
+        The created Viser handle when supported, otherwise ``None``.
+    """
+    label_position = np.asarray(offset, dtype=np.float32) + np.asarray(
+        [0.0, 0.0, float(label_height_offset)],
+        dtype=np.float32,
+    )
     if hasattr(server.scene, "add_label"):
         try:
-            return server.scene.add_label(f"{scene_name}/label", text=caption, position=label_position)
+            return server.scene.add_label(
+                f"{scene_name}/label",
+                text=caption,
+                position=label_position,
+                font_size_mode=str(label_font_size_mode),
+                font_screen_scale=float(label_font_screen_scale),
+            )
         except TypeError:
-            print(f"[{log_prefix}] {scene_name}: {caption}")
+            try:
+                return server.scene.add_label(f"{scene_name}/label", text=caption, position=label_position)
+            except TypeError:
+                print(f"[{log_prefix}] {scene_name}: {caption}")
     else:
         print(f"[{log_prefix}] {scene_name}: {caption}")
     return None
@@ -1812,6 +1848,9 @@ def show_scenes_with_viser(
     log_prefix: str = "visualize",
     selection_controls=None,
     next_batch_loader=None,
+    label_font_size_mode: str = "screen",
+    label_font_screen_scale: float = 0.8,
+    label_height_offset: float = 0.35,
 ):
     if not VISER_AVAILABLE:
         raise ImportError(
@@ -1902,7 +1941,20 @@ def show_scenes_with_viser(
                 label_text = build_caption_from_aspects(record, state["caption_aspects"])
             else:
                 label_text = str(record.get("label_caption", ""))
-            label = add_scene_label_to_viser(server, scene_name, label_text, offset, log_prefix) if label_text else None
+            label = (
+                add_scene_label_to_viser(
+                    server,
+                    scene_name,
+                    label_text,
+                    offset,
+                    log_prefix,
+                    label_font_size_mode=label_font_size_mode,
+                    label_font_screen_scale=label_font_screen_scale,
+                    label_height_offset=label_height_offset,
+                )
+                if label_text
+                else None
+            )
             if label is not None:
                 scene_handles["value"].append(label)
 
