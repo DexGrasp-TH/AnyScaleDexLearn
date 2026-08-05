@@ -81,6 +81,8 @@ except ModuleNotFoundError:
 EPS = 1e-12
 CE_EPS_VALUES = (1e-12, 1e-9, 1e-6, 1e-3)
 REAL_TYPE_IDS = tuple(range(1, len(GRASP_TYPES)))
+BOTH_THREE_TYPE_ID = 4
+WITHOUT_BOTH_THREE_SUFFIX = "without_both_three"
 SCALE_FEATURES = ("xy_long", "xy_short", "z_height")
 GRASP_TYPE_LABELS = [name.split("_", 1)[1] for name in GRASP_TYPES[1:]]
 
@@ -212,6 +214,23 @@ def _write_json(data: Any, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False, default=_json_default)
+
+
+def suffixed_output_path(output_dir: str, filename: str, suffix: str = "") -> str:
+    """Build an output path with an optional stem suffix.
+
+    Args:
+        output_dir: Directory where evaluation files are written.
+        filename: Base filename, including extension.
+        suffix: Optional suffix appended before the extension.
+
+    Returns:
+        Output path inside ``output_dir``.
+    """
+    stem, ext = os.path.splitext(filename)
+    if suffix:
+        filename = f"{stem}_{suffix}{ext}"
+    return os.path.join(output_dir, filename)
 
 
 def canonical_object_id(object_name: Any) -> str:
@@ -598,26 +617,32 @@ def kendall_tau_b(x: np.ndarray, y: np.ndarray) -> float | None:
     return float((concordant - discordant) / denom)
 
 
-def top_k_indices(values: np.ndarray, k: int) -> set[int]:
+def top_k_indices(values: np.ndarray, k: int, type_ids: tuple[int, ...] = REAL_TYPE_IDS) -> set[int]:
     """Return the ids of the top-k real types.
 
     Args:
-        values: Five-dimensional score vector.
+        values: Score vector aligned with ``type_ids``.
         k: Number of entries to select.
+        type_ids: Active real grasp type ids.
 
     Returns:
-        Set of type ids in ``1..5``.
+        Set of selected type ids.
     """
     order = np.argsort(-np.asarray(values, dtype=np.float64), kind="mergesort")
-    return {int(REAL_TYPE_IDS[idx]) for idx in order[: min(k, len(order))]}
+    return {int(type_ids[idx]) for idx in order[: min(k, len(order))]}
 
 
-def positive_set_recall_at_positive_num(q: np.ndarray, p: np.ndarray) -> float | None:
+def positive_set_recall_at_positive_num(
+    q: np.ndarray,
+    p: np.ndarray,
+    type_ids: tuple[int, ...] = REAL_TYPE_IDS,
+) -> float | None:
     """Measure how many GT-positive types appear in the top-|P| predictions.
 
     Args:
-        q: Ground-truth five-way type distribution.
-        p: Predicted five-way type distribution.
+        q: Ground-truth type distribution aligned with ``type_ids``.
+        p: Predicted type distribution aligned with ``type_ids``.
+        type_ids: Active real grasp type ids.
 
     Returns:
         Recall value in ``[0, 1]`` using ``P={t | q_t>0}`` as GT-positive
@@ -626,19 +651,24 @@ def positive_set_recall_at_positive_num(q: np.ndarray, p: np.ndarray) -> float |
     """
     q = np.asarray(q, dtype=np.float64)
     p = np.asarray(p, dtype=np.float64)
-    positive_type_ids = {int(REAL_TYPE_IDS[idx]) for idx, value in enumerate(q) if float(value) > 0.0}
+    positive_type_ids = {int(type_ids[idx]) for idx, value in enumerate(q) if float(value) > 0.0}
     if not positive_type_ids:
         return None
-    predicted_type_ids = top_k_indices(p, len(positive_type_ids))
+    predicted_type_ids = top_k_indices(p, len(positive_type_ids), type_ids)
     return float(len(positive_type_ids & predicted_type_ids) / len(positive_type_ids))
 
 
-def positive_set_soft_recall_at_positive_num(q: np.ndarray, p: np.ndarray) -> float | None:
+def positive_set_soft_recall_at_positive_num(
+    q: np.ndarray,
+    p: np.ndarray,
+    type_ids: tuple[int, ...] = REAL_TYPE_IDS,
+) -> float | None:
     """Measure how much GT positive probability mass is covered by top-|P| types.
 
     Args:
-        q: Ground-truth five-way type distribution.
-        p: Predicted five-way type distribution.
+        q: Ground-truth type distribution aligned with ``type_ids``.
+        p: Predicted type distribution aligned with ``type_ids``.
+        type_ids: Active real grasp type ids.
 
     Returns:
         Soft recall value in ``[0, 1]`` using ``P={t | q_t>0}`` to define the
@@ -651,11 +681,11 @@ def positive_set_soft_recall_at_positive_num(q: np.ndarray, p: np.ndarray) -> fl
     positive_type_num = int(np.sum(q > 0.0))
     if positive_type_num <= 0:
         return None
-    predicted_type_ids = top_k_indices(p, positive_type_num)
+    predicted_type_ids = top_k_indices(p, positive_type_num, type_ids)
     return float(
         sum(
             float(q[idx])
-            for idx, type_id in enumerate(REAL_TYPE_IDS)
+            for idx, type_id in enumerate(type_ids)
             if int(type_id) in predicted_type_ids
         )
     )
@@ -1533,30 +1563,108 @@ def build_pose_class_labels(config, score_rows: list[dict]) -> tuple[list[dict],
     return rows, summary
 
 
-def metric_row_for_pose_class(row: dict) -> dict | None:
+def normalize_probability_values(values: list[float]) -> list[float] | None:
+    """Normalize non-negative probability-like values.
+
+    Args:
+        values: Non-negative values.
+
+    Returns:
+        Normalized values, or ``None`` when the sum is zero.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    total = float(arr.sum())
+    if total <= EPS:
+        return None
+    return (arr / total).tolist()
+
+
+def label_rows_without_grasp_type(label_rows: list[dict], removed_type_id: int) -> tuple[list[dict], dict]:
+    """Remove one grasp type from label rows and renormalize q_t and p_t.
+
+    Args:
+        label_rows: Original five-type pose-class label rows.
+        removed_type_id: Real grasp type id to remove.
+
+    Returns:
+        Tuple of transformed label rows and a summary dictionary.
+    """
+    active_type_ids = tuple(type_id for type_id in REAL_TYPE_IDS if int(type_id) != int(removed_type_id))
+    transformed_rows = []
+    removed_record_count = 0
+    original_record_count = 0
+    for row in label_rows:
+        original_record_count += int(row.get("record_count", 0))
+        removed_count = int(row.get(f"type_{removed_type_id}_count", 0))
+        removed_record_count += removed_count
+        counts = [int(row.get(f"type_{type_id}_count", 0)) for type_id in active_type_ids]
+        q_values = normalize_probability_values(counts)
+        if q_values is None:
+            continue
+
+        transformed = deepcopy(row)
+        transformed["record_count_raw"] = int(row.get("record_count", 0))
+        transformed[f"removed_type_{removed_type_id}_count"] = removed_count
+        transformed[f"removed_type_{removed_type_id}_q_raw"] = row.get(f"type_{removed_type_id}_q", "")
+        transformed[f"removed_type_{removed_type_id}_p_raw"] = row.get(f"type_{removed_type_id}_p", "")
+        transformed.pop(f"type_{removed_type_id}_count", None)
+        transformed.pop(f"type_{removed_type_id}_q", None)
+        transformed.pop(f"type_{removed_type_id}_p", None)
+        transformed["record_count"] = int(sum(counts))
+        for index, type_id in enumerate(active_type_ids):
+            transformed[f"type_{type_id}_count"] = int(counts[index])
+            transformed[f"type_{type_id}_q"] = float(q_values[index])
+
+        if transformed.get("has_score", False):
+            p_values = normalize_probability_values([float(row.get(f"type_{type_id}_p", 0.0) or 0.0) for type_id in active_type_ids])
+            if p_values is None:
+                transformed["has_score"] = False
+                for type_id in active_type_ids:
+                    transformed[f"type_{type_id}_p"] = ""
+            else:
+                for index, type_id in enumerate(active_type_ids):
+                    transformed[f"type_{type_id}_p"] = float(p_values[index])
+        transformed_rows.append(transformed)
+
+    return transformed_rows, {
+        "removed_type_id": int(removed_type_id),
+        "removed_type_name": GRASP_TYPES[int(removed_type_id)],
+        "active_type_ids": list(active_type_ids),
+        "active_type_names": [GRASP_TYPES[type_id] for type_id in active_type_ids],
+        "original_pose_class_num": len(label_rows),
+        "kept_pose_class_num": len(transformed_rows),
+        "dropped_pose_class_num": len(label_rows) - len(transformed_rows),
+        "original_record_count": int(original_record_count),
+        "kept_record_count": int(sum(int(row.get("record_count", 0)) for row in transformed_rows)),
+        "removed_record_count": int(removed_record_count),
+    }
+
+
+def metric_row_for_pose_class(row: dict, active_type_ids: tuple[int, ...] = REAL_TYPE_IDS) -> dict | None:
     """Compute one human labeled metric row.
 
     Args:
         row: Pose-class label row with q and p values.
+        active_type_ids: Real grasp type ids included in this metric row.
 
     Returns:
         Metric row, or ``None`` when prediction is missing.
     """
     if not row.get("has_score", False):
         return None
-    q = np.asarray([float(row[f"type_{type_id}_q"]) for type_id in REAL_TYPE_IDS], dtype=np.float64)
-    p = np.asarray([float(row[f"type_{type_id}_p"]) for type_id in REAL_TYPE_IDS], dtype=np.float64)
+    q = np.asarray([float(row[f"type_{type_id}_q"]) for type_id in active_type_ids], dtype=np.float64)
+    p = np.asarray([float(row[f"type_{type_id}_p"]) for type_id in active_type_ids], dtype=np.float64)
     positive_mask = q > 0.0
     ce = cross_entropy_with_eps(q, p, EPS)
     entropy = float(-np.sum(q * np.log(np.clip(q, EPS, None))))
     l1 = float(np.sum(np.abs(p - q)))
     soft_precision = float(p[positive_mask].sum())
-    hard_recall = positive_set_recall_at_positive_num(q, p)
-    soft_recall = positive_set_soft_recall_at_positive_num(q, p)
-    p_top1 = top_k_indices(p, 1)
-    q_top1 = top_k_indices(q, 1)
-    p_top2 = top_k_indices(p, 2)
-    q_top2 = top_k_indices(q, 2)
+    hard_recall = positive_set_recall_at_positive_num(q, p, active_type_ids)
+    soft_recall = positive_set_soft_recall_at_positive_num(q, p, active_type_ids)
+    p_top1 = top_k_indices(p, 1, active_type_ids)
+    q_top1 = top_k_indices(q, 1, active_type_ids)
+    p_top2 = top_k_indices(p, 2, active_type_ids)
+    q_top2 = top_k_indices(q, 2, active_type_ids)
     out = {
         "split": row["split"],
         "canonical_object_id": row["canonical_object_id"],
@@ -1587,7 +1695,7 @@ def metric_row_for_pose_class(row: dict) -> dict | None:
     }
     for eps in CE_EPS_VALUES:
         out[ce_eps_key(eps)] = cross_entropy_with_eps(q, p, eps)
-    for idx, type_id in enumerate(REAL_TYPE_IDS):
+    for idx, type_id in enumerate(active_type_ids):
         out[f"type_{type_id}_q"] = float(q[idx])
         out[f"type_{type_id}_p"] = float(p[idx])
         out[f"type_{type_id}_bias"] = float(p[idx] - q[idx])
@@ -1655,13 +1763,14 @@ def add_scale_buckets(rows: list[dict], bucket_count: int) -> dict[str, np.ndarr
     return edges_by_feature
 
 
-def summarize_metric_rows(rows: list[dict], group_name: str, group_value: str) -> dict:
+def summarize_metric_rows(rows: list[dict], group_name: str, group_value: str, active_type_ids: tuple[int, ...] = REAL_TYPE_IDS) -> dict:
     """Summarize human metric rows for one group.
 
     Args:
         rows: Metric rows.
         group_name: Grouping field name.
         group_value: Grouping value.
+        active_type_ids: Real grasp type ids included in this summary.
 
     Returns:
         Summary row.
@@ -1690,19 +1799,20 @@ def summarize_metric_rows(rows: list[dict], group_name: str, group_value: str) -
         "top2_overlap",
     ]:
         summary[metric] = metric_mean(rows, metric)
-    for type_id in REAL_TYPE_IDS:
+    for type_id in active_type_ids:
         summary[f"type_{type_id}_signed_bias"] = metric_mean(rows, f"type_{type_id}_bias")
         summary[f"type_{type_id}_mean_under"] = metric_mean(rows, f"type_{type_id}_under")
         summary[f"type_{type_id}_mean_over"] = metric_mean(rows, f"type_{type_id}_over")
     return summary
 
 
-def object_macro_summary(rows: list[dict], split: str) -> dict:
+def object_macro_summary(rows: list[dict], split: str, active_type_ids: tuple[int, ...] = REAL_TYPE_IDS) -> dict:
     """Compute canonical-object macro averages for one split.
 
     Args:
         rows: Metric rows.
         split: Split label.
+        active_type_ids: Real grasp type ids included in this summary.
 
     Returns:
         Summary row.
@@ -1710,7 +1820,7 @@ def object_macro_summary(rows: list[dict], split: str) -> dict:
     object_rows = []
     for object_id in sorted({row["canonical_object_id"] for row in rows}, key=_natural_sort_key):
         object_metric_rows = [row for row in rows if row["canonical_object_id"] == object_id]
-        object_rows.append(summarize_metric_rows(object_metric_rows, "object", object_id))
+        object_rows.append(summarize_metric_rows(object_metric_rows, "object", object_id, active_type_ids))
     summary = {"group_name": "object_macro", "group_value": split, "pose_class_num": len(rows), "object_num": len(object_rows)}
     for key in object_rows[0].keys() if object_rows else []:
         if key in {"group_name", "group_value", "pose_class_num", "object_num"}:
@@ -1720,11 +1830,12 @@ def object_macro_summary(rows: list[dict], split: str) -> dict:
     return summary
 
 
-def build_human_metric_summaries(metric_rows: list[dict]) -> list[dict]:
+def build_human_metric_summaries(metric_rows: list[dict], active_type_ids: tuple[int, ...] = REAL_TYPE_IDS) -> list[dict]:
     """Build required human train/test aggregate summaries.
 
     Args:
         metric_rows: Per-pose-class metric rows.
+        active_type_ids: Real grasp type ids included in this summary.
 
     Returns:
         Summary rows.
@@ -1732,17 +1843,17 @@ def build_human_metric_summaries(metric_rows: list[dict]) -> list[dict]:
     summaries = []
     for split in sorted({row["split"] for row in metric_rows}):
         split_rows = [row for row in metric_rows if row["split"] == split]
-        summaries.append(summarize_metric_rows(split_rows, "scene_micro", split))
+        summaries.append(summarize_metric_rows(split_rows, "scene_micro", split, active_type_ids))
         if split_rows:
-            summaries.append(object_macro_summary(split_rows, split))
+            summaries.append(object_macro_summary(split_rows, split, active_type_ids))
         for positive_num in sorted({row["positive_type_num"] for row in split_rows}):
             rows = [row for row in split_rows if row["positive_type_num"] == positive_num]
-            summaries.append(summarize_metric_rows(rows, "|P(scene)|", str(positive_num)))
+            summaries.append(summarize_metric_rows(rows, "|P(scene)|", str(positive_num), active_type_ids))
         for feature in SCALE_FEATURES:
             bucket_key = f"{feature}_bucket"
             for bucket in sorted({row[bucket_key] for row in split_rows}):
                 rows = [row for row in split_rows if row[bucket_key] == bucket]
-                summary = summarize_metric_rows(rows, bucket_key, f"{split}:{bucket}")
+                summary = summarize_metric_rows(rows, bucket_key, f"{split}:{bucket}", active_type_ids)
                 summaries.append(summary)
     return summaries
 
@@ -1779,7 +1890,15 @@ def train_test_gap_rows(summaries: list[dict]) -> list[dict]:
     return gaps
 
 
-def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_rows: list[dict], output_dir: str) -> list[str]:
+def human_report_lines(
+    label_rows: list[dict],
+    metric_rows: list[dict],
+    summary_rows: list[dict],
+    output_dir: str,
+    active_type_ids: tuple[int, ...] = REAL_TYPE_IDS,
+    output_suffix: str = "",
+    label_summary: dict | None = None,
+) -> list[str]:
     """Format the human 1A markdown section.
 
     Args:
@@ -1787,17 +1906,22 @@ def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_
         metric_rows: Per-pose-class metric rows.
         summary_rows: Aggregate metric rows.
         output_dir: Directory containing CSV outputs.
+        active_type_ids: Real grasp type ids included in this report.
+        output_suffix: Optional suffix appended to referenced output files.
+        label_summary: Optional label transformation summary.
 
     Returns:
         Markdown lines.
     """
+    active_type_names = ", ".join(GRASP_TYPES[type_id] for type_id in active_type_ids)
     lines = [
         "- 本节实现 `Evaluation Metrics 1 / 1A`。label 由本 evaluator 从 human train/test grasp records 重新计算；没有读取或复用 `scene_budget.py` 的 `hierarchy_count` 输出。",
-        "- `q_t=count_t/sum_t count_t` 是 pose-class 内 human observed grasp type 分布，只用于 evaluation；`p_t` 是 Human Prior score 归一化后的五类分布。",
+        f"- Active grasp types: `{active_type_names}`。",
+        "- `q_t=count_t/sum_t count_t` 是 pose-class 内 human observed grasp type 分布，只用于 evaluation；`p_t` 是 Human Prior score 归一化后的 active-type 分布。",
         f"- Pose-class label rows: {len(label_rows)}；有 score 可评估的 rows: {len(metric_rows)}。",
-        f"- 明细 CSV: `{os.path.join(output_dir, 'evaluation_human_pose_class_labels.csv')}`",
-        f"- per-scene metric CSV: `{os.path.join(output_dir, 'evaluation_human_pose_class_metrics.csv')}`",
-        f"- aggregate CSV: `{os.path.join(output_dir, 'evaluation_human_metric_summary.csv')}`",
+        f"- 明细 CSV: `{suffixed_output_path(output_dir, 'evaluation_human_pose_class_labels.csv', output_suffix)}`",
+        f"- per-scene metric CSV: `{suffixed_output_path(output_dir, 'evaluation_human_pose_class_metrics.csv', output_suffix)}`",
+        f"- aggregate CSV: `{suffixed_output_path(output_dir, 'evaluation_human_metric_summary.csv', output_suffix)}`",
         "",
         "### 指标解释",
         "- `KL(q||p)`：`CE-H(q)`，去掉 label 自身 entropy 后的分布偏差；越低越好。",
@@ -1811,12 +1935,18 @@ def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_
         "- `Positive probability mass`：`sum_{t in P(scene)} p_t`，衡量模型把多少概率放到 human observed positive types 上；越高越好。",
         "- `Positive-set Recall@|P|`：令 `P={t | q_t>0}`，取 `p_t` 最高的前 `|P|` 个 type，统计其中覆盖了多少 GT positive types；越高越好，更接近“数据里出现过的 type 是否都被提出来”。",
         "- `Per-type signed bias / under / over`：分别统计 `p_t-q_t`、`max(q_t-p_t,0)`、`max(p_t-q_t,0)`，用于发现某一类是否系统性低估或高估。",
-        "- `Rank agreement`：Spearman、Kendall、top-1 match、top-2 overlap，衡量五类排序是否接近 `q_t`，对 top-heavy allocator 更敏感。",
+        "- `Rank agreement`：Spearman、Kendall、top-1 match、top-2 overlap，衡量 active types 排序是否接近 `q_t`，对 top-heavy allocator 更敏感。",
         "",
         "### Train/Test 主汇总",
         "| split | avg | N | KL | SoftPrec | SoftRec@card(P) | CE | PosCE | CE@1e-6 | CE@1e-3 | L1 | TVD | JS | PosMass | PosR@card(P) | Spearman | Kendall | Top1 | Top2 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    if label_summary and label_summary.get("removed_type_name"):
+        lines[2:2] = [
+            f"- 移除 grasp type: `{label_summary['removed_type_name']}`；剩余 `q_t` 和 `p_t` 已重新归一化。",
+            f"- 原 pose-class rows: {label_summary['original_pose_class_num']}；保留 rows: {label_summary['kept_pose_class_num']}；丢弃 rows: {label_summary['dropped_pose_class_num']}。",
+            f"- 原 human grasp record_count: {label_summary['original_record_count']}；移除后 record_count: {label_summary['kept_record_count']}；移除 count: {label_summary['removed_record_count']}。",
+        ]
     wanted = [row for row in summary_rows if row["group_name"] in {"scene_micro", "object_macro"} and row["group_value"] in {"train", "test"}]
     for row in wanted:
         lines.append(
@@ -1834,9 +1964,9 @@ def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_
         )
     lines.extend(["", "### Per-type Signed Bias（scene-micro）", "| split | type | mean(p-q) | mean under | mean over |", "|---|---:|---:|---:|---:|"])
     for row in [item for item in summary_rows if item["group_name"] == "scene_micro" and item["group_value"] in {"train", "test"}]:
-        for type_id in REAL_TYPE_IDS:
+        for type_id in active_type_ids:
             lines.append(
-                f"| {row['group_value']} | {type_id} | "
+                f"| {row['group_value']} | {GRASP_TYPES[type_id]} | "
                 f"{format_float(row.get(f'type_{type_id}_signed_bias'))} | "
                 f"{format_float(row.get(f'type_{type_id}_mean_under'))} | "
                 f"{format_float(row.get(f'type_{type_id}_mean_over'))} |"
@@ -1845,7 +1975,39 @@ def human_report_lines(label_rows: list[dict], metric_rows: list[dict], summary_
     return lines
 
 
-def run_human_1a(config, human_score_rows: list[dict], output_dir: str) -> tuple[list[str], list[dict], list[dict]]:
+def write_human_1a_outputs(
+    config,
+    label_rows: list[dict],
+    label_summary: dict,
+    output_dir: str,
+    active_type_ids: tuple[int, ...] = REAL_TYPE_IDS,
+    output_suffix: str = "",
+) -> tuple[list[str], list[dict], list[dict]]:
+    """Write 1A label, metric, summary, and report lines for active types.
+
+    Args:
+        config: Full Hydra config.
+        label_rows: Pose-class label rows aligned with ``active_type_ids``.
+        label_summary: Label construction or transformation summary.
+        output_dir: Directory for CSV/JSON outputs.
+        active_type_ids: Real grasp type ids included in this evaluation view.
+        output_suffix: Optional suffix appended to output filenames.
+
+    Returns:
+        Tuple of markdown lines, metric rows, and label rows.
+    """
+    metric_rows = [row for row in (metric_row_for_pose_class(label_row, active_type_ids) for label_row in label_rows) if row is not None]
+    add_scale_buckets(metric_rows, int(getattr(config.task, "scale_bucket_count", 4)))
+    summary_rows = build_human_metric_summaries(metric_rows, active_type_ids)
+    summary_rows.extend(train_test_gap_rows(summary_rows))
+    _write_csv(label_rows, suffixed_output_path(output_dir, "evaluation_human_pose_class_labels.csv", output_suffix))
+    _write_csv(metric_rows, suffixed_output_path(output_dir, "evaluation_human_pose_class_metrics.csv", output_suffix))
+    _write_csv(summary_rows, suffixed_output_path(output_dir, "evaluation_human_metric_summary.csv", output_suffix))
+    _write_json(label_summary, suffixed_output_path(output_dir, "evaluation_human_label_summary.json", output_suffix))
+    return human_report_lines(label_rows, metric_rows, summary_rows, output_dir, active_type_ids, output_suffix, label_summary), metric_rows, label_rows
+
+
+def run_human_1a(config, human_score_rows: list[dict], output_dir: str) -> tuple[list[str], list[dict], list[dict], dict | None]:
     """Run 1A human train/test labeled metrics.
 
     Args:
@@ -1854,18 +2016,35 @@ def run_human_1a(config, human_score_rows: list[dict], output_dir: str) -> tuple
         output_dir: Directory for CSV outputs.
 
     Returns:
-        Tuple of markdown lines, scored human metric rows, and label rows.
+        Tuple of markdown lines, scored human metric rows, label rows, and an
+        optional without-both-three result bundle.
     """
     label_rows, label_summary = build_pose_class_labels(config, human_score_rows)
-    metric_rows = [row for row in (metric_row_for_pose_class(label_row) for label_row in label_rows) if row is not None]
-    add_scale_buckets(metric_rows, int(getattr(config.task, "scale_bucket_count", 4)))
-    summary_rows = build_human_metric_summaries(metric_rows)
-    summary_rows.extend(train_test_gap_rows(summary_rows))
-    _write_csv(label_rows, os.path.join(output_dir, "evaluation_human_pose_class_labels.csv"))
-    _write_csv(metric_rows, os.path.join(output_dir, "evaluation_human_pose_class_metrics.csv"))
-    _write_csv(summary_rows, os.path.join(output_dir, "evaluation_human_metric_summary.csv"))
-    _write_json(label_summary, os.path.join(output_dir, "evaluation_human_label_summary.json"))
-    return human_report_lines(label_rows, metric_rows, summary_rows, output_dir), metric_rows, label_rows
+    human_lines, metric_rows, label_rows = write_human_1a_outputs(
+        config=config,
+        label_rows=label_rows,
+        label_summary=label_summary,
+        output_dir=output_dir,
+    )
+    excluded_result = None
+    if bool(getattr(config.task, "exclude_both_three", False)):
+        excluded_rows, excluded_summary = label_rows_without_grasp_type(label_rows, BOTH_THREE_TYPE_ID)
+        excluded_lines, excluded_metric_rows, excluded_rows = write_human_1a_outputs(
+            config=config,
+            label_rows=excluded_rows,
+            label_summary=excluded_summary,
+            output_dir=output_dir,
+            active_type_ids=tuple(type_id for type_id in REAL_TYPE_IDS if type_id != BOTH_THREE_TYPE_ID),
+            output_suffix=WITHOUT_BOTH_THREE_SUFFIX,
+        )
+        excluded_result = {
+            "lines": excluded_lines,
+            "metric_rows": excluded_metric_rows,
+            "label_rows": excluded_rows,
+            "active_type_ids": tuple(type_id for type_id in REAL_TYPE_IDS if type_id != BOTH_THREE_TYPE_ID),
+            "output_suffix": WITHOUT_BOTH_THREE_SUFFIX,
+        }
+    return human_lines, metric_rows, label_rows, excluded_result
 
 
 def load_scale_anchor_distributions(path: str, scope: str = "train") -> list[dict]:
@@ -1930,13 +2109,19 @@ def nearest_scale_anchor(object_scale: float, anchors: list[dict]) -> dict:
     return min(anchors, key=lambda item: (abs(float(item["anchor_scale"]) - float(object_scale)), int(item["anchor_index"])))
 
 
-def build_scale_anchor_baseline_predictions(label_rows: list[dict], anchors: list[dict], split: str = "test") -> list[dict]:
+def build_scale_anchor_baseline_predictions(
+    label_rows: list[dict],
+    anchors: list[dict],
+    split: str = "test",
+    active_type_ids: tuple[int, ...] = REAL_TYPE_IDS,
+) -> list[dict]:
     """Build baseline prediction rows by nearest object-scale anchor.
 
     Args:
         label_rows: Human pose-class label rows produced by ``build_pose_class_labels``.
         anchors: Scale-anchor distribution rows.
         split: Dataset split to evaluate, normally ``test``.
+        active_type_ids: Real grasp type ids included in this baseline view.
 
     Returns:
         Label-like rows whose ``type_*_p`` values come from the nearest anchor.
@@ -1957,8 +2142,13 @@ def build_scale_anchor_baseline_predictions(label_rows: list[dict], anchors: lis
         baseline["anchor_interval"] = str(anchor["anchor_interval"])
         baseline["anchor_total_count"] = int(anchor["anchor_total_count"])
         baseline["anchor_abs_scale_delta"] = abs(float(anchor["anchor_scale"]) - object_scale)
-        for idx, type_id in enumerate(REAL_TYPE_IDS):
-            baseline[f"type_{type_id}_p"] = float(anchor["distribution"][idx])
+        active_distribution = normalize_probability_values(
+            [float(anchor["distribution"][int(type_id) - 1]) for type_id in active_type_ids]
+        )
+        if active_distribution is None:
+            continue
+        for idx, type_id in enumerate(active_type_ids):
+            baseline[f"type_{type_id}_p"] = float(active_distribution[idx])
         out.append(baseline)
     return out
 
@@ -1972,6 +2162,8 @@ def scale_anchor_baseline_report_lines(
     summary_rows: list[dict],
     model_metric_rows: list[dict],
     output_dir: str,
+    active_type_ids: tuple[int, ...] = REAL_TYPE_IDS,
+    output_suffix: str = "",
 ) -> list[str]:
     """Format the scale-anchor baseline report section.
 
@@ -1984,18 +2176,22 @@ def scale_anchor_baseline_report_lines(
         summary_rows: Baseline aggregate rows.
         model_metric_rows: Existing model metric rows for comparison.
         output_dir: Directory containing CSV outputs.
+        active_type_ids: Real grasp type ids included in this baseline view.
+        output_suffix: Optional suffix appended to referenced output files.
 
     Returns:
         Markdown lines.
     """
+    active_type_names = ", ".join(GRASP_TYPES[type_id] for type_id in active_type_ids)
     lines = [
         f"- Baseline 来源: `{anchor_path}`",
         f"- Baseline 统计 scope: `{anchor_scope}`。该 baseline 只使用这个 scope 内的 grasp distribution，默认使用 train 以避免 test label 泄漏。",
-        "- 对每个 test pose-class row，使用该 object 的 AABB 半对角 scale 找最近 anchor，并把该 anchor 的五类分布作为 `p_t`。",
+        f"- Active grasp types: `{active_type_names}`。",
+        "- 对每个 test pose-class row，使用该 object 的 AABB 半对角 scale 找最近 anchor，并把该 anchor 的 active-type 分布作为 `p_t`。",
         f"- anchor 数量: {len(anchors)}；test baseline rows: {len(metric_rows)}。",
-        f"- baseline prediction CSV: `{os.path.join(output_dir, 'evaluation_human_scale_anchor_baseline_predictions.csv')}`",
-        f"- baseline metric CSV: `{os.path.join(output_dir, 'evaluation_human_scale_anchor_baseline_metrics.csv')}`",
-        f"- baseline summary CSV: `{os.path.join(output_dir, 'evaluation_human_scale_anchor_baseline_summary.csv')}`",
+        f"- baseline prediction CSV: `{suffixed_output_path(output_dir, 'evaluation_human_scale_anchor_baseline_predictions.csv', output_suffix)}`",
+        f"- baseline metric CSV: `{suffixed_output_path(output_dir, 'evaluation_human_scale_anchor_baseline_metrics.csv', output_suffix)}`",
+        f"- baseline summary CSV: `{suffixed_output_path(output_dir, 'evaluation_human_scale_anchor_baseline_summary.csv', output_suffix)}`",
         "",
         "### Baseline vs Model（test）",
         "| method | avg | N | KL | SoftPrec | SoftRec@card(P) | CE | PosCE | CE@1e-6 | CE@1e-3 | L1 | TVD | JS | PosMass | PosR@card(P) | Spearman | Kendall | Top1 | Top2 |",
@@ -2004,8 +2200,8 @@ def scale_anchor_baseline_report_lines(
     model_test_rows = [row for row in model_metric_rows if str(row.get("split", "")) == "test"]
     compare_rows = []
     if model_test_rows:
-        compare_rows.append(("model", summarize_metric_rows(model_test_rows, "scene_micro", "test")))
-        compare_rows.append(("model", object_macro_summary(model_test_rows, "test")))
+        compare_rows.append(("model", summarize_metric_rows(model_test_rows, "scene_micro", "test", active_type_ids)))
+        compare_rows.append(("model", object_macro_summary(model_test_rows, "test", active_type_ids)))
     for row in summary_rows:
         if row["group_name"] in {"scene_micro", "object_macro"} and row["group_value"] == "test":
             compare_rows.append(("scale_anchor", row))
@@ -2030,7 +2226,14 @@ def scale_anchor_baseline_report_lines(
     return lines
 
 
-def run_human_scale_anchor_baseline(config, label_rows: list[dict], model_metric_rows: list[dict], output_dir: str) -> list[str]:
+def run_human_scale_anchor_baseline(
+    config,
+    label_rows: list[dict],
+    model_metric_rows: list[dict],
+    output_dir: str,
+    active_type_ids: tuple[int, ...] = REAL_TYPE_IDS,
+    output_suffix: str = "",
+) -> list[str]:
     """Run the nearest-object-scale-anchor human baseline.
 
     Args:
@@ -2038,6 +2241,8 @@ def run_human_scale_anchor_baseline(config, label_rows: list[dict], model_metric
         label_rows: Human pose-class label rows from 1A evaluation.
         model_metric_rows: Model metric rows from 1A evaluation.
         output_dir: Directory for CSV outputs.
+        active_type_ids: Real grasp type ids included in this baseline view.
+        output_suffix: Optional suffix appended to output filenames.
 
     Returns:
         Markdown report lines.
@@ -2048,10 +2253,10 @@ def run_human_scale_anchor_baseline(config, label_rows: list[dict], model_metric
     split = str(getattr(config.task, "human_scale_anchor_baseline_split", "test") or "test")
     anchor_scope = str(getattr(config.task, "human_scale_anchor_distribution_scope", "train") or "train")
     anchors = load_scale_anchor_distributions(anchor_path, scope=anchor_scope)
-    prediction_rows = build_scale_anchor_baseline_predictions(label_rows, anchors, split=split)
+    prediction_rows = build_scale_anchor_baseline_predictions(label_rows, anchors, split=split, active_type_ids=active_type_ids)
     metric_rows = []
     for prediction in prediction_rows:
-        metric = metric_row_for_pose_class(prediction)
+        metric = metric_row_for_pose_class(prediction, active_type_ids)
         if metric is None:
             continue
         for key in ["baseline_name", "anchor_scope", "anchor_index", "anchor_scale", "anchor_interval", "anchor_total_count", "anchor_abs_scale_delta"]:
@@ -2059,12 +2264,23 @@ def run_human_scale_anchor_baseline(config, label_rows: list[dict], model_metric
         metric_rows.append(metric)
     if metric_rows:
         add_scale_buckets(metric_rows, int(getattr(config.task, "scale_bucket_count", 4)))
-    summary_rows = build_human_metric_summaries(metric_rows)
+    summary_rows = build_human_metric_summaries(metric_rows, active_type_ids)
     summary_rows.extend(train_test_gap_rows(summary_rows))
-    _write_csv(prediction_rows, os.path.join(output_dir, "evaluation_human_scale_anchor_baseline_predictions.csv"))
-    _write_csv(metric_rows, os.path.join(output_dir, "evaluation_human_scale_anchor_baseline_metrics.csv"))
-    _write_csv(summary_rows, os.path.join(output_dir, "evaluation_human_scale_anchor_baseline_summary.csv"))
-    return scale_anchor_baseline_report_lines(anchor_path, anchor_scope, anchors, prediction_rows, metric_rows, summary_rows, model_metric_rows, output_dir)
+    _write_csv(prediction_rows, suffixed_output_path(output_dir, "evaluation_human_scale_anchor_baseline_predictions.csv", output_suffix))
+    _write_csv(metric_rows, suffixed_output_path(output_dir, "evaluation_human_scale_anchor_baseline_metrics.csv", output_suffix))
+    _write_csv(summary_rows, suffixed_output_path(output_dir, "evaluation_human_scale_anchor_baseline_summary.csv", output_suffix))
+    return scale_anchor_baseline_report_lines(
+        anchor_path,
+        anchor_scope,
+        anchors,
+        prediction_rows,
+        metric_rows,
+        summary_rows,
+        model_metric_rows,
+        output_dir,
+        active_type_ids,
+        output_suffix,
+    )
 
 
 def score_rows_with_scale(score_rows: list[dict], task_cfg, output_dir: str, prefix: str) -> list[dict]:
@@ -2565,6 +2781,7 @@ def task_evaluate(config) -> None:
 
     max_score_rows = int(getattr(config.task, "max_score_rows", 0))
     score_grasp_type = str(getattr(config.task, "score_grasp_type", "0_any") or "0_any")
+    exclude_both_three = bool(getattr(config.task, "exclude_both_three", False))
     human_dataset_name = str(getattr(config.task, "human_results_dataset", "humanMulti") or "humanMulti")
     dgn_dataset_name = str(getattr(config.task, "dgn_results_dataset", "DGNMulti") or "DGNMulti")
 
@@ -2614,6 +2831,7 @@ def task_evaluate(config) -> None:
             f"- dgn_results_dir: `{dgn_results_dir}`",
             f"- dgn score rows: {len(dgn_score_rows)}",
             f"- score_grasp_type: `{score_grasp_type}`",
+            f"- exclude_both_three: `{exclude_both_three}`",
             f"- output_dir: `{output_dir}`",
             "- 本任务只读已保存的 `tests/step_*` sample 结果，不运行 sampling、BimanBODex 或 Bench。",
         ],
@@ -2621,18 +2839,29 @@ def task_evaluate(config) -> None:
 
     human_metric_rows = []
     human_label_rows = []
+    excluded_both_three_result = None
     if bool(getattr(config.task, "run_human_1a", True)):
         try:
-            human_lines, human_metric_rows, human_label_rows = run_human_1a(config, human_score_rows, output_dir)
+            human_lines, human_metric_rows, human_label_rows, excluded_both_three_result = run_human_1a(config, human_score_rows, output_dir)
             report.add_section("1A Human Train/Test 有 Label", human_lines)
         except Exception as exc:
             report.add_section("1A Human Train/Test 有 Label", [f"- 1A 运行失败：`{type(exc).__name__}: {exc}`"])
             raise
 
+    excluded_baseline_lines = []
     if bool(getattr(config.task, "run_human_scale_anchor_baseline", True)):
         try:
             baseline_lines = run_human_scale_anchor_baseline(config, human_label_rows, human_metric_rows, output_dir)
             report.add_section("1A-Baseline Human Scale Anchor", baseline_lines)
+            if excluded_both_three_result is not None:
+                excluded_baseline_lines = run_human_scale_anchor_baseline(
+                    config,
+                    excluded_both_three_result["label_rows"],
+                    excluded_both_three_result["metric_rows"],
+                    output_dir,
+                    excluded_both_three_result["active_type_ids"],
+                    excluded_both_three_result["output_suffix"],
+                )
         except Exception as exc:
             report.add_section("1A-Baseline Human Scale Anchor", [f"- baseline 运行失败：`{type(exc).__name__}: {exc}`"])
             raise
@@ -2649,4 +2878,29 @@ def task_evaluate(config) -> None:
             "- 最终 allocator 是否有效仍需要固定总 budget 下的 BimanBODex + Bench paired downstream evaluation 验证。",
         ],
     )
+    if excluded_both_three_result is not None:
+        excluded_report_path = suffixed_output_path(output_dir, "evaluation_report.md", WITHOUT_BOTH_THREE_SUFFIX)
+        excluded_report = MarkdownReport(excluded_report_path, "Human Prior Intrinsic Evaluation（without both_three）")
+        excluded_report.add_section(
+            "输入",
+            [
+                f"- source evaluation output_dir: `{output_dir}`",
+                f"- score_grasp_type: `{score_grasp_type}`",
+                f"- exclude_both_three: `{exclude_both_three}`",
+                f"- output_suffix: `{WITHOUT_BOTH_THREE_SUFFIX}`",
+                "- 本报告与主 evaluation 同次生成；只在 1A/baseline 统计口径中移除 `4_both_three`，并对剩余四类的 `q_t` / `p_t` 重新归一化。",
+            ],
+        )
+        excluded_report.add_section("1A Human Train/Test 有 Label", excluded_both_three_result["lines"])
+        if excluded_baseline_lines:
+            excluded_report.add_section("1A-Baseline Human Scale Anchor", excluded_baseline_lines)
+        excluded_report.add_section(
+            "结论使用边界",
+            [
+                "- 本报告回答的是排除 `4_both_three` 后，Human Prior 在剩余四类上的分布匹配表现。",
+                "- 它不重新训练模型，也不重新运行 sampling、BimanBODex 或 Bench。",
+                "- 移除 type 后的 `p_t` 会重新归一化，因此数值不能和原五类固定总预算口径直接混用。",
+            ],
+        )
+        print(f"[evaluate] Wrote without-both-three report to {excluded_report_path}")
     print(f"[evaluate] Wrote report to {report_path}")

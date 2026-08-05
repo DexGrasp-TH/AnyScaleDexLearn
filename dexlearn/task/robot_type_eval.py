@@ -22,6 +22,7 @@ from dexlearn.utils.util import load_json, set_seed
 
 REAL_GRASP_TYPE_IDS = tuple(range(1, len(GRASP_TYPES)))
 REAL_GRASP_TYPE_NUM = len(REAL_GRASP_TYPE_IDS)
+DEFAULT_EXCLUDED_GRASP_TYPES = ()
 
 
 def _grasp_type_id_from_token(token: str) -> int | None:
@@ -39,6 +40,35 @@ def _grasp_type_id_from_token(token: str) -> int | None:
         if token == grasp_type or grasp_type.endswith(token):
             return type_id
     return None
+
+
+def _resolve_eval_type_ids(task_config: DictConfig) -> tuple[int, ...]:
+    """Resolve real grasp types that should contribute to evaluation metrics.
+
+    Args:
+        task_config: Hydra task config for ``robot_type_eval``.
+
+    Returns:
+        Tuple of real grasp-type ids that are included in macro metrics and
+        output tables.
+    """
+    raw_excluded = getattr(task_config, "exclude_grasp_types", DEFAULT_EXCLUDED_GRASP_TYPES)
+    excluded_type_ids: set[int] = set()
+    for raw_token in raw_excluded or []:
+        token = str(raw_token)
+        type_id = int(token) if token.isdigit() else _grasp_type_id_from_token(token)
+        if type_id is None:
+            raise ValueError(f"Unknown excluded grasp type: {raw_token!r}")
+        if type_id == 0:
+            continue
+        if type_id not in REAL_GRASP_TYPE_IDS:
+            raise ValueError(f"Excluded grasp type must be a real type id, got {raw_token!r}")
+        excluded_type_ids.add(type_id)
+
+    eval_type_ids = tuple(type_id for type_id in REAL_GRASP_TYPE_IDS if type_id not in excluded_type_ids)
+    if not eval_type_ids:
+        raise ValueError("At least one real grasp type must remain after exclude_grasp_types")
+    return eval_type_ids
 
 
 def _scene_id_from_grasp_path(grasp_path: str, grasp_root: str, obj_id: str) -> str:
@@ -218,13 +248,19 @@ def _aggregate_scene_predictions(records: list[dict]) -> dict[str, dict]:
     return aggregated
 
 
-def _compute_precision_recall(predictions: dict[str, dict], ground_truth: dict[str, dict], threshold: float) -> dict:
+def _compute_precision_recall(
+    predictions: dict[str, dict],
+    ground_truth: dict[str, dict],
+    threshold: float,
+    eval_type_ids: tuple[int, ...],
+) -> dict:
     """Compute per-grasp-type precision, recall and F1.
 
     Args:
         predictions: Mapping ``scene_id -> {scores}`` from model inference.
         ground_truth: Mapping ``scene_id -> {availability, counts}``.
         threshold: Score threshold used to binarize predicted availability.
+        eval_type_ids: Real grasp-type ids included in metrics.
 
     Returns:
         Summary dictionary with per-type confusion counts and metrics.
@@ -234,7 +270,8 @@ def _compute_precision_recall(predictions: dict[str, dict], ground_truth: dict[s
     precision_values = []
     recall_values = []
     f1_values = []
-    for type_offset, type_id in enumerate(REAL_GRASP_TYPE_IDS):
+    for type_id in eval_type_ids:
+        type_offset = type_id - 1
         tp = fp = fn = tn = 0
         for scene_id in matched_scene_ids:
             pred_available = bool(predictions[scene_id]["scores"][type_offset] >= threshold)
@@ -273,6 +310,10 @@ def _compute_precision_recall(predictions: dict[str, dict], ground_truth: dict[s
         "macro_precision": float(np.mean(precision_values)) if precision_values else 0.0,
         "macro_recall": float(np.mean(recall_values)) if recall_values else 0.0,
         "macro_f1": float(np.mean(f1_values)) if f1_values else 0.0,
+        "included_type_ids": [int(type_id) for type_id in eval_type_ids],
+        "included_grasp_types": [GRASP_TYPES[type_id] for type_id in eval_type_ids],
+        "excluded_type_ids": [int(type_id) for type_id in REAL_GRASP_TYPE_IDS if type_id not in eval_type_ids],
+        "excluded_grasp_types": [GRASP_TYPES[type_id] for type_id in REAL_GRASP_TYPE_IDS if type_id not in eval_type_ids],
         "per_type": metrics,
     }
 
@@ -313,26 +354,36 @@ def _resolve_thresholds(task_config: DictConfig) -> list[float]:
     return cleaned
 
 
-def _compute_threshold_sweep(predictions: dict[str, dict], ground_truth: dict[str, dict], thresholds: list[float]) -> list[dict]:
+def _compute_threshold_sweep(
+    predictions: dict[str, dict],
+    ground_truth: dict[str, dict],
+    thresholds: list[float],
+    eval_type_ids: tuple[int, ...],
+) -> list[dict]:
     """Evaluate all configured thresholds.
 
     Args:
         predictions: Mapping ``scene_id -> {scores}`` from model inference.
         ground_truth: Mapping ``scene_id -> {availability, counts}``.
         thresholds: Threshold values used to binarize predicted scores.
+        eval_type_ids: Real grasp-type ids included in metrics.
 
     Returns:
         List of metric summaries, one per threshold.
     """
-    return [_compute_precision_recall(predictions, ground_truth, threshold=value) for value in thresholds]
+    return [
+        _compute_precision_recall(predictions, ground_truth, threshold=value, eval_type_ids=eval_type_ids)
+        for value in thresholds
+    ]
 
 
-def _best_threshold_report(threshold_summaries: list[dict]) -> dict:
+def _best_threshold_report(threshold_summaries: list[dict], eval_type_ids: tuple[int, ...]) -> dict:
     """Find convenient best-threshold suggestions from a sweep.
 
     Args:
         threshold_summaries: List of summaries returned by
             ``_compute_threshold_sweep``.
+        eval_type_ids: Real grasp-type ids included in metrics.
 
     Returns:
         Dictionary containing the best macro-F1 threshold and best per-type F1
@@ -343,7 +394,7 @@ def _best_threshold_report(threshold_summaries: list[dict]) -> dict:
 
     best_macro = max(threshold_summaries, key=lambda row: (row["macro_f1"], row["macro_recall"], -row["threshold"]))
     best_per_type = {}
-    for type_id in REAL_GRASP_TYPE_IDS:
+    for type_id in eval_type_ids:
         type_key = str(type_id)
         best_row = max(
             threshold_summaries,
@@ -373,13 +424,18 @@ def _best_threshold_report(threshold_summaries: list[dict]) -> dict:
     }
 
 
-def _write_threshold_sweep_outputs(output_dir: str, threshold_summaries: list[dict]) -> None:
+def _write_threshold_sweep_outputs(
+    output_dir: str,
+    threshold_summaries: list[dict],
+    eval_type_ids: tuple[int, ...],
+) -> None:
     """Write threshold sweep tables to disk.
 
     Args:
         output_dir: Directory where report files should be saved.
         threshold_summaries: List of summaries returned by
             ``_compute_threshold_sweep``.
+        eval_type_ids: Real grasp-type ids included in metrics.
 
     Returns:
         None.
@@ -409,7 +465,7 @@ def _write_threshold_sweep_outputs(output_dir: str, threshold_summaries: list[di
         writer = csv.DictWriter(f, fieldnames=per_type_fields)
         writer.writeheader()
         for summary in threshold_summaries:
-            for type_id in REAL_GRASP_TYPE_IDS:
+            for type_id in eval_type_ids:
                 metric = summary["per_type"][str(type_id)]
                 writer.writerow(
                     {
@@ -435,6 +491,7 @@ def _write_outputs(
     ground_truth: dict[str, dict],
     summary: dict,
     threshold_summaries: list[dict] | None = None,
+    eval_type_ids: tuple[int, ...] = REAL_GRASP_TYPE_IDS,
 ) -> None:
     """Write robot type evaluation reports to disk.
 
@@ -445,6 +502,7 @@ def _write_outputs(
         summary: Metric summary returned by ``_compute_precision_recall``.
         threshold_summaries: Optional sweep summaries for additional CSV
             reports.
+        eval_type_ids: Real grasp-type ids included in metrics and tables.
 
     Returns:
         None.
@@ -453,13 +511,13 @@ def _write_outputs(
     with open(pjoin(output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     if threshold_summaries is not None:
-        _write_threshold_sweep_outputs(output_dir, threshold_summaries)
+        _write_threshold_sweep_outputs(output_dir, threshold_summaries, eval_type_ids=eval_type_ids)
 
     row_fields = ["scene_id", "scene_path", "row_count"]
-    row_fields += [f"pred_score_{type_id}_{GRASP_TYPES[type_id]}" for type_id in REAL_GRASP_TYPE_IDS]
-    row_fields += [f"pred_available_{type_id}_{GRASP_TYPES[type_id]}" for type_id in REAL_GRASP_TYPE_IDS]
-    row_fields += [f"gt_available_{type_id}_{GRASP_TYPES[type_id]}" for type_id in REAL_GRASP_TYPE_IDS]
-    row_fields += [f"gt_count_{type_id}_{GRASP_TYPES[type_id]}" for type_id in REAL_GRASP_TYPE_IDS]
+    row_fields += [f"pred_score_{type_id}_{GRASP_TYPES[type_id]}" for type_id in eval_type_ids]
+    row_fields += [f"pred_available_{type_id}_{GRASP_TYPES[type_id]}" for type_id in eval_type_ids]
+    row_fields += [f"gt_available_{type_id}_{GRASP_TYPES[type_id]}" for type_id in eval_type_ids]
+    row_fields += [f"gt_count_{type_id}_{GRASP_TYPES[type_id]}" for type_id in eval_type_ids]
     with open(pjoin(output_dir, "per_scene.csv"), "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=row_fields)
         writer.writeheader()
@@ -473,7 +531,8 @@ def _write_outputs(
                 "scene_path": pred["scene_path"],
                 "row_count": pred["row_count"],
             }
-            for offset, type_id in enumerate(REAL_GRASP_TYPE_IDS):
+            for type_id in eval_type_ids:
+                offset = type_id - 1
                 row[f"pred_score_{type_id}_{GRASP_TYPES[type_id]}"] = float(pred["scores"][offset])
                 row[f"pred_available_{type_id}_{GRASP_TYPES[type_id]}"] = int(
                     pred["scores"][offset] >= summary["threshold"]
@@ -488,6 +547,8 @@ def _write_outputs(
         f.write(f"- matched scenes: {summary['scene_count']}\n")
         f.write(f"- missing GT scenes: {summary['missing_ground_truth_scene_count']}\n")
         f.write(f"- unused GT scenes: {summary['unused_ground_truth_scene_count']}\n\n")
+        f.write(f"- included grasp types: {', '.join(summary['included_grasp_types'])}\n")
+        f.write(f"- excluded grasp types: {', '.join(summary['excluded_grasp_types']) or 'none'}\n\n")
         f.write(
             f"- macro precision/recall/F1: "
             f"{summary['macro_precision']:.6f} / {summary['macro_recall']:.6f} / {summary['macro_f1']:.6f}\n\n"
@@ -503,7 +564,7 @@ def _write_outputs(
             )
             f.write("| type | best threshold | precision | recall | F1 |\n")
             f.write("| --- | ---: | ---: | ---: | ---: |\n")
-            for type_id in REAL_GRASP_TYPE_IDS:
+            for type_id in eval_type_ids:
                 row = best_report["best_per_type_f1"][str(type_id)]
                 f.write(
                     f"| {row['grasp_type']} | {row['threshold']:.4f} | "
@@ -514,7 +575,7 @@ def _write_outputs(
         f.write("## Selected Threshold Metrics\n\n")
         f.write("| type | precision | recall | F1 | tp | fp | fn | tn |\n")
         f.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
-        for type_id in REAL_GRASP_TYPE_IDS:
+        for type_id in eval_type_ids:
             row = summary["per_type"][str(type_id)]
             f.write(
                 f"| {row['grasp_type']} | {row['precision']:.6f} | {row['recall']:.6f} | {row['f1']:.6f} | "
@@ -542,8 +603,10 @@ def _print_summary(summary: dict) -> None:
             f"best_macro_f1_threshold={best_macro['threshold']:.4f}, "
             f"macro_f1={best_macro['macro_f1']:.6f}"
         )
+    print(f"included_types={','.join(summary['included_grasp_types'])}")
+    print(f"excluded_types={','.join(summary['excluded_grasp_types']) or 'none'}")
     print("type\tprecision\trecall\tf1\ttp\tfp\tfn\ttn")
-    for type_id in REAL_GRASP_TYPE_IDS:
+    for type_id in summary["included_type_ids"]:
         row = summary["per_type"][str(type_id)]
         print(
             f"{row['grasp_type']}\t{row['precision']:.6f}\t{row['recall']:.6f}\t{row['f1']:.6f}\t"
@@ -608,19 +671,37 @@ def task_robot_type_eval(config: DictConfig):
                 )
 
     predictions = _aggregate_scene_predictions(records)
+    eval_type_ids = _resolve_eval_type_ids(config.task)
     thresholds = _resolve_thresholds(config.task)
-    threshold_summaries = _compute_threshold_sweep(predictions, ground_truth, thresholds=thresholds)
+    threshold_summaries = _compute_threshold_sweep(
+        predictions,
+        ground_truth,
+        thresholds=thresholds,
+        eval_type_ids=eval_type_ids,
+    )
     threshold = float(getattr(config.task, "threshold", 0.5))
-    summary = _compute_precision_recall(predictions, ground_truth, threshold=threshold)
+    summary = _compute_precision_recall(
+        predictions,
+        ground_truth,
+        threshold=threshold,
+        eval_type_ids=eval_type_ids,
+    )
     summary["checkpoint"] = str(config.ckpt)
     summary["checkpoint_iter"] = ckpt_iter
     summary["raw_prediction_row_count"] = int(len(records))
     summary["prediction_scene_count"] = int(len(predictions))
     summary["sweep_thresholds"] = thresholds
-    summary["threshold_selection"] = _best_threshold_report(threshold_summaries)
+    summary["threshold_selection"] = _best_threshold_report(threshold_summaries, eval_type_ids=eval_type_ids)
 
     default_output_dir = pjoin(logger.save_test_dir, f"step_{str(ckpt_iter).zfill(6)}", "robot_type_eval")
     output_dir = str(getattr(config.task, "output_dir", "") or default_output_dir)
-    _write_outputs(output_dir, predictions, ground_truth, summary, threshold_summaries=threshold_summaries)
+    _write_outputs(
+        output_dir,
+        predictions,
+        ground_truth,
+        summary,
+        threshold_summaries=threshold_summaries,
+        eval_type_ids=eval_type_ids,
+    )
     _print_summary(summary)
     print(f"Saved robot type evaluation to {output_dir}")

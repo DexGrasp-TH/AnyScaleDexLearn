@@ -33,6 +33,10 @@ run_human_1a: true
 run_human_scale_anchor_baseline: true
 run_dgn_1b: true
 
+# Also emit a derived 1A report where both-three labels and probabilities are
+# removed before q_t and p_t are renormalized over the remaining four types.
+exclude_both_three: false
+
 # Human label recomputation. These thresholds mirror the pose-class notion used
 # by scene_budget.py, but evaluate.py recomputes labels independently.
 human_splits: [train, test]
