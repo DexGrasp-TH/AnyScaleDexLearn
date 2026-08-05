@@ -1,13 +1,24 @@
+# Python
 __pycache__/
-*.egg-info
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# .vscode
-*.npy
-*.json
-debug*
-output*
+# Local environments and OS files
+.env
+.env.*
+!.env.example
+.venv/
+.DS_Store
+Thumbs.db
+
+# Project-local datasets and generated outputs
+/assets/object
+/output/
+/temp/
+/multirun/
+
+# Local package archives
 *.tar.bz2
-pytorch3d-*.tar.bz2
-assets/*
-!assets/.gitkeep
-temp/
