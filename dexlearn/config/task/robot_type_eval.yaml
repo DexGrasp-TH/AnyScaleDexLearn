@@ -16,6 +16,10 @@ threshold_step: 0.05
 # Ground-truth object split used to index full robot grasp data.
 gt_split: test
 
+# Optional real grasp types excluded from macro metrics and output tables.
+# Example paper protocol: [both_three]
+exclude_grasp_types: []
+
 # Empty means write to:
 # <output_folder>/<wandb.id>/tests/<ckpt_step>/robot_type_eval
 output_dir:
