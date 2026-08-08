@@ -95,28 +95,143 @@ class RobotMultiDexDataset(Dataset):
             item_name="object",
         )
 
-        scene_patterns = (
-            [self.config.test_scene_cfg] if isinstance(self.config.test_scene_cfg, str) else self.config.test_scene_cfg
-        )
+        scene_list_path = self._configured_test_scene_list_path()
+        test_scene_num = int(getattr(self.config, "test_scene_num", 0))
+        if scene_list_path is not None:
+            if test_scene_num > 0:
+                raise ValueError("test_scene_list_path and test_scene_num are mutually exclusive")
+            listed_paths = self._load_explicit_test_scene_paths(scene_list_path)
+            selected_object_ids = set(self.obj_id_lst)
+            scene_root = os.path.abspath(pjoin(self.config.object_path, "scene_cfg"))
+            self.test_cfg_lst = [
+                scene_path
+                for scene_path in listed_paths
+                if os.path.relpath(scene_path, scene_root).split(os.sep, 1)[0] in selected_object_ids
+            ]
+            if not self.test_cfg_lst:
+                raise ValueError(
+                    f"No scenes from test_scene_list_path={scene_list_path} match test split {split_name!r}"
+                )
+            print(
+                f"Selected {len(self.test_cfg_lst)}/{len(listed_paths)} explicit test scenes "
+                f"from {scene_list_path} for split {split_name!r}."
+            )
+        else:
+            scene_patterns = (
+                [self.config.test_scene_cfg]
+                if isinstance(self.config.test_scene_cfg, str)
+                else self.config.test_scene_cfg
+            )
 
-        test_cfg_set = set()
-        for obj_id in self.obj_id_lst:
-            base_dir = pjoin(self.config.object_path, "scene_cfg", obj_id)
-            for pattern in scene_patterns:
-                test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
+            test_cfg_set = set()
+            for obj_id in self.obj_id_lst:
+                base_dir = pjoin(self.config.object_path, "scene_cfg", obj_id)
+                for pattern in scene_patterns:
+                    test_cfg_set.update(glob(pjoin(base_dir, pattern), recursive=True))
 
-        self.test_cfg_lst = self._subsample_test_items(
-            sorted(test_cfg_set),
-            max_count=int(getattr(self.config, "test_scene_num", 0)),
-            seed=int(getattr(self.config, "test_subset_seed", 0)) + 1,
-            item_name="scene",
-        )
+            self.test_cfg_lst = self._subsample_test_items(
+                sorted(test_cfg_set),
+                max_count=test_scene_num,
+                seed=int(getattr(self.config, "test_subset_seed", 0)) + 1,
+                item_name="scene",
+            )
         self.data_num = self.grasp_type_num * len(self.test_cfg_lst)  # TO BE CHECKED
         display_grasp_type_lst = getattr(self.config, "display_grasp_type_lst", self.grasp_type_lst)
         print(
             f"Test split: {split_name}, grasp type list: {display_grasp_type_lst}, "
             f"object cfg num: {len(self.test_cfg_lst)}"
         )
+
+    def _configured_test_scene_list_path(self):
+        """Resolve the optional explicit test-scene list path.
+
+        Args:
+            None. The path is read from ``config.test_scene_list_path``.
+
+        Returns:
+            Absolute JSON path, or ``None`` when explicit scene selection is
+            disabled.
+        """
+        configured_path = getattr(self.config, "test_scene_list_path", None)
+        if configured_path is None:
+            return None
+        configured_path = str(configured_path).strip()
+        if not configured_path or configured_path.lower() in {"none", "null"}:
+            return None
+        scene_list_path = os.path.abspath(os.path.expanduser(configured_path))
+        if not os.path.isfile(scene_list_path):
+            raise FileNotFoundError(f"Could not find test_scene_list_path: {scene_list_path}")
+        return scene_list_path
+
+    def _load_explicit_test_scene_paths(self, scene_list_path):
+        """Load and validate an explicit scene-config whitelist.
+
+        The JSON may be a plain list or an object containing ``scene_paths``.
+        Entries may be scene ids relative to ``<object_path>/scene_cfg`` or
+        absolute paths resolving inside that scene root. Missing ``.npy``
+        suffixes are added automatically.
+
+        Args:
+            scene_list_path: Absolute path to the JSON whitelist.
+
+        Returns:
+            Sorted absolute scene-config paths under the configured asset root.
+        """
+        payload = load_json(scene_list_path)
+        declared_count = None
+        if isinstance(payload, dict):
+            entries = payload.get("scene_paths")
+            declared_count = payload.get("scene_count")
+            if entries is None:
+                raise KeyError(f"Explicit scene-list JSON must contain 'scene_paths': {scene_list_path}")
+        elif isinstance(payload, list):
+            entries = payload
+        else:
+            raise TypeError(f"Explicit scene-list JSON must be a list or object: {scene_list_path}")
+
+        if not entries:
+            raise ValueError(f"Explicit scene-list JSON is empty: {scene_list_path}")
+        if declared_count is not None and int(declared_count) != len(entries):
+            raise ValueError(
+                f"Declared scene_count={declared_count} does not match {len(entries)} entries in {scene_list_path}"
+            )
+
+        scene_root = os.path.abspath(pjoin(self.config.object_path, "scene_cfg"))
+        real_scene_root = os.path.realpath(scene_root)
+        resolved_paths = []
+        seen_real_paths = set()
+        for entry in entries:
+            if isinstance(entry, dict):
+                entry = entry.get("scene_path", entry.get("scene_id"))
+            if not isinstance(entry, str) or not entry.strip():
+                raise TypeError(f"Invalid scene-list entry {entry!r} in {scene_list_path}")
+
+            entry_path = os.path.expanduser(entry.strip())
+            if not entry_path.endswith(".npy"):
+                entry_path = f"{entry_path}.npy"
+            if os.path.isabs(entry_path):
+                real_entry_path = os.path.realpath(entry_path)
+                if os.path.commonpath([real_scene_root, real_entry_path]) != real_scene_root:
+                    raise ValueError(f"Explicit scene path is outside configured scene root: {entry_path}")
+                relative_path = os.path.relpath(real_entry_path, real_scene_root)
+                resolved_path = os.path.abspath(pjoin(scene_root, relative_path))
+            else:
+                normalized_entry = entry_path.replace("\\", "/")
+                if normalized_entry.startswith("scene_cfg/"):
+                    normalized_entry = normalized_entry[len("scene_cfg/") :]
+                resolved_path = os.path.abspath(pjoin(scene_root, normalized_entry))
+                if os.path.commonpath([scene_root, resolved_path]) != scene_root:
+                    raise ValueError(f"Explicit scene path escapes configured scene root: {entry_path}")
+
+            if not os.path.isfile(resolved_path):
+                raise FileNotFoundError(f"Explicit scene config does not exist: {resolved_path}")
+            real_resolved_path = os.path.realpath(resolved_path)
+            if real_resolved_path in seen_real_paths:
+                raise ValueError(f"Duplicate explicit scene config: {resolved_path}")
+            seen_real_paths.add(real_resolved_path)
+            resolved_paths.append(resolved_path)
+
+        return sorted(resolved_paths)
 
     def _subsample_test_items(self, items, max_count, seed, item_name):
         """Randomly subsample test objects or scenes for faster evaluation sampling.
