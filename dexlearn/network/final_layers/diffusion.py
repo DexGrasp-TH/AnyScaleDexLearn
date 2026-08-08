@@ -10,6 +10,74 @@ from dexlearn.utils.RMS import Normalization
 from dexlearn.dataset.grasp_types import GRASP_TYPES
 
 
+def bimanual_t24_from_data(data: dict) -> torch.Tensor:
+    """Build the centered bimanual wrist target from a batch.
+
+    Args:
+        data: Batch containing right/left hand rotation matrices and translations.
+
+    Returns:
+        Tensor shaped ``(B * S, 24)`` with right and left ``rot9+trans3`` blocks.
+    """
+    right_hand_trans = rearrange(data["right_hand_trans"], "b s n x -> (b s) n x")
+    right_hand_rot = rearrange(data["right_hand_rot"], "b s n x y -> (b s) n x y")
+    left_hand_trans = rearrange(data["left_hand_trans"], "b s n x -> (b s) n x")
+    left_hand_rot = rearrange(data["left_hand_rot"], "b s n x y -> (b s) n x y")
+    return torch.cat(
+        [
+            rearrange(right_hand_rot[:, -1], "b x y -> b (x y)"),
+            right_hand_trans[:, -1],
+            rearrange(left_hand_rot[:, -1], "b x y -> b (x y)"),
+            left_hand_trans[:, -1],
+        ],
+        dim=-1,
+    )
+
+
+def canonicalize_bimanual_t24(t24: torch.Tensor) -> torch.Tensor:
+    """Project both 9D rotation blocks onto SO(3) without changing translations.
+
+    Args:
+        t24: Tensor with final dimension 24 using the bimanual ``rot9+trans3``
+            layout.
+
+    Returns:
+        Tensor with the same shape and mode-independent projected rotations.
+    """
+    if t24.shape[-1] != 24:
+        raise ValueError(f"Expected bimanual T24 with final dimension 24, got {tuple(t24.shape)}")
+    original_shape = t24.shape
+    flat = t24.reshape(-1, 24)
+    right_rot = proper_svd(flat[:, 0:9].reshape(-1, 3, 3)).reshape(-1, 9)
+    left_rot = proper_svd(flat[:, 12:21].reshape(-1, 3, 3)).reshape(-1, 9)
+    canonical = torch.cat(
+        [right_rot, flat[:, 9:12], left_rot, flat[:, 21:24]],
+        dim=-1,
+    )
+    return canonical.reshape(original_shape)
+
+
+def bimanual_t24_to_pose(t24: torch.Tensor) -> torch.Tensor:
+    """Convert canonical bimanual T24 into the existing ``trans+quat`` tensor.
+
+    Args:
+        t24: Canonical tensor with final dimension 24.
+
+    Returns:
+        Pose tensor shaped ``(..., 1, 14)`` with right then left ``xyz+wxyz``.
+    """
+    if t24.shape[-1] != 24:
+        raise ValueError(f"Expected canonical bimanual T24 with final dimension 24, got {tuple(t24.shape)}")
+    flat = t24.reshape(-1, 24)
+    right_quat = pttf.matrix_to_quaternion(flat[:, 0:9].reshape(-1, 3, 3))
+    left_quat = pttf.matrix_to_quaternion(flat[:, 12:21].reshape(-1, 3, 3))
+    pose = torch.cat(
+        [flat[:, 9:12], right_quat, flat[:, 21:24], left_quat],
+        dim=-1,
+    )
+    return pose.reshape(*t24.shape[:-1], 1, 14)
+
+
 class DiffusionBiRT_MLPRTJ(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -189,48 +257,36 @@ class DiffusionBiRT_v2(torch.nn.Module):
 
     def forward(self, data, cond_feat):
         result_dict = {}
-        batch_num, sample_num, pose_num, _ = data["right_hand_trans"].shape
-        right_hand_trans = rearrange(data["right_hand_trans"], "b t n x -> (b t) n x")
-        right_hand_rot = rearrange(data["right_hand_rot"], "b t n x y -> (b t) n x y")
-        left_hand_trans = rearrange(data["left_hand_trans"], "b t n x -> (b t) n x")
-        left_hand_rot = rearrange(data["left_hand_rot"], "b t n x y -> (b t) n x y")
-
-        grasp_rt = torch.cat(
-            [
-                rearrange(right_hand_rot[:, -1], "b x y -> b (x y)"),
-                right_hand_trans[:, -1],
-                rearrange(left_hand_rot[:, -1], "b x y -> b (x y)"),
-                left_hand_trans[:, -1],
-            ],
-            dim=-1,
-        )
+        grasp_rt = bimanual_t24_from_data(data)
         grasp_rt_norm = self.RMS(grasp_rt)
 
         result_dict["loss_diffusion"] = self.diffusion(grasp_rt_norm, cond_feat)
         return result_dict
 
-    def sample(self, cond_feat, grasp_type, sample_num):
+    def sample_with_t24(self, cond_feat, sample_num):
+        """Sample canonical T24 and the backward-compatible pose representation.
+
+        Args:
+            cond_feat: Object-conditioned feature tensor shaped ``(B, C)``.
+            sample_num: Number of marginal or conditional samples per object.
+
+        Returns:
+            Tuple ``(canonical_t24, robot_pose, log_prob)`` where T24 is shaped
+            ``(B, S, 24)``, pose is ``(B, S, 1, 14)``, and log probability is
+            ``(B, S)``.
+        """
         cond_feat = repeat(cond_feat, "b c -> (b n) c", n=sample_num)
 
         grasp_rt, log_prob = self.diffusion.sample(cond=cond_feat)
         log_prob = rearrange(log_prob, "(b t) -> b t", t=sample_num)
         grasp_rt = self.RMS.inv(grasp_rt)
+        canonical_t24 = canonicalize_bimanual_t24(grasp_rt)
+        canonical_t24 = rearrange(canonical_t24, "(b t) d -> b t d", t=sample_num)
+        robot_pose = bimanual_t24_to_pose(canonical_t24)
+        return canonical_t24, robot_pose, log_prob
 
-        r_rot_raw = rearrange(grasp_rt[..., 0:9], "(b t) (x y) -> b t x y", t=sample_num, x=3, y=3)
-        r_trans = rearrange(grasp_rt[..., 9:12], "(b t) c -> b t c", t=sample_num)
-
-        l_rot_raw = rearrange(grasp_rt[..., 12:21], "(b t) (x y) -> b t x y", t=sample_num, x=3, y=3)
-        l_trans = rearrange(grasp_rt[..., 21:24], "(b t) c -> b t c", t=sample_num)
-
-        r_rot_matrix = proper_svd(r_rot_raw.reshape(-1, 3, 3)).reshape_as(r_rot_raw)
-        r_quat = pttf.matrix_to_quaternion(r_rot_matrix)
-        right_pose = torch.cat([r_trans.unsqueeze(-2), r_quat.unsqueeze(-2)], dim=-1)
-
-        l_rot_matrix = proper_svd(l_rot_raw.reshape(-1, 3, 3)).reshape_as(l_rot_raw)
-        l_quat = pttf.matrix_to_quaternion(l_rot_matrix)
-        left_pose = torch.cat([l_trans.unsqueeze(-2), l_quat.unsqueeze(-2)], dim=-1)
-
-        robot_pose = torch.cat([right_pose, left_pose], dim=-1)
+    def sample(self, cond_feat, grasp_type, sample_num):
+        _, robot_pose, log_prob = self.sample_with_t24(cond_feat, sample_num)
         return robot_pose, log_prob
 
 

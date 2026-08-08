@@ -220,6 +220,41 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
   algo.training.mode=two_stage_diffusion_then_frozen_type_head
 ```
 
+### Reverse T-to-C Human Prior
+
+`humanMultiReverse` implements the independent Reverse factorization
+`p(T|o) p(c|T,o)`. It launches two from-scratch runs by default:
+`<EXP_NAME>_pose_marginal` trains the object-only marginal pose diffusion for
+10,000 iterations, then `<EXP_NAME>_type_posterior` trains the independent
+hard-label pose-conditioned posterior for 300 iterations. Both branches use
+record-uniform sampling without type balancing or pose-group soft labels.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiReverse data=humanMulti \
+  data.sampling.train_split=all \
+  exp_name=<EXP_NAME>
+
+# Optional: launch only one independent branch.
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiReverse data=humanMulti \
+  data.sampling.train_split=all \
+  algo.training.run=pose_marginal \
+  exp_name=<EXP_NAME>
+
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiReverse data=humanMulti \
+  data.sampling.train_split=all \
+  algo.training.run=type_posterior \
+  exp_name=<EXP_NAME>
+```
+
+The posterior owns a separate checkpointed 24D pose normalization. It trains
+on clean GT centered canonical `T24`, while inference consumes generated
+centered canonical `T24` from the marginal diffusion; this GT-to-generated pose
+shift is the intentional initial train-inference gap. The marginal generator
+does not accept a contact-mode id or mode-specific sampling path.
+
 ### Sample
 
 For the default `algo.training.mode=independent_from_scratch`, diffusion poses
@@ -305,6 +340,42 @@ override is not used. Per-scene files are stored under a subdirectory named
 after `test_data.object_path`'s final component and `task.robot_name`,
 preserving the original scene id hierarchy, for example
 `.../step_<POSE_CKPT>_<SCORE_CKPT>/DGN_5k/leap_hand/<object>/<env>/<scene>.npy`.
+
+For Reverse export, use the two Reverse checkpoints with
+`algo=humanMultiReverse`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=obj_human_prior_export \
+  data=humanMulti \
+  algo=humanMultiReverse \
+  test_data=DGNMulti \
+  test_data.test_split=all \
+  algo.batch_size=1024 \
+  task.skip_existing=false \
+  task.robot_name=leap \
+  task.robot_size=1.8 \
+  task.score_ckpt=000300 \
+  task.pose_ckpt=010000 \
+  wandb.mode=disabled \
+  exp_name=<EXP_NAME> \
+  task.score_exp_name=<EXP_NAME>_type_posterior \
+  task.pose_exp_name=<EXP_NAME>_pose_marginal
+```
+
+Its default export root is
+`output/humanMulti_humanMultiReverse_<EXP_NAME>/obj_human_prior/step_<POSE_CKPT>_<SCORE_CKPT>/`.
+
+Reverse export generates one shared 500-pose marginal pool before evaluating
+`q(c|T,o)`. It computes the five `budget_scores` before filtering, performs
+fixed-seed weighted sampling without replacement to obtain 100 candidates per
+mode, and applies the existing full-bimanual `prob_pose` diversity selection to
+keep 20. Mode-specific active-hand masks, rescaling, and decentering happen only
+after selection. Per-scene files retain the raw pool, posterior probabilities,
+raw sampled modes, resampling/selection indices, ESS, checkpoint hashes, and an
+explicit `factorization=reverse_T_to_C` tag. Long training, batch export, GPU
+synthesis, and benchmark runs should still be launched only after their output
+roots and resources are approved.
 
 Visualize an exported object human prior:
 ```bash

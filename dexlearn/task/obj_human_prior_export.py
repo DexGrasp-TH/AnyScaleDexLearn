@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -28,6 +29,63 @@ from dexlearn.utils.util import load_json, set_seed
 
 REAL_GRASP_TYPE_IDS = tuple(range(1, len(GRASP_TYPES)))
 REAL_GRASP_TYPE_NAMES = tuple(GRASP_TYPES[type_id] for type_id in REAL_GRASP_TYPE_IDS)
+REVERSE_FACTORIZATION = "reverse_T_to_C"
+PROPOSED_FACTORIZATION = "proposed_C_to_T"
+
+
+def factorization_from_config(config: DictConfig) -> str:
+    """Return the Human Prior factorization recorded in exported artifacts."""
+    factorization = str(getattr(config.algo, "factorization", PROPOSED_FACTORIZATION))
+    valid_factorizations = {PROPOSED_FACTORIZATION, REVERSE_FACTORIZATION}
+    if factorization not in valid_factorizations:
+        raise ValueError(
+            f"Unsupported Human Prior factorization={factorization!r}; "
+            f"expected one of {sorted(valid_factorizations)}"
+        )
+    return factorization
+
+
+def is_reverse_factorization(config: DictConfig) -> bool:
+    """Check whether the config selects the Reverse T-to-C pipeline."""
+    return factorization_from_config(config) == REVERSE_FACTORIZATION
+
+
+def reverse_sampling_config(config: DictConfig) -> dict:
+    """Resolve and validate Reverse shared-pool sampling options.
+
+    Args:
+        config: Full Hydra config containing ``algo.reverse_sampling``.
+
+    Returns:
+        Plain dictionary of validated Reverse sampling parameters.
+    """
+    sampling_cfg = getattr(config.algo, "reverse_sampling", None)
+    if sampling_cfg is None:
+        raise ValueError("Reverse export requires algo.reverse_sampling")
+    pool_size = int(getattr(sampling_cfg, "marginal_pool_size", 500))
+    conditional_num = int(getattr(sampling_cfg, "conditional_candidate_num", config.algo.test_grasp_num))
+    policy = str(getattr(sampling_cfg, "resampling_policy", "weighted_without_replacement"))
+    seed = int(getattr(sampling_cfg, "resampling_seed", config.seed))
+    include_raw_pool = bool(getattr(sampling_cfg, "include_raw_pool", True))
+    ess_warning_threshold = float(getattr(sampling_cfg, "ess_warning_threshold", config.algo.test_topk))
+    if pool_size <= 0 or conditional_num <= 0:
+        raise ValueError("Reverse pool and conditional candidate counts must be positive")
+    if conditional_num > pool_size:
+        raise ValueError("Reverse conditional_candidate_num must not exceed marginal_pool_size")
+    if policy != "weighted_without_replacement":
+        raise ValueError("Reverse export currently requires weighted_without_replacement")
+    if int(config.algo.test_topk) > conditional_num:
+        raise ValueError("algo.test_topk must not exceed Reverse conditional_candidate_num")
+    if ess_warning_threshold < 0.0:
+        raise ValueError("Reverse ess_warning_threshold must be non-negative")
+    return {
+        "marginal_pool_size": pool_size,
+        "conditional_candidate_num": conditional_num,
+        "resampling_policy": policy,
+        "resampling_seed": seed,
+        "include_raw_pool": include_raw_pool,
+        "ess_warning_threshold": ess_warning_threshold,
+    }
 
 
 def _as_list(value: Any) -> list:
@@ -197,6 +255,29 @@ def clone_config_for_checkpoint(
     return branch_config
 
 
+def clone_config_for_model_checkpoint(
+    config: DictConfig,
+    model_config: DictConfig,
+    exp_name: str | None,
+    ckpt: str | None,
+) -> DictConfig:
+    """Clone an export config for one heterogeneous model checkpoint."""
+    branch_config = clone_config_for_checkpoint(config, exp_name, ckpt)
+    with open_dict(branch_config.algo):
+        branch_config.algo.model = copy.deepcopy(model_config)
+    resolve_type_supervision_config(branch_config)
+    return branch_config
+
+
+def checkpoint_sha256(checkpoint_path: str) -> str:
+    """Compute the SHA-256 digest of one checkpoint for export provenance."""
+    digest = hashlib.sha256()
+    with open(checkpoint_path, "rb") as checkpoint_handle:
+        for chunk in iter(lambda: checkpoint_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def load_export_model(config: DictConfig) -> tuple[torch.nn.Module, str, int | None]:
     """Instantiate the human prior model and load the requested checkpoint.
 
@@ -219,6 +300,44 @@ def load_export_model(config: DictConfig) -> tuple[torch.nn.Module, str, int | N
     return model, checkpoint_path, checkpoint_iter
 
 
+def load_reverse_export_models(config: DictConfig) -> tuple[torch.nn.Module, torch.nn.Module, dict]:
+    """Load the independent posterior and marginal models for Reverse export."""
+    score_exp_name = getattr(config.task, "score_exp_name", None) or f"{config.exp_name}_type_posterior"
+    pose_exp_name = getattr(config.task, "pose_exp_name", None) or f"{config.exp_name}_pose_marginal"
+    score_ckpt = getattr(config.task, "score_ckpt", None)
+    pose_ckpt = getattr(config.task, "pose_ckpt", None)
+    if score_ckpt is None or pose_ckpt is None:
+        raise ValueError("Reverse export requires task.score_ckpt and task.pose_ckpt")
+
+    posterior_cfg = OmegaConf.select(config, "algo.models.type_posterior")
+    marginal_cfg = OmegaConf.select(config, "algo.models.pose_marginal")
+    if posterior_cfg is None or marginal_cfg is None:
+        raise ValueError("Reverse export requires algo.models.type_posterior and algo.models.pose_marginal")
+    score_config = clone_config_for_model_checkpoint(config, posterior_cfg, score_exp_name, score_ckpt)
+    pose_config = clone_config_for_model_checkpoint(config, marginal_cfg, pose_exp_name, pose_ckpt)
+    posterior_model, posterior_path, posterior_iter = load_export_model(score_config)
+    marginal_model, marginal_path, marginal_iter = load_export_model(pose_config)
+    return posterior_model, marginal_model, {
+        "checkpoint_path": marginal_path,
+        "checkpoint_iter": marginal_iter,
+        "score_checkpoint_path": posterior_path,
+        "score_checkpoint_iter": posterior_iter,
+        "score_checkpoint_sha256": checkpoint_sha256(posterior_path),
+        "score_ckpt": score_config.ckpt,
+        "pose_checkpoint_path": marginal_path,
+        "pose_checkpoint_iter": marginal_iter,
+        "pose_checkpoint_sha256": checkpoint_sha256(marginal_path),
+        "pose_ckpt": pose_config.ckpt,
+        "uses_independent_models": True,
+        "model_roles": {
+            "score": "pose_conditioned_type_posterior",
+            "pose": "marginal_pose_generator",
+        },
+        "score_model_config": OmegaConf.to_container(score_config.algo.model, resolve=True),
+        "pose_model_config": OmegaConf.to_container(pose_config.algo.model, resolve=True),
+    }
+
+
 def load_export_models(config: DictConfig) -> tuple[torch.nn.Module, torch.nn.Module, dict]:
     """Load the score and pose models used by object human-prior export.
 
@@ -230,6 +349,9 @@ def load_export_models(config: DictConfig) -> tuple[torch.nn.Module, torch.nn.Mo
         Tuple ``(score_model, pose_model, checkpoint_meta)``. The two models are
         the same object when no independent checkpoint override is configured.
     """
+    if is_reverse_factorization(config):
+        return load_reverse_export_models(config)
+
     score_exp_name = getattr(config.task, "score_exp_name", None)
     score_ckpt = getattr(config.task, "score_ckpt", None)
     pose_exp_name = getattr(config.task, "pose_exp_name", None)
@@ -458,6 +580,8 @@ def score_semantics_from_config(config: DictConfig) -> str:
     Returns:
         Human-readable score semantics for the manifest.
     """
+    if is_reverse_factorization(config):
+        return "monte_carlo_pose_posterior_probability"
     objective = str(getattr(config.algo.model, "type_objective", "ce")).lower()
     if objective != "ce":
         raise ValueError("Human prior export only supports CE type scores")
@@ -715,7 +839,10 @@ def export_pose_candidate_num(config: DictConfig) -> int:
     Returns:
         Positive candidate count used before ``sample_selection`` filtering.
     """
-    candidate_num = int(getattr(config.algo, "test_grasp_num", getattr(config.task, "samples_per_type", 20)))
+    if is_reverse_factorization(config):
+        candidate_num = reverse_sampling_config(config)["conditional_candidate_num"]
+    else:
+        candidate_num = int(getattr(config.algo, "test_grasp_num", getattr(config.task, "samples_per_type", 20)))
     if candidate_num <= 0:
         raise ValueError("algo.test_grasp_num must be positive for obj_human_prior_export")
     return candidate_num
@@ -864,6 +991,433 @@ def sample_fixed_types_from_features(
 
     log_prob = log_prob.reshape(batch_size, type_num, samples_per_type)
     return grasp_pose, log_prob, type_ids
+
+
+def _stable_reverse_seed(base_seed: int, scene_id: str, type_id: int) -> int:
+    """Derive a batching-independent RNG seed for one scene and mode."""
+    payload = f"{int(base_seed)}:{scene_id}:{int(type_id)}".encode("utf-8")
+    value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=False)
+    return value % np.iinfo(np.int64).max
+
+
+def reverse_weighted_resample_indices(
+    posterior_probs: torch.Tensor,
+    scene_ids: list[str],
+    candidate_num: int,
+    base_seed: int,
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Draw unique per-mode candidates from one shared marginal pool.
+
+    Args:
+        posterior_probs: Tensor shaped ``(B, M, 5)``.
+        scene_ids: Stable scene ids aligned with the batch.
+        candidate_num: Number of unique candidates to draw per mode.
+        base_seed: Experiment-level resampling seed.
+
+    Returns:
+        Pool indices shaped ``(B, 5, C)`` and derived seeds ``(B, 5)``.
+    """
+    if posterior_probs.ndim != 3 or posterior_probs.shape[-1] != len(REAL_GRASP_TYPE_IDS):
+        raise ValueError(f"Expected posterior_probs shape (B,M,5), got {tuple(posterior_probs.shape)}")
+    batch_size, pool_size, _ = posterior_probs.shape
+    if len(scene_ids) != batch_size:
+        raise ValueError("scene_ids must match posterior batch size")
+    if candidate_num > pool_size:
+        raise ValueError("candidate_num must not exceed marginal pool size")
+
+    probabilities = posterior_probs.detach().cpu().numpy().astype(np.float64)
+    indices = np.empty((batch_size, len(REAL_GRASP_TYPE_IDS), candidate_num), dtype=np.int64)
+    seeds = np.empty((batch_size, len(REAL_GRASP_TYPE_IDS)), dtype=np.int64)
+    for batch_index, scene_id in enumerate(scene_ids):
+        for type_index, type_id in enumerate(REAL_GRASP_TYPE_IDS):
+            derived_seed = _stable_reverse_seed(base_seed, scene_id, type_id)
+            seeds[batch_index, type_index] = derived_seed
+            weights = np.maximum(probabilities[batch_index, :, type_index], 0.0)
+            total = float(weights.sum())
+            if not np.isfinite(total) or total <= 0.0:
+                weights = np.full((pool_size,), 1.0 / pool_size, dtype=np.float64)
+            else:
+                # Float32 softmax values may underflow to exact zero. Keep every
+                # pool item technically sampleable so unique resampling remains
+                # defined when candidate_num exceeds the non-zero support.
+                weights = np.maximum(weights, 1e-12)
+                weights = weights / float(weights.sum())
+            rng = np.random.default_rng(derived_seed)
+            indices[batch_index, type_index] = rng.choice(
+                pool_size,
+                size=candidate_num,
+                replace=False,
+                p=weights,
+            )
+    return torch.as_tensor(indices, device=posterior_probs.device, dtype=torch.long), seeds
+
+
+def reverse_raw_joint_type_ids(
+    posterior_probs: torch.Tensor,
+    scene_ids: list[str],
+    base_seed: int,
+) -> np.ndarray:
+    """Sample raw joint contact modes after the marginal T pool exists."""
+    probabilities = posterior_probs.detach().cpu().numpy().astype(np.float64)
+    batch_size, pool_size, type_num = probabilities.shape
+    sampled = np.empty((batch_size, pool_size), dtype=np.int64)
+    for batch_index, scene_id in enumerate(scene_ids):
+        rng = np.random.default_rng(_stable_reverse_seed(base_seed, scene_id, 0))
+        weights = np.maximum(probabilities[batch_index], 0.0)
+        totals = weights.sum(axis=-1, keepdims=True)
+        valid_rows = np.isfinite(totals[:, 0]) & (totals[:, 0] > 0.0) & np.isfinite(weights).all(axis=-1)
+        normalized = np.full((pool_size, type_num), 1.0 / type_num, dtype=np.float64)
+        normalized[valid_rows] = weights[valid_rows] / totals[valid_rows]
+        cumulative = np.cumsum(normalized, axis=-1)
+        cumulative[:, -1] = 1.0
+        uniforms = rng.random(pool_size)
+        sampled[batch_index] = np.sum(uniforms[:, None] > cumulative, axis=-1, dtype=np.int64) + 1
+    return sampled
+
+
+def _gather_reverse_pool(value: torch.Tensor, pool_indices: torch.Tensor) -> torch.Tensor:
+    """Gather ``(B,M,...)`` values into ``(B,T,C,...)`` by pool index."""
+    if value.shape[0] != pool_indices.shape[0]:
+        raise ValueError("Pool value and index batch dimensions must match")
+    batch_index = torch.arange(value.shape[0], device=value.device)[:, None, None]
+    return value[batch_index, pool_indices]
+
+
+def validate_reverse_shared_pool(
+    canonical_t24: torch.Tensor,
+    robot_pose: torch.Tensor,
+    marginal_log_prob: torch.Tensor,
+    posterior_probs: torch.Tensor,
+    expected_pool_size: int,
+) -> None:
+    """Validate the model-facing Reverse shared-pool contract before adapting it."""
+    if canonical_t24.ndim != 3 or canonical_t24.shape[1:] != (expected_pool_size, 24):
+        raise ValueError(
+            f"Expected Reverse canonical T24 shape (B,{expected_pool_size},24), "
+            f"got {tuple(canonical_t24.shape)}"
+        )
+    batch_size = canonical_t24.shape[0]
+    expected_pose_shape = (batch_size, expected_pool_size, 1, 14)
+    if tuple(robot_pose.shape) != expected_pose_shape:
+        raise ValueError(f"Expected Reverse pose shape {expected_pose_shape}, got {tuple(robot_pose.shape)}")
+    expected_score_shape = (batch_size, expected_pool_size)
+    if tuple(marginal_log_prob.shape) != expected_score_shape:
+        raise ValueError(
+            f"Expected Reverse marginal log-probability shape {expected_score_shape}, "
+            f"got {tuple(marginal_log_prob.shape)}"
+        )
+    expected_posterior_shape = (batch_size, expected_pool_size, len(REAL_GRASP_TYPE_IDS))
+    if tuple(posterior_probs.shape) != expected_posterior_shape:
+        raise ValueError(
+            f"Expected Reverse posterior shape {expected_posterior_shape}, got {tuple(posterior_probs.shape)}"
+        )
+    for name, value in (
+        ("canonical T24", canonical_t24),
+        ("pose", robot_pose),
+        ("marginal log probability", marginal_log_prob),
+        ("posterior probability", posterior_probs),
+    ):
+        if not torch.isfinite(value).all():
+            raise ValueError(f"Reverse {name} contains non-finite values")
+    if torch.any((posterior_probs < 0.0) | (posterior_probs > 1.0)):
+        raise ValueError("Reverse posterior probabilities must be in [0, 1]")
+    if not torch.allclose(
+        posterior_probs.sum(dim=-1),
+        torch.ones_like(posterior_probs[..., 0]),
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        raise ValueError("Reverse posterior rows must sum to 1")
+
+
+def build_reverse_conditional_adapter(
+    robot_pose: torch.Tensor,
+    marginal_log_prob: torch.Tensor,
+    posterior_probs: torch.Tensor,
+    scene_ids: list[str],
+    config: DictConfig,
+) -> dict:
+    """Build fixed per-mode candidates from one Reverse marginal pool."""
+    sampling = reverse_sampling_config(config)
+    if robot_pose.shape[:2] != posterior_probs.shape[:2]:
+        raise ValueError("Reverse pose and posterior pool dimensions must match")
+    if marginal_log_prob.shape != posterior_probs.shape[:2]:
+        raise ValueError("Reverse marginal score and posterior pool dimensions must match")
+    resampled_pool_indices, resampling_seeds = reverse_weighted_resample_indices(
+        posterior_probs,
+        scene_ids,
+        sampling["conditional_candidate_num"],
+        sampling["resampling_seed"],
+    )
+    candidate_pose = _gather_reverse_pool(robot_pose, resampled_pool_indices)
+    candidate_marginal_log_prob = _gather_reverse_pool(marginal_log_prob, resampled_pool_indices)
+    posterior_by_type = posterior_probs.permute(0, 2, 1)
+    candidate_posterior = torch.gather(posterior_by_type, 2, resampled_pool_indices)
+    conditional_score = candidate_marginal_log_prob + torch.log(candidate_posterior.clamp_min(1e-12))
+
+    batch_size, type_num, candidate_num = conditional_score.shape
+    flat_pose = candidate_pose.reshape(batch_size * type_num, candidate_num, *candidate_pose.shape[3:])
+    flat_score = conditional_score.reshape(batch_size * type_num, candidate_num)
+    selected_resample_indices = _candidate_selection_indices(flat_pose, flat_score, config)
+    selected_resample_indices = selected_resample_indices.reshape(batch_size, type_num, -1)
+    selected_pose = _gather_candidates(flat_pose, selected_resample_indices.reshape(batch_size * type_num, -1))
+    selected_pose = selected_pose.reshape(batch_size, type_num, -1, *candidate_pose.shape[3:])
+    selected_pool_indices = torch.gather(resampled_pool_indices, 2, selected_resample_indices)
+    selected_marginal_log_prob = torch.gather(candidate_marginal_log_prob, 2, selected_resample_indices)
+    selected_posterior = torch.gather(candidate_posterior, 2, selected_resample_indices)
+    selected_conditional_score = torch.gather(conditional_score, 2, selected_resample_indices)
+
+    posterior_sum = posterior_probs.sum(dim=1)
+    ess = posterior_sum.square() / posterior_probs.square().sum(dim=1).clamp_min(1e-12)
+    threshold = sampling["ess_warning_threshold"]
+    if threshold > 0.0:
+        low_ess = torch.nonzero(ess < threshold, as_tuple=False)
+        for batch_index, type_index in low_ess.detach().cpu().tolist():
+            print(
+                f"Warning: Reverse low ESS scene={scene_ids[batch_index]} "
+                f"type={REAL_GRASP_TYPE_NAMES[type_index]} ess={float(ess[batch_index, type_index]):.3f}"
+            )
+
+    return {
+        "robot_pose": selected_pose,
+        "marginal_log_prob": selected_marginal_log_prob,
+        "posterior_probability": selected_posterior,
+        "conditional_score": selected_conditional_score,
+        "resampled_pool_indices": resampled_pool_indices,
+        "selected_resample_indices": selected_resample_indices,
+        "selected_pool_indices": selected_pool_indices,
+        "importance_ess": ess,
+        "resampling_seeds": resampling_seeds,
+    }
+
+
+def sample_reverse_scene_scores_and_poses(
+    config: DictConfig,
+    posterior_model: torch.nn.Module,
+    marginal_model: torch.nn.Module,
+    split_lookup: dict[str, str],
+    scene_dir: str,
+    checkpoint_meta: dict,
+    skip_scene_ids: set[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Export Reverse T-to-C priors from one shared marginal pose pool.
+
+    Args:
+        config: Full Reverse export config.
+        posterior_model: Independent ``q(c|T,o)`` network.
+        marginal_model: Independent ``p(T|o)`` network.
+        split_lookup: Object id to split mapping.
+        scene_dir: Destination root for per-scene files.
+        checkpoint_meta: Loaded checkpoint paths, iterations, and hashes.
+        skip_scene_ids: Existing complete scenes that should not be regenerated.
+
+    Returns:
+        JSON-friendly scene summaries and index rows for newly saved scenes.
+    """
+    if not hasattr(marginal_model, "sample_with_t24"):
+        raise TypeError("Reverse pose model must implement sample_with_t24")
+    if not hasattr(posterior_model, "posterior_probabilities"):
+        raise TypeError("Reverse posterior model must implement posterior_probabilities")
+
+    score_lines: list[dict] = []
+    scene_index: list[dict] = []
+    saved_scene_ids: set[str] = set()
+    skip_scene_ids = skip_scene_ids or set()
+    sampling = reverse_sampling_config(config)
+    samples_per_type = export_samples_per_type(config)
+    grasp_pos_source = normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist"))
+    include_log_prob = bool(getattr(config.task, "include_log_prob", True))
+    include_grasp_pose = bool(getattr(config.task, "include_grasp_pose", False))
+    scene_pass_grasp_types = _as_list(getattr(config.task, "score_grasp_types", ["0_any"]))[:1] or ["0_any"]
+
+    for split_name in _as_list(getattr(config.task, "object_splits", [config.test_data.test_split])):
+        pass_config = clone_config_with_grasp_types(config, scene_pass_grasp_types, str(split_name))
+        test_loader = create_test_dataloader(pass_config)
+        for data in tqdm(test_loader, desc=f"reverse obj prior scene [{split_name}]"):
+            batch_metadata = [read_scene_metadata(scene_path) for scene_path in data["scene_path"]]
+            keep_indices = [
+                batch_idx
+                for batch_idx, metadata in enumerate(batch_metadata)
+                if metadata["scene_id"] not in skip_scene_ids
+            ]
+            if not keep_indices:
+                continue
+            data = filter_batch_data(data, keep_indices, config)
+            batch_metadata = [batch_metadata[index] for index in keep_indices]
+            scene_ids = [metadata["scene_id"] for metadata in batch_metadata]
+
+            canonical_t24, raw_robot_pose, marginal_log_prob = marginal_model.sample_with_t24(
+                data,
+                sampling["marginal_pool_size"],
+            )
+            posterior_probs = posterior_model.posterior_probabilities(data, canonical_t24)
+            validate_reverse_shared_pool(
+                canonical_t24,
+                raw_robot_pose,
+                marginal_log_prob,
+                posterior_probs,
+                sampling["marginal_pool_size"],
+            )
+            budget_scores = posterior_probs.mean(dim=1)
+            adapter = build_reverse_conditional_adapter(
+                raw_robot_pose,
+                marginal_log_prob,
+                posterior_probs,
+                scene_ids,
+                config,
+            )
+            selected_centered_t24 = _gather_reverse_pool(canonical_t24, adapter["selected_pool_indices"])
+
+            batch_size = int(canonical_t24.shape[0])
+            type_num = len(REAL_GRASP_TYPE_IDS)
+            selected_pose = adapter["robot_pose"].reshape(
+                batch_size,
+                type_num * samples_per_type,
+                *adapter["robot_pose"].shape[3:],
+            )
+            selected_pose = rescale_human_pose_translations_for_export(selected_pose, export_robot_size(config))
+            type_ids = torch.as_tensor(REAL_GRASP_TYPE_IDS, device=selected_pose.device, dtype=torch.long)
+            type_ids_for_decenter = (
+                type_ids[None, :, None]
+                .expand(batch_size, type_num, samples_per_type)
+                .reshape(batch_size, type_num * samples_per_type)
+            )
+            if "pc_centroid" in data:
+                selected_pose = _decenter_human_pose(selected_pose, data["pc_centroid"], type_ids_for_decenter)
+            grasp_pose = pose_tensor_to_grasp_pose(selected_pose).reshape(batch_size, type_num, samples_per_type, -1)
+
+            grasp_pose_np = grasp_pose.detach().cpu().numpy().astype(np.float32)
+            budget_scores_np = budget_scores.detach().cpu().numpy().astype(np.float32)
+            if sampling["include_raw_pool"]:
+                raw_t24_np = canonical_t24.detach().cpu().numpy().astype(np.float32)
+                raw_log_prob_np = marginal_log_prob.detach().cpu().numpy().astype(np.float32)
+                raw_posterior_np = posterior_probs.detach().cpu().numpy().astype(np.float32)
+                raw_joint_type_ids = reverse_raw_joint_type_ids(
+                    posterior_probs,
+                    scene_ids,
+                    sampling["resampling_seed"],
+                )
+            adapter_np = {
+                key: value.detach().cpu().numpy()
+                for key, value in adapter.items()
+                if torch.is_tensor(value)
+            }
+
+            for batch_idx, metadata in enumerate(batch_metadata):
+                scene_path = data["scene_path"][batch_idx]
+                scene_id = metadata["scene_id"]
+                if scene_id in saved_scene_ids:
+                    raise ValueError(f"Duplicate Reverse export record for scene_id={scene_id}")
+                object_id = metadata["object_id"]
+                split = scene_split_for_record(object_id, str(split_name), split_lookup)
+                score_record = {
+                    "scene_id": scene_id,
+                    "object_id": object_id,
+                    "split": split,
+                    "scene_path": scene_path,
+                    "pc_path": get_batch_value(data, "pc_path", batch_idx),
+                    "budget_scores": budget_scores_np[batch_idx],
+                }
+                pose_record_by_type = {}
+                for type_index, grasp_type_id in enumerate(REAL_GRASP_TYPE_IDS):
+                    pose_record = convert_target_pose_to_export_pose(
+                        grasp_pose_np[batch_idx, type_index],
+                        grasp_pos_source,
+                    )
+                    hand_num = pose_record["wrist_quat"].shape[1]
+                    pose_record.update(
+                        {
+                            "scene_id": scene_id,
+                            "object_id": object_id,
+                            "split": split,
+                            "scene_path": scene_path,
+                            "pc_path": score_record["pc_path"],
+                            "grasp_type_id": grasp_type_id,
+                            "grasp_type_name": GRASP_TYPES[grasp_type_id],
+                            "active_hand_mask": build_active_hand_mask(
+                                grasp_type_id,
+                                samples_per_type,
+                                hand_num,
+                            ),
+                        }
+                    )
+                    if include_log_prob:
+                        pose_record["log_prob"] = adapter_np["conditional_score"][batch_idx, type_index].astype(
+                            np.float32
+                        )
+                    if include_grasp_pose:
+                        pose_record["grasp_pose"] = grasp_pose_np[batch_idx, type_index]
+                    pose_record_by_type[grasp_type_id] = pose_record
+
+                scene_data = build_scene_export_record(score_record, pose_record_by_type, config)
+                scene_data.update(
+                    {
+                        "reverse_sampling_order": np.asarray(
+                            ["marginal_T", "posterior_C", "budget_integral", "resample", "select", "export"]
+                        ),
+                        "reverse_marginal_pool_size": np.int64(sampling["marginal_pool_size"]),
+                        "reverse_conditional_candidate_num": np.int64(sampling["conditional_candidate_num"]),
+                        "reverse_resampling_policy": sampling["resampling_policy"],
+                        "reverse_resampling_base_seed": np.int64(sampling["resampling_seed"]),
+                        "reverse_resampling_seeds": adapter["resampling_seeds"][batch_idx].astype(np.int64),
+                        "reverse_importance_ess": adapter_np["importance_ess"][batch_idx].astype(np.float32),
+                        "reverse_resampled_pool_indices": adapter_np["resampled_pool_indices"][batch_idx].astype(
+                            np.int64
+                        ),
+                        "reverse_selected_resample_indices": adapter_np["selected_resample_indices"][batch_idx].astype(
+                            np.int64
+                        ),
+                        "reverse_selected_pool_indices": adapter_np["selected_pool_indices"][batch_idx].astype(
+                            np.int64
+                        ),
+                        "reverse_selected_centered_t24": selected_centered_t24[batch_idx]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32),
+                        "reverse_selected_marginal_log_prob": adapter_np["marginal_log_prob"][batch_idx].astype(
+                            np.float32
+                        ),
+                        "reverse_selected_posterior_probability": adapter_np["posterior_probability"][
+                            batch_idx
+                        ].astype(np.float32),
+                        "reverse_selected_conditional_score": adapter_np["conditional_score"][batch_idx].astype(
+                            np.float32
+                        ),
+                        "reverse_raw_pool_included": np.bool_(sampling["include_raw_pool"]),
+                        "reverse_score_checkpoint_sha256": checkpoint_meta["score_checkpoint_sha256"],
+                        "reverse_pose_checkpoint_sha256": checkpoint_meta["pose_checkpoint_sha256"],
+                    }
+                )
+                if sampling["include_raw_pool"]:
+                    scene_data.update(
+                        {
+                            "reverse_raw_centered_t24": raw_t24_np[batch_idx],
+                            "reverse_raw_marginal_log_prob": raw_log_prob_np[batch_idx],
+                            "reverse_raw_posterior_probability": raw_posterior_np[batch_idx],
+                            "reverse_raw_sampled_type_ids": raw_joint_type_ids[batch_idx],
+                        }
+                    )
+                validate_reverse_scene_export(scene_data, config, checkpoint_meta)
+                scene_file = scene_file_path(scene_dir, scene_id)
+                os.makedirs(os.path.dirname(scene_file), exist_ok=True)
+                np.save(scene_file, scene_data)
+                summary = scene_summary_from_data(scene_data, scene_file)
+                score_lines.append(summary)
+                scene_index.append(
+                    {
+                        "scene_id": summary["scene_id"],
+                        "object_id": summary["object_id"],
+                        "split": summary["split"],
+                        "robot_name": summary["robot_name"],
+                        "robot_size": summary["robot_size"],
+                        "pc_runtime_scale": summary["pc_runtime_scale"],
+                        "factorization": summary["factorization"],
+                        "scene_file": summary["scene_file"],
+                    }
+                )
+                saved_scene_ids.add(scene_id)
+    return score_lines, scene_index
 
 
 def sample_scene_scores_and_fixed_type_poses(
@@ -1142,7 +1696,170 @@ def validate_scene_export(scene_data: dict, quat_norm_tol: float) -> None:
         raise FileNotFoundError(f"pc_path does not exist: {scene_data['pc_path']}")
 
 
-def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> None:
+def validate_reverse_scene_export(
+    scene_data: dict,
+    config: DictConfig,
+    checkpoint_meta: dict | None = None,
+) -> None:
+    """Validate Reverse-specific provenance and shared-pool shapes."""
+    validate_scene_export(scene_data, float(getattr(config.task, "quat_norm_tol", 1e-3)))
+    if str(scene_data.get("factorization")) != REVERSE_FACTORIZATION:
+        raise ValueError("Reverse scene export has an invalid factorization tag")
+    if str(scene_data.get("score_semantics")) != score_semantics_from_config(config):
+        raise ValueError("Reverse scene export has invalid score semantics")
+    sampling = reverse_sampling_config(config)
+    type_num = len(REAL_GRASP_TYPE_IDS)
+    samples_per_type = export_samples_per_type(config)
+    expected_shapes = {
+        "reverse_importance_ess": (type_num,),
+        "reverse_resampling_seeds": (type_num,),
+        "reverse_resampled_pool_indices": (type_num, sampling["conditional_candidate_num"]),
+        "reverse_selected_resample_indices": (type_num, samples_per_type),
+        "reverse_selected_pool_indices": (type_num, samples_per_type),
+        "reverse_selected_centered_t24": (type_num, samples_per_type, 24),
+        "reverse_selected_marginal_log_prob": (type_num, samples_per_type),
+        "reverse_selected_posterior_probability": (type_num, samples_per_type),
+        "reverse_selected_conditional_score": (type_num, samples_per_type),
+    }
+    expected_order = ["marginal_T", "posterior_C", "budget_integral", "resample", "select", "export"]
+    if np.asarray(scene_data.get("reverse_sampling_order", [])).astype(str).tolist() != expected_order:
+        raise ValueError("Reverse scene export has an invalid sampling order")
+    if int(scene_data.get("reverse_resampling_base_seed", -1)) != sampling["resampling_seed"]:
+        raise ValueError("Reverse scene export has an invalid resampling base seed")
+    expected_resampling_seeds = np.asarray(
+        [
+            _stable_reverse_seed(sampling["resampling_seed"], str(scene_data["scene_id"]), type_id)
+            for type_id in REAL_GRASP_TYPE_IDS
+        ],
+        dtype=np.int64,
+    )
+    if not np.array_equal(np.asarray(scene_data.get("reverse_resampling_seeds")), expected_resampling_seeds):
+        raise ValueError("Reverse scene export has invalid per-mode resampling seeds")
+    for key in ("reverse_score_checkpoint_sha256", "reverse_pose_checkpoint_sha256"):
+        value = str(scene_data.get(key, ""))
+        if len(value) != 64:
+            raise ValueError(f"Reverse scene export has an invalid {key}")
+    if checkpoint_meta is not None:
+        if str(scene_data["reverse_score_checkpoint_sha256"]) != str(checkpoint_meta["score_checkpoint_sha256"]):
+            raise ValueError("Reverse scene export uses a different posterior checkpoint")
+        if str(scene_data["reverse_pose_checkpoint_sha256"]) != str(checkpoint_meta["pose_checkpoint_sha256"]):
+            raise ValueError("Reverse scene export uses a different marginal checkpoint")
+    for key, expected_shape in expected_shapes.items():
+        if key not in scene_data:
+            raise KeyError(f"Reverse scene export is missing {key}")
+        if np.asarray(scene_data[key]).shape != expected_shape:
+            raise ValueError(f"Invalid {key} shape: {np.asarray(scene_data[key]).shape}, expected {expected_shape}")
+    finite_fields = (
+        "reverse_importance_ess",
+        "reverse_selected_centered_t24",
+        "reverse_selected_marginal_log_prob",
+        "reverse_selected_posterior_probability",
+        "reverse_selected_conditional_score",
+    )
+    for key in finite_fields:
+        if not np.isfinite(np.asarray(scene_data[key])).all():
+            raise ValueError(f"Reverse scene export contains non-finite values in {key}")
+    selected_posterior = np.asarray(scene_data["reverse_selected_posterior_probability"])
+    if ((selected_posterior < 0.0) | (selected_posterior > 1.0)).any():
+        raise ValueError("Reverse selected posterior probabilities must be in [0, 1]")
+    expected_active_hand_mask = np.stack(
+        [build_active_hand_mask(type_id, samples_per_type, hand_num=2) for type_id in REAL_GRASP_TYPE_IDS],
+        axis=0,
+    )
+    if not np.array_equal(np.asarray(scene_data["active_hand_mask"], dtype=bool), expected_active_hand_mask):
+        raise ValueError("Reverse active-hand mask does not match the exported grasp types")
+    if int(scene_data["reverse_marginal_pool_size"]) != sampling["marginal_pool_size"]:
+        raise ValueError("Reverse marginal pool size does not match config")
+    if int(scene_data["reverse_conditional_candidate_num"]) != sampling["conditional_candidate_num"]:
+        raise ValueError("Reverse conditional candidate count does not match config")
+    if str(scene_data["reverse_resampling_policy"]) != sampling["resampling_policy"]:
+        raise ValueError("Reverse resampling policy does not match config")
+    resampled_pool_indices = np.asarray(scene_data["reverse_resampled_pool_indices"])
+    if (resampled_pool_indices < 0).any() or (resampled_pool_indices >= sampling["marginal_pool_size"]).any():
+        raise ValueError("Reverse resampled pool indices are out of range")
+    for type_indices in resampled_pool_indices:
+        if np.unique(type_indices).size != type_indices.size:
+            raise ValueError("Reverse weighted-without-replacement indices contain duplicates within a mode")
+    selected_resample_indices = np.asarray(scene_data["reverse_selected_resample_indices"])
+    if (selected_resample_indices < 0).any() or (
+        selected_resample_indices >= sampling["conditional_candidate_num"]
+    ).any():
+        raise ValueError("Reverse selected resample indices are out of range")
+    selected_pool_indices = np.asarray(scene_data["reverse_selected_pool_indices"])
+    if (selected_pool_indices < 0).any() or (selected_pool_indices >= sampling["marginal_pool_size"]).any():
+        raise ValueError("Reverse selected pool indices are out of range")
+    expected_selected_pool_indices = np.take_along_axis(
+        resampled_pool_indices,
+        selected_resample_indices,
+        axis=1,
+    )
+    if not np.array_equal(selected_pool_indices, expected_selected_pool_indices):
+        raise ValueError("Reverse selected pool indices do not match resampling provenance")
+    raw_included = bool(scene_data.get("reverse_raw_pool_included", False))
+    if raw_included != sampling["include_raw_pool"]:
+        raise ValueError("Reverse raw-pool inclusion does not match config")
+    if raw_included:
+        raw_shapes = {
+            "reverse_raw_centered_t24": (sampling["marginal_pool_size"], 24),
+            "reverse_raw_marginal_log_prob": (sampling["marginal_pool_size"],),
+            "reverse_raw_posterior_probability": (sampling["marginal_pool_size"], type_num),
+            "reverse_raw_sampled_type_ids": (sampling["marginal_pool_size"],),
+        }
+        for key, expected_shape in raw_shapes.items():
+            if key not in scene_data or np.asarray(scene_data[key]).shape != expected_shape:
+                raise ValueError(f"Invalid or missing Reverse raw field {key}")
+        raw_type_ids = np.asarray(scene_data["reverse_raw_sampled_type_ids"])
+        if ((raw_type_ids < 1) | (raw_type_ids > type_num)).any():
+            raise ValueError("Reverse raw sampled type ids must be in [1, 5]")
+        for key in (
+            "reverse_raw_centered_t24",
+            "reverse_raw_marginal_log_prob",
+            "reverse_raw_posterior_probability",
+        ):
+            if not np.isfinite(np.asarray(scene_data[key])).all():
+                raise ValueError(f"Reverse scene export contains non-finite values in {key}")
+        raw_posterior = np.asarray(scene_data["reverse_raw_posterior_probability"])
+        if ((raw_posterior < 0.0) | (raw_posterior > 1.0)).any():
+            raise ValueError("Reverse raw posterior probabilities must be in [0, 1]")
+        if not np.allclose(raw_posterior.sum(axis=-1), 1.0, atol=1e-5):
+            raise ValueError("Reverse raw posterior rows must sum to 1")
+        if not np.allclose(np.asarray(scene_data["budget_scores"]), raw_posterior.mean(axis=0), atol=1e-6):
+            raise ValueError("Reverse budget scores must be computed from the unfiltered raw posterior pool")
+        expected_ess = raw_posterior.sum(axis=0) ** 2 / np.maximum(
+            np.square(raw_posterior).sum(axis=0),
+            1e-12,
+        )
+        if not np.allclose(scene_data["reverse_importance_ess"], expected_ess, atol=1e-5):
+            raise ValueError("Reverse importance ESS does not match the raw posterior pool")
+
+        raw_t24 = np.asarray(scene_data["reverse_raw_centered_t24"])
+        raw_log_prob = np.asarray(scene_data["reverse_raw_marginal_log_prob"])
+        type_indices = np.arange(type_num)[:, None]
+        expected_selected_t24 = raw_t24[selected_pool_indices]
+        expected_selected_log_prob = raw_log_prob[selected_pool_indices]
+        expected_selected_posterior = raw_posterior[selected_pool_indices, type_indices]
+        expected_selected_score = expected_selected_log_prob + np.log(
+            np.maximum(expected_selected_posterior, 1e-12)
+        )
+        if not np.allclose(scene_data["reverse_selected_centered_t24"], expected_selected_t24, atol=1e-6):
+            raise ValueError("Reverse selected T24 does not match raw-pool provenance")
+        if not np.allclose(scene_data["reverse_selected_marginal_log_prob"], expected_selected_log_prob, atol=1e-6):
+            raise ValueError("Reverse selected marginal scores do not match raw-pool provenance")
+        if not np.allclose(
+            scene_data["reverse_selected_posterior_probability"],
+            expected_selected_posterior,
+            atol=1e-6,
+        ):
+            raise ValueError("Reverse selected posterior does not match raw-pool provenance")
+        if not np.allclose(scene_data["reverse_selected_conditional_score"], expected_selected_score, atol=1e-6):
+            raise ValueError("Reverse conditional scores do not match raw-pool provenance")
+
+
+def validate_scene_export_completeness(
+    scene_data: dict,
+    config: DictConfig,
+    checkpoint_meta: dict | None = None,
+) -> None:
     """Validate that an existing scene file satisfies the current export config.
 
     Args:
@@ -1193,6 +1910,9 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
     if bool(getattr(config.task, "include_grasp_pose", False)) and "grasp_pose" not in scene_data:
         raise KeyError("Existing export does not contain required grasp_pose")
 
+    if is_reverse_factorization(config):
+        validate_reverse_scene_export(scene_data, config, checkpoint_meta)
+
     position = np.asarray(scene_data[position_key])
     wrist_quat = np.asarray(scene_data["wrist_quat"])
     active_hand_mask = np.asarray(scene_data["active_hand_mask"])
@@ -1236,7 +1956,11 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
     validate_scene_export(scene_data, float(getattr(config.task, "quat_norm_tol", 1e-3)))
 
 
-def load_complete_scene_export(scene_file: str, config: DictConfig) -> dict | None:
+def load_complete_scene_export(
+    scene_file: str,
+    config: DictConfig,
+    checkpoint_meta: dict | None = None,
+) -> dict | None:
     """Load an existing per-scene export if it is complete for this run.
 
     Args:
@@ -1248,14 +1972,18 @@ def load_complete_scene_export(scene_file: str, config: DictConfig) -> dict | No
     """
     try:
         scene_data = np.load(scene_file, allow_pickle=True).item()
-        validate_scene_export_completeness(scene_data, config)
+        validate_scene_export_completeness(scene_data, config, checkpoint_meta)
     except Exception as exc:
         print(f"Will regenerate incomplete existing scene export {scene_file}: {exc}")
         return None
     return scene_data
 
 
-def collect_complete_scene_ids(output_dir: str, config: DictConfig) -> set[str]:
+def collect_complete_scene_ids(
+    output_dir: str,
+    config: DictConfig,
+    checkpoint_meta: dict | None = None,
+) -> set[str]:
     """Collect scene ids that can be safely skipped.
 
     Args:
@@ -1265,16 +1993,38 @@ def collect_complete_scene_ids(output_dir: str, config: DictConfig) -> set[str]:
     Returns:
         Set of scene ids with complete per-scene export files.
     """
+    return set(collect_complete_scene_exports(output_dir, config, checkpoint_meta))
+
+
+def collect_complete_scene_exports(
+    output_dir: str,
+    config: DictConfig,
+    checkpoint_meta: dict | None = None,
+) -> dict[str, tuple[dict, str]]:
+    """Load reusable scene records together with their source file paths.
+
+    Args:
+        output_dir: Export output directory.
+        config: Full Hydra config containing current export options.
+        checkpoint_meta: Optional checkpoint hashes used by Reverse validation.
+
+    Returns:
+        Mapping from scene id to ``(scene_data, scene_file)``.
+    """
     scene_dir = export_scene_dir(output_dir, config)
     if not os.path.isdir(scene_dir):
-        return set()
-    complete_scene_ids = set()
+        return {}
+    complete_exports: dict[str, tuple[dict, str]] = {}
     scene_files = sorted(glob(pjoin(scene_dir, "**", "*.npy"), recursive=True))
     for scene_file in tqdm(scene_files, desc="scan existing obj prior", leave=False):
-        scene_data = load_complete_scene_export(scene_file, config)
-        if scene_data is not None:
-            complete_scene_ids.add(str(scene_data["scene_id"]))
-    return complete_scene_ids
+        scene_data = load_complete_scene_export(scene_file, config, checkpoint_meta)
+        if scene_data is None:
+            continue
+        scene_id = str(scene_data["scene_id"])
+        if scene_id in complete_exports:
+            raise ValueError(f"Duplicate complete scene export for scene_id={scene_id}")
+        complete_exports[scene_id] = (scene_data, scene_file)
+    return complete_exports
 
 
 def scene_summary_from_data(scene_data: dict, scene_file: str) -> dict:
@@ -1301,6 +2051,21 @@ def scene_summary_from_data(scene_data: dict, scene_file: str) -> dict:
         "grasp_type_names": np.asarray(scene_data["grasp_type_names"]).astype(str),
         "budget_scores": np.asarray(scene_data["budget_scores"], dtype=np.float32),
         "score_semantics": str(scene_data["score_semantics"]),
+        "factorization": str(scene_data.get("factorization", PROPOSED_FACTORIZATION)),
+    }
+
+
+def scene_index_from_summary(summary: dict) -> dict:
+    """Build the compact scene-index row shared by new and reused exports."""
+    return {
+        "scene_id": summary["scene_id"],
+        "object_id": summary["object_id"],
+        "split": summary["split"],
+        "robot_name": summary["robot_name"],
+        "robot_size": summary["robot_size"],
+        "pc_runtime_scale": summary["pc_runtime_scale"],
+        "factorization": summary["factorization"],
+        "scene_file": summary["scene_file"],
     }
 
 
@@ -1347,6 +2112,7 @@ def build_scene_export_record(score_record: dict, pose_records: dict[int, dict],
         "sample_selection_translation_scale_m": np.float32(selection_metadata["sample_selection_translation_scale_m"]),
         "sample_selection_rotation_weight": np.float32(selection_metadata["sample_selection_rotation_weight"]),
         "score_semantics": score_semantics_from_config(config),
+        "factorization": factorization_from_config(config),
         "budget_scores": np.asarray(score_record["budget_scores"], dtype=np.float32),
         position_key: position,
         "wrist_quat": wrist_quat,
@@ -1408,8 +2174,8 @@ def write_obj_human_prior_export(
     """Write score JSONL, scene index and manifest after batch scene saves.
 
     Args:
-        score_lines: Per-scene score summaries for newly saved scenes.
-        scene_index: Per-scene index rows for newly saved scenes.
+        score_lines: Per-scene score summaries for all current scenes.
+        scene_index: Per-scene index rows for all current scenes.
         output_dir: Destination output directory.
         manifest: Manifest fields built by the caller.
         config: Full Hydra config.
@@ -1442,6 +2208,7 @@ def write_obj_human_prior_export(
                 "grasp_type_names": row["grasp_type_names"],
                 "budget_scores": row["budget_scores"],
                 "score_semantics": row["score_semantics"],
+                "factorization": row["factorization"],
             }
             score_handle.write(json.dumps(score_line, default=_json_default, ensure_ascii=False) + "\n")
 
@@ -1481,6 +2248,7 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
     selection_metadata = export_sample_selection_metadata(config)
     return {
         "task_name": "obj_human_prior_export",
+        "factorization": factorization_from_config(config),
         "checkpoint_path": checkpoint_meta["checkpoint_path"],
         "checkpoint_iter": checkpoint_meta["checkpoint_iter"],
         "uses_independent_models": bool(checkpoint_meta["uses_independent_models"]),
@@ -1489,10 +2257,15 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
         "pc_runtime_scale": export_pc_runtime_scale(config),
         "score_checkpoint_path": checkpoint_meta["score_checkpoint_path"],
         "score_checkpoint_iter": checkpoint_meta["score_checkpoint_iter"],
+        "score_checkpoint_sha256": checkpoint_meta.get("score_checkpoint_sha256"),
         "score_ckpt": checkpoint_meta.get("score_ckpt"),
         "pose_checkpoint_path": checkpoint_meta["pose_checkpoint_path"],
         "pose_checkpoint_iter": checkpoint_meta["pose_checkpoint_iter"],
+        "pose_checkpoint_sha256": checkpoint_meta.get("pose_checkpoint_sha256"),
         "pose_ckpt": checkpoint_meta.get("pose_ckpt"),
+        "model_roles": checkpoint_meta.get("model_roles"),
+        "score_model_config": checkpoint_meta.get("score_model_config"),
+        "pose_model_config": checkpoint_meta.get("pose_model_config"),
         "model_name": str(config.algo.model.name),
         "type_objective": str(getattr(config.algo.model, "type_objective", "ce")),
         "score_semantics": score_semantics_from_config(config),
@@ -1517,6 +2290,12 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
         "test_data": OmegaConf.to_container(config.test_data, resolve=True),
         "data_hand_pos_source": normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist")),
         "seed": int(config.seed),
+        "reverse_sampling": reverse_sampling_config(config) if is_reverse_factorization(config) else None,
+        "posterior_contract": (
+            OmegaConf.to_container(config.algo.posterior_contract, resolve=True)
+            if is_reverse_factorization(config)
+            else None
+        ),
     }
 
 
@@ -1541,7 +2320,12 @@ def task_obj_human_prior_export(config: DictConfig) -> None:
     score_model, pose_model, checkpoint_meta = load_export_models(config)
     output_dir = resolve_output_dir(config, checkpoint_meta)
     skip_existing = bool(getattr(config.task, "skip_existing", True))
-    skip_scene_ids = collect_complete_scene_ids(output_dir, config) if skip_existing else set()
+    complete_exports = (
+        collect_complete_scene_exports(output_dir, config, checkpoint_meta)
+        if skip_existing
+        else {}
+    )
+    skip_scene_ids = set(complete_exports)
     if skip_scene_ids:
         print(f"Skipping {len(skip_scene_ids)} existing complete scene exports from {output_dir}")
 
@@ -1550,25 +2334,48 @@ def task_obj_human_prior_export(config: DictConfig) -> None:
     scene_dir = export_scene_dir(output_dir, config)
 
     with torch.no_grad():
-        score_lines, scene_index = sample_scene_scores_and_fixed_type_poses(
-            config,
-            score_model,
-            pose_model,
-            split_lookup,
-            scene_dir,
-            skip_scene_ids=skip_scene_ids,
-        )
+        if is_reverse_factorization(config):
+            new_score_lines, new_scene_index = sample_reverse_scene_scores_and_poses(
+                config,
+                score_model,
+                pose_model,
+                split_lookup,
+                scene_dir,
+                checkpoint_meta,
+                skip_scene_ids=skip_scene_ids,
+            )
+        else:
+            new_score_lines, new_scene_index = sample_scene_scores_and_fixed_type_poses(
+                config,
+                score_model,
+                pose_model,
+                split_lookup,
+                scene_dir,
+                skip_scene_ids=skip_scene_ids,
+            )
 
     expected_count = expected_scene_count(config)
-    if expected_count is not None and not skip_existing and expected_count != len(score_lines):
-        raise RuntimeError(f"Expected {expected_count} scenes, but exported scores for {len(score_lines)} scenes")
+    if expected_count is not None and not skip_existing and expected_count != len(new_score_lines):
+        raise RuntimeError(f"Expected {expected_count} scenes, but exported scores for {len(new_score_lines)} scenes")
+
+    existing_score_lines = []
+    existing_scene_index = []
+    for scene_data, scene_file in complete_exports.values():
+        summary = scene_summary_from_data(scene_data, scene_file)
+        existing_score_lines.append(summary)
+        existing_scene_index.append(scene_index_from_summary(summary))
+    score_lines = existing_score_lines + new_score_lines
+    scene_index = existing_scene_index + new_scene_index
+    scene_ids = [row["scene_id"] for row in scene_index]
+    if len(scene_ids) != len(set(scene_ids)):
+        raise ValueError("Duplicate scene ids found while merging reused and newly exported scenes")
 
     manifest = build_manifest(config, checkpoint_meta)
     if expected_count is not None:
         manifest["expected_scene_count"] = expected_count
     manifest["skip_existing"] = skip_existing
     manifest["skipped_complete_scene_count"] = len(skip_scene_ids)
-    manifest["new_scene_count"] = len(score_lines)
+    manifest["new_scene_count"] = len(new_score_lines)
     output_paths = write_obj_human_prior_export(
         score_lines,
         scene_index,
@@ -1576,10 +2383,10 @@ def task_obj_human_prior_export(config: DictConfig) -> None:
         manifest,
         config,
     )
-    if expected_count is not None and skip_existing and len(skip_scene_ids) + len(score_lines) < expected_count:
+    if expected_count is not None and skip_existing and len(score_lines) < expected_count:
         print(
             f"Warning: expected {expected_count} scenes, but found {len(skip_scene_ids)} skipped and "
-            f"{len(score_lines)} newly exported scenes for this config."
+            f"{len(new_score_lines)} newly exported scenes for this config."
         )
     print(f"Saved object human prior export to {output_paths['output_dir']}")
     print(f"Exported {output_paths['scene_count']} scenes")

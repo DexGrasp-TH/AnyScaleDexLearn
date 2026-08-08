@@ -92,7 +92,7 @@ def _infer_type_objective(config):
 
     if model_name in {"HierarchicalModel", "HierarchicalTypeCEModel"}:
         return "ce"
-    if model_name == "HierarchicalTypeObjectiveModel":
+    if model_name in {"HierarchicalTypeObjectiveModel", "PoseConditionedTypeModel"}:
         return "ce"
     return None
 

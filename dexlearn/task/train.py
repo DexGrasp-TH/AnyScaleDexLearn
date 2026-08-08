@@ -433,6 +433,7 @@ def _training_mode(config: DictConfig) -> str:
         "legacy_shared_encoder_two_stage",
         "independent_from_scratch",
         "joint_single_stage",
+        "reverse_independent_from_scratch",
         "two_stage_diffusion_then_frozen_type_head",
     }
     if mode not in supported_modes:
@@ -523,6 +524,74 @@ def _independent_from_scratch_branches(config: DictConfig) -> list[str]:
         f"Unsupported algo.training.independent.run={run_mode}. "
         "Expected one of ['both', 'type', 'diffusion']"
     )
+
+
+def _reverse_training_branches(config: DictConfig) -> list[str]:
+    """Resolve which Reverse T-to-C branches should run.
+
+    Args:
+        config: Full config containing ``algo.training.run``.
+
+    Returns:
+        Ordered branch list. ``both`` trains the marginal generator first.
+    """
+    run_mode = str(OmegaConf.select(config, "algo.training.run", default="both")).strip()
+    if run_mode == "both":
+        return ["pose_marginal", "type_posterior"]
+    if run_mode in {"pose_marginal", "type_posterior"}:
+        return [run_mode]
+    raise ValueError(
+        f"Unsupported algo.training.run={run_mode}. "
+        "Expected one of ['both', 'pose_marginal', 'type_posterior']"
+    )
+
+
+def _build_reverse_branch_config(config: DictConfig, branch_name: str, exp_name: str) -> DictConfig:
+    """Create one isolated Reverse model training config.
+
+    Args:
+        config: Base ``humanMultiReverse`` config.
+        branch_name: ``pose_marginal`` or ``type_posterior``.
+        exp_name: Concrete experiment name for this branch.
+
+    Returns:
+        Deep-copied branch config with its own model and schedule.
+    """
+    if branch_name not in {"pose_marginal", "type_posterior"}:
+        raise ValueError(f"Unsupported Reverse branch {branch_name!r}")
+    branch_config = copy.deepcopy(config)
+    _set_exp_name(branch_config, exp_name)
+    branch_config.ckpt = None
+    branch_config.resume = False
+    branch_config.wandb.resume = False
+
+    schedule = OmegaConf.select(branch_config, f"algo.training.{branch_name}")
+    model_config = OmegaConf.select(branch_config, f"algo.models.{branch_name}")
+    if schedule is None or model_config is None:
+        raise ValueError(f"Missing Reverse schedule or model config for {branch_name}")
+    branch_config.algo.model = copy.deepcopy(model_config)
+    branch_config.algo.max_iter = int(schedule.max_iter)
+    branch_config.algo.save_every = int(schedule.save_every)
+    branch_config.algo.val_every = int(schedule.val_every)
+    branch_config.algo.lr = float(schedule.lr)
+    branch_config.algo.lr_min = float(schedule.lr_min)
+
+    branch_config.data.sampling.train_unit = "record_uniform"
+    branch_config.data.sampling.pose_group_soft_labels = False
+    branch_config.algo.supervision.balancing.enabled = False
+    branch_config.algo.supervision.balancing.sampler.enabled = False
+    branch_config.algo.supervision.balancing.loss_weight.enabled = False
+
+    if branch_name == "pose_marginal":
+        branch_config.algo.loss_weight.loss_diffusion = 1.0
+        branch_config.algo.loss_weight.loss_type = 0.0
+        key_features = "reverse_T_to_C_pose_marginal_object_conditioned_diffusion_only"
+    else:
+        branch_config.algo.loss_weight.loss_diffusion = 0.0
+        branch_config.algo.loss_weight.loss_type = 1.0
+        key_features = "reverse_T_to_C_pose_conditioned_hard_label_posterior"
+    branch_config.model_registry.key_features = f"{key_features}_{branch_config.algo.max_iter}iter"
+    return branch_config
 
 
 def _build_two_stage_config(
@@ -662,6 +731,18 @@ def _task_train_independent_from_scratch(config: DictConfig) -> None:
         branch_exp_name = exp_name_by_branch[branch_name]
         print(f"Independent-from-scratch mode: {branch_name} exp_name={branch_exp_name}")
         branch_config = _build_independent_from_scratch_config(config, branch_name, branch_exp_name)
+        _task_train_single(branch_config)
+        wandb.finish()
+
+
+def _task_train_reverse_independent_from_scratch(config: DictConfig) -> None:
+    """Train the Reverse pose marginal and posterior as separate fresh runs."""
+    base_exp_name = str(config.exp_name)
+    for branch_name in _reverse_training_branches(config):
+        suffix = str(OmegaConf.select(config, f"algo.training.{branch_name}.exp_suffix"))
+        branch_exp_name = _stage_exp_name(base_exp_name, suffix)
+        print(f"Reverse T-to-C branch: {branch_name} exp_name={branch_exp_name}")
+        branch_config = _build_reverse_branch_config(config, branch_name, branch_exp_name)
         _task_train_single(branch_config)
         wandb.finish()
 
@@ -859,6 +940,10 @@ def task_train(config: DictConfig):
 
     if mode == "independent_from_scratch":
         _task_train_independent_from_scratch(config)
+        return
+
+    if mode == "reverse_independent_from_scratch":
+        _task_train_reverse_independent_from_scratch(config)
         return
 
     if mode == "joint_single_stage":
