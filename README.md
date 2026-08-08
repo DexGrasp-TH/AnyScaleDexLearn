@@ -366,6 +366,14 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
 Its default export root is
 `output/humanMulti_humanMultiReverse_<EXP_NAME>/obj_human_prior/step_<POSE_CKPT>_<SCORE_CKPT>/`.
 
+To export an exact bounded scene set, set
+`test_data.test_scene_list_path=<SCENE_LIST_JSON>` and leave
+`test_data.test_scene_num=0`. The JSON may be a plain list of scene ids, or an
+object with a `scene_paths` list and optional matching `scene_count`. Relative
+entries resolve under `<test_data.object_path>/scene_cfg`; absolute entries
+must resolve inside the same scene root. This avoids enumerating the full asset
+split when a downstream synthesis experiment references only a known subset.
+
 Reverse export generates one shared 500-pose marginal pool before evaluating
 `q(c|T,o)`. It computes the five `budget_scores` before filtering, performs
 fixed-seed weighted sampling without replacement to obtain 100 candidates per

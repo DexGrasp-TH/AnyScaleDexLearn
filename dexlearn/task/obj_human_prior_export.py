@@ -2149,6 +2149,21 @@ def expected_scene_count(config: DictConfig) -> int | None:
     if int(getattr(config.test_data, "test_scene_num", 0)) > 0:
         return None
 
+    scene_list_path = getattr(config.test_data, "test_scene_list_path", None)
+    if scene_list_path is not None and str(scene_list_path).strip():
+        resolved_list_path = to_absolute_path(str(scene_list_path))
+        payload = load_json(resolved_list_path)
+        entries = payload.get("scene_paths") if isinstance(payload, dict) else payload
+        if not isinstance(entries, list):
+            return None
+        declared_count = payload.get("scene_count") if isinstance(payload, dict) else None
+        if declared_count is not None and int(declared_count) != len(entries):
+            raise ValueError(
+                f"Declared scene_count={declared_count} does not match {len(entries)} entries in "
+                f"{resolved_list_path}"
+            )
+        return len(entries)
+
     split_root = to_absolute_path(pjoin(str(config.test_data.object_path), str(config.test_data.split_path)))
     scene_count = 0
     for split_name in _as_list(getattr(config.task, "object_splits", [config.test_data.test_split])):

@@ -30,3 +30,9 @@ mini_test: False
 test_object_num: 0
 test_scene_num: 0
 test_subset_seed: 0
+
+# Optional exact scene whitelist for bounded export/evaluation. The JSON may be
+# a plain list or an object with ``scene_paths`` and optional ``scene_count``.
+# Entries are relative to ``<object_path>/scene_cfg`` unless absolute. This is
+# mutually exclusive with ``test_scene_num``.
+test_scene_list_path:
