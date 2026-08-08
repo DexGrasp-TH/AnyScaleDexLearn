@@ -754,10 +754,12 @@ def export_sample_selection_metadata(config: DictConfig) -> dict:
         Dictionary describing the generated candidate count, selected count,
         and active selection strategy.
     """
-    mode, translation_scale_m, rotation_weight, intermediate_topk = _sample_selection_config(config)
+    enabled, scope, mode, translation_scale_m, rotation_weight, intermediate_topk = _sample_selection_config(config)
     return {
         "pose_candidate_num": export_pose_candidate_num(config),
         "samples_per_type": export_samples_per_type(config),
+        "sample_selection_enabled": bool(enabled),
+        "sample_selection_scope": scope,
         "sample_selection_mode": mode,
         "sample_selection_intermediate_topk": intermediate_topk,
         "sample_selection_translation_scale_m": float(translation_scale_m),
@@ -1168,6 +1170,8 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
         "active_hand_mask",
         "grasp_pos_source",
         "pose_candidate_num",
+        "sample_selection_enabled",
+        "sample_selection_scope",
         "sample_selection_mode",
         "sample_selection_intermediate_topk",
         "sample_selection_translation_scale_m",
@@ -1211,6 +1215,10 @@ def validate_scene_export_completeness(scene_data: dict, config: DictConfig) -> 
         raise ValueError("Existing export uses a different pc_runtime_scale value")
     if int(np.asarray(scene_data.get("pose_candidate_num", -1)).item()) != selection_metadata["pose_candidate_num"]:
         raise ValueError("Existing export uses a different pose_candidate_num value")
+    if bool(scene_data.get("sample_selection_enabled")) != selection_metadata["sample_selection_enabled"]:
+        raise ValueError("Existing export uses a different sample_selection_enabled value")
+    if str(scene_data.get("sample_selection_scope")) != selection_metadata["sample_selection_scope"]:
+        raise ValueError("Existing export uses a different sample_selection_scope value")
     if str(scene_data.get("sample_selection_mode")) != selection_metadata["sample_selection_mode"]:
         raise ValueError("Existing export uses a different sample_selection_mode value")
     if scene_data.get("sample_selection_intermediate_topk") != selection_metadata["sample_selection_intermediate_topk"]:
@@ -1332,6 +1340,8 @@ def build_scene_export_record(score_record: dict, pose_records: dict[int, dict],
         "grasp_type_names": np.asarray(REAL_GRASP_TYPE_NAMES),
         "samples_per_type": np.int64(samples_per_type),
         "pose_candidate_num": np.int64(selection_metadata["pose_candidate_num"]),
+        "sample_selection_enabled": np.bool_(selection_metadata["sample_selection_enabled"]),
+        "sample_selection_scope": selection_metadata["sample_selection_scope"],
         "sample_selection_mode": selection_metadata["sample_selection_mode"],
         "sample_selection_intermediate_topk": selection_metadata["sample_selection_intermediate_topk"],
         "sample_selection_translation_scale_m": np.float32(selection_metadata["sample_selection_translation_scale_m"]),
@@ -1489,6 +1499,8 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
         "samples_per_type": export_samples_per_type(config),
         "pose_candidate_num": selection_metadata["pose_candidate_num"],
         "sample_selection": {
+            "enabled": selection_metadata["sample_selection_enabled"],
+            "scope": selection_metadata["sample_selection_scope"],
             "mode": selection_metadata["sample_selection_mode"],
             "intermediate_topk": selection_metadata["sample_selection_intermediate_topk"],
             "translation_scale_m": selection_metadata["sample_selection_translation_scale_m"],
