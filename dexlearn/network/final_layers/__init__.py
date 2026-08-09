@@ -20,3 +20,4 @@ from .diffusion import (
     canonicalize_bimanual_t24,
     bimanual_t24_to_pose,
 )
+from .joint_diffusion import CoupledJointDenoiser, JointCategoricalPoseDiffusion

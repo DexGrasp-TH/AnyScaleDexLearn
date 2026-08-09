@@ -430,6 +430,7 @@ def _training_mode(config: DictConfig) -> str:
         )
     ).strip()
     supported_modes = {
+        "joint_coupled_diffusion",
         "legacy_shared_encoder_two_stage",
         "independent_from_scratch",
         "joint_single_stage",
@@ -439,6 +440,21 @@ def _training_mode(config: DictConfig) -> str:
     if mode not in supported_modes:
         raise ValueError(f"Unsupported algo.training.mode={mode}. Expected one of {sorted(supported_modes)}")
     return mode
+
+
+def _build_joint_coupled_training_config(config: DictConfig) -> DictConfig:
+    """Build the hard-label, record-uniform single-run Joint training config."""
+    joint_config = copy.deepcopy(config)
+    joint_config.data.sampling.train_unit = "record_uniform"
+    joint_config.data.sampling.pose_group_soft_labels = False
+    joint_config.algo.supervision.balancing.enabled = False
+    joint_config.algo.supervision.balancing.sampler.enabled = False
+    joint_config.algo.supervision.balancing.loss_weight.enabled = False
+    if not OmegaConf.select(joint_config, "model_registry.key_features"):
+        joint_config.model_registry.key_features = (
+            "joint_C_T_coupled_categorical_gaussian_diffusion_record_uniform_hard_labels"
+        )
+    return joint_config
 
 
 def _build_independent_from_scratch_config(
@@ -944,6 +960,10 @@ def task_train(config: DictConfig):
 
     if mode == "reverse_independent_from_scratch":
         _task_train_reverse_independent_from_scratch(config)
+        return
+
+    if mode == "joint_coupled_diffusion":
+        _task_train_single(_build_joint_coupled_training_config(config))
         return
 
     if mode == "joint_single_stage":
