@@ -434,6 +434,7 @@ def _training_mode(config: DictConfig) -> str:
         "legacy_shared_encoder_two_stage",
         "independent_from_scratch",
         "joint_single_stage",
+        "independent_marginals_from_scratch",
         "reverse_independent_from_scratch",
         "two_stage_diffusion_then_frozen_type_head",
     }
@@ -540,6 +541,62 @@ def _independent_from_scratch_branches(config: DictConfig) -> list[str]:
         f"Unsupported algo.training.independent.run={run_mode}. "
         "Expected one of ['both', 'type', 'diffusion']"
     )
+
+
+def _independent_marginal_training_branches(config: DictConfig) -> list[str]:
+    """Resolve which strict Independent marginal branches should run."""
+    run_mode = str(OmegaConf.select(config, "algo.training.run", default="both")).strip()
+    if run_mode == "both":
+        return ["mode_marginal", "pose_marginal"]
+    if run_mode in {"mode_marginal", "pose_marginal"}:
+        return [run_mode]
+    raise ValueError(
+        f"Unsupported algo.training.run={run_mode}. "
+        "Expected one of ['both', 'mode_marginal', 'pose_marginal']"
+    )
+
+
+def _build_independent_marginal_branch_config(
+    config: DictConfig,
+    branch_name: str,
+    exp_name: str,
+) -> DictConfig:
+    """Create one isolated strict Independent marginal training config."""
+    if branch_name not in {"mode_marginal", "pose_marginal"}:
+        raise ValueError(f"Unsupported Independent branch {branch_name!r}")
+    branch_config = copy.deepcopy(config)
+    _set_exp_name(branch_config, exp_name)
+    branch_config.ckpt = None
+    branch_config.resume = False
+    branch_config.wandb.resume = False
+
+    schedule = OmegaConf.select(branch_config, f"algo.training.{branch_name}")
+    model_config = OmegaConf.select(branch_config, f"algo.models.{branch_name}")
+    if schedule is None or model_config is None:
+        raise ValueError(f"Missing Independent schedule or model config for {branch_name}")
+    branch_config.algo.model = copy.deepcopy(model_config)
+    branch_config.algo.max_iter = int(schedule.max_iter)
+    branch_config.algo.save_every = int(schedule.save_every)
+    branch_config.algo.val_every = int(schedule.val_every)
+    branch_config.algo.lr = float(schedule.lr)
+    branch_config.algo.lr_min = float(schedule.lr_min)
+
+    branch_config.data.sampling.train_unit = "record_uniform"
+    branch_config.algo.supervision.balancing.enabled = False
+    branch_config.algo.supervision.balancing.sampler.enabled = False
+    branch_config.algo.supervision.balancing.loss_weight.enabled = False
+    if branch_name == "mode_marginal":
+        branch_config.data.sampling.pose_group_soft_labels = True
+        branch_config.algo.loss_weight.loss_type = 1.0
+        branch_config.algo.loss_weight.loss_diffusion = 0.0
+        key_features = "independent_C_T_object_only_mode_marginal_soft_label_ce"
+    else:
+        branch_config.data.sampling.pose_group_soft_labels = False
+        branch_config.algo.loss_weight.loss_type = 0.0
+        branch_config.algo.loss_weight.loss_diffusion = 1.0
+        key_features = "independent_C_T_object_only_pose_marginal_diffusion"
+    branch_config.model_registry.key_features = f"{key_features}_{branch_config.algo.max_iter}iter"
+    return branch_config
 
 
 def _reverse_training_branches(config: DictConfig) -> list[str]:
@@ -763,6 +820,22 @@ def _task_train_reverse_independent_from_scratch(config: DictConfig) -> None:
         wandb.finish()
 
 
+def _task_train_independent_marginals_from_scratch(config: DictConfig) -> None:
+    """Train strict Independent mode and pose marginals as separate runs."""
+    base_exp_name = str(config.exp_name)
+    for branch_name in _independent_marginal_training_branches(config):
+        suffix = str(OmegaConf.select(config, f"algo.training.{branch_name}.exp_suffix"))
+        branch_exp_name = _stage_exp_name(base_exp_name, suffix)
+        print(f"Independent C-T branch: {branch_name} exp_name={branch_exp_name}")
+        branch_config = _build_independent_marginal_branch_config(
+            config,
+            branch_name,
+            branch_exp_name,
+        )
+        _task_train_single(branch_config)
+        wandb.finish()
+
+
 def _task_train_single(config: DictConfig):
     resolve_type_supervision_config(config)
     set_seed(config.seed)
@@ -956,6 +1029,10 @@ def task_train(config: DictConfig):
 
     if mode == "independent_from_scratch":
         _task_train_independent_from_scratch(config)
+        return
+
+    if mode == "independent_marginals_from_scratch":
+        _task_train_independent_marginals_from_scratch(config)
         return
 
     if mode == "reverse_independent_from_scratch":

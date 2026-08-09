@@ -1,6 +1,6 @@
-"""Reverse T-to-C Human Prior models."""
+"""Reverse T-to-C and reusable marginal wrist-pose Human Prior models."""
 
-from typing import Iterable
+from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -70,21 +70,65 @@ class MarginalPoseDiffusionModel(torch.nn.Module):
         global_feature = repeat(global_feature, "b c -> (b s) c", s=sample_num)
         return self.output_head.forward(data, global_feature)
 
-    def sample_with_t24(self, data: dict, sample_num: int):
+    def _initial_noise(
+        self,
+        global_feature: torch.Tensor,
+        sample_num: int,
+        seed: int | Iterable[int],
+    ) -> torch.Tensor:
+        """Build per-scene diffusion noise without using the global RNG state."""
+        if isinstance(seed, int):
+            scene_seeds = [int(seed)] * global_feature.shape[0]
+        else:
+            scene_seeds = [int(value) for value in seed]
+            if len(scene_seeds) != global_feature.shape[0]:
+                raise ValueError(
+                    f"Expected {global_feature.shape[0]} pose seeds, got {len(scene_seeds)}"
+                )
+        pose_dim = int(self.output_head.policy.channels)
+        rows = []
+        for scene_seed in scene_seeds:
+            generator = torch.Generator(device=global_feature.device)
+            generator.manual_seed(scene_seed)
+            rows.append(
+                torch.randn(
+                    (sample_num, pose_dim),
+                    generator=generator,
+                    device=global_feature.device,
+                    dtype=global_feature.dtype,
+                )
+            )
+        return torch.stack(rows, dim=0).reshape(-1, pose_dim)
+
+    def sample_with_t24(
+        self,
+        data: dict,
+        sample_num: int,
+        seed: int | Iterable[int] | None = None,
+    ):
         """Sample T before any contact-mode prediction.
 
         Args:
             data: Object observation batch.
             sample_num: Number of marginal poses per object.
+            seed: Optional scalar or one explicit diffusion seed per scene.
 
         Returns:
             Tuple ``(canonical_t24, robot_pose, log_prob)``.
         """
         global_feature = self.encode_object(data)
-        return self.output_head.sample_with_t24(global_feature, sample_num)
+        initial_noise = None if seed is None else self._initial_noise(global_feature, sample_num, seed)
+        if initial_noise is None:
+            return self.output_head.sample_with_t24(global_feature, sample_num)
+        return self.output_head.sample_with_t24(global_feature, sample_num, initial_noise=initial_noise)
 
-    def sample(self, data: dict, sample_num: int = 1):
-        _, robot_pose, log_prob = self.sample_with_t24(data, sample_num)
+    def sample(
+        self,
+        data: dict,
+        sample_num: int = 1,
+        seed: int | Iterable[int] | None = None,
+    ):
+        _, robot_pose, log_prob = self.sample_with_t24(data, sample_num, seed=seed)
         return robot_pose, log_prob
 
 

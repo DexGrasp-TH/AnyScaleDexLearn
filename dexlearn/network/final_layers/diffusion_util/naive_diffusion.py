@@ -365,10 +365,18 @@ class GaussianDiffusion1DMask(nn.Module):
 
         return loss
 
-    def sample(self, cond, mask=None):
+    def sample(self, cond, mask=None, initial_noise=None):
         device = cond.device
         batch_size = cond.shape[0]
-        x = torch.randn(cond.shape[0], self.model.channels, device=device)
+        if initial_noise is None:
+            x = torch.randn(cond.shape[0], self.model.channels, device=device)
+        else:
+            expected_shape = (cond.shape[0], self.model.channels)
+            if tuple(initial_noise.shape) != expected_shape:
+                raise ValueError(
+                    f"Expected initial_noise shape {expected_shape}, got {tuple(initial_noise.shape)}"
+                )
+            x = initial_noise.to(device=device, dtype=cond.dtype).clone()
 
         if mask is None:
             mask = torch.ones_like(x)
