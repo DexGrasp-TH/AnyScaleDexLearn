@@ -1,3 +1,5 @@
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -124,6 +126,44 @@ class ExportSampleSelectionMetadataTest(unittest.TestCase):
             manifest = build_manifest(config, checkpoint_meta)
             self.assertFalse(manifest["sample_selection"]["enabled"])
             self.assertEqual(manifest["sample_selection"]["scope"], "per_type")
+
+    def test_manifest_records_explicit_scene_list_hash(self):
+        config = _build_config()
+        checkpoint_meta = {
+            "checkpoint_path": "pose.pth",
+            "checkpoint_iter": 100,
+            "uses_independent_models": True,
+            "score_checkpoint_path": "score.pth",
+            "score_checkpoint_iter": 10,
+            "score_ckpt": "000010",
+            "pose_checkpoint_path": "pose.pth",
+            "pose_checkpoint_iter": 100,
+            "pose_ckpt": "000100",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            scene_paths = ["obj_a/tabletop/scene.npy", "obj_b/tabletop/scene.npy"]
+            digest = hashlib.sha256(
+                "".join(f"{entry}\n" for entry in scene_paths).encode("utf-8")
+            ).hexdigest()
+            scene_list_path = Path(tmp_dir) / "scene_list.json"
+            scene_list_path.write_text(
+                json.dumps(
+                    {
+                        "scene_count": len(scene_paths),
+                        "scene_list_sha256": digest,
+                        "scene_paths": scene_paths,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config.test_data.test_scene_list_path = str(scene_list_path)
+
+            manifest = build_manifest(config, checkpoint_meta)
+
+            self.assertEqual(manifest["scene_list"]["scene_count"], 2)
+            self.assertEqual(manifest["scene_list"]["scene_list_sha256"], digest)
+            self.assertIn("commit", manifest["repository"])
+            self.assertIn("python", manifest["runtime"])
 
     def test_completeness_rejects_enabled_or_scope_mismatch(self):
         config = _build_config(enabled=True, scope="global", mode="random")

@@ -2,6 +2,8 @@ import copy
 import hashlib
 import json
 import os
+import platform
+import subprocess
 import sys
 from glob import glob
 from os.path import join as pjoin
@@ -407,6 +409,87 @@ def checkpoint_sha256(checkpoint_path: str) -> str:
     return digest.hexdigest()
 
 
+def _git_repository_provenance() -> dict[str, Any]:
+    """Return commit and dirty-state metadata for this DexLearn checkout."""
+    repository_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def run_git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", repository_root, *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        return result.stdout.strip()
+
+    status = run_git("status", "--porcelain", "--untracked-files=all")
+    return {
+        "repository_root": repository_root,
+        "commit": run_git("rev-parse", "HEAD"),
+        "branch": run_git("branch", "--show-current"),
+        "dirty": None if status is None else bool(status),
+        "status_porcelain": None if status is None else status.splitlines(),
+    }
+
+
+def _runtime_provenance(config: DictConfig) -> dict[str, Any]:
+    """Return the runtime versions and selected accelerator for an export."""
+    device = str(getattr(config, "device", "cpu"))
+    cuda_device_name = None
+    if device.startswith("cuda") and torch.cuda.is_available():
+        cuda_index = torch.device(device).index
+        if cuda_index is None:
+            cuda_index = torch.cuda.current_device()
+        cuda_device_name = torch.cuda.get_device_name(cuda_index)
+    return {
+        "python": platform.python_version(),
+        "python_executable": sys.executable,
+        "numpy": np.__version__,
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "device": device,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_name": cuda_device_name,
+        "command": [sys.executable, *sys.argv],
+    }
+
+
+def _scene_list_provenance(config: DictConfig) -> dict[str, Any] | None:
+    """Validate and summarize the explicit test-scene whitelist, if set."""
+    configured_path = getattr(config.test_data, "test_scene_list_path", None)
+    if configured_path is None or not str(configured_path).strip():
+        return None
+    scene_list_path = to_absolute_path(str(configured_path))
+    payload = load_json(scene_list_path)
+    entries = payload.get("scene_paths") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list) or any(not isinstance(entry, str) for entry in entries):
+        raise ValueError(f"Invalid explicit scene list for provenance: {scene_list_path}")
+    normalized_entries = [entry if entry.endswith(".npy") else f"{entry}.npy" for entry in entries]
+    digest = hashlib.sha256("".join(f"{entry}\n" for entry in normalized_entries).encode("utf-8")).hexdigest()
+    declared_count = payload.get("scene_count") if isinstance(payload, dict) else None
+    declared_hash = payload.get("scene_list_sha256") if isinstance(payload, dict) else None
+    if declared_count is not None and int(declared_count) != len(normalized_entries):
+        raise ValueError(
+            f"Declared scene_count={declared_count} does not match {len(normalized_entries)} entries in "
+            f"{scene_list_path}"
+        )
+    if declared_hash is not None and str(declared_hash) != digest:
+        raise ValueError(
+            f"Declared scene_list_sha256={declared_hash} does not match computed hash {digest} in "
+            f"{scene_list_path}"
+        )
+    return {
+        "path": scene_list_path,
+        "scene_count": len(normalized_entries),
+        "scene_list_sha256": digest,
+        "declared_scene_list_sha256": declared_hash,
+    }
+
+
 def load_export_model(config: DictConfig) -> tuple[torch.nn.Module, str, int | None]:
     """Instantiate the human prior model and load the requested checkpoint.
 
@@ -561,13 +644,17 @@ def load_export_models(config: DictConfig) -> tuple[torch.nn.Module, torch.nn.Mo
 
     if not use_independent_models:
         model, checkpoint_path, checkpoint_iter = load_export_model(config)
+        checkpoint_hash = checkpoint_sha256(checkpoint_path)
         return model, model, {
             "checkpoint_path": checkpoint_path,
             "checkpoint_iter": checkpoint_iter,
+            "checkpoint_sha256": checkpoint_hash,
             "score_checkpoint_path": checkpoint_path,
             "score_checkpoint_iter": checkpoint_iter,
+            "score_checkpoint_sha256": checkpoint_hash,
             "pose_checkpoint_path": checkpoint_path,
             "pose_checkpoint_iter": checkpoint_iter,
+            "pose_checkpoint_sha256": checkpoint_hash,
             "uses_independent_models": False,
         }
 
@@ -575,14 +662,19 @@ def load_export_models(config: DictConfig) -> tuple[torch.nn.Module, torch.nn.Mo
     pose_config = clone_config_for_checkpoint(config, pose_exp_name, pose_ckpt)
     score_model, score_checkpoint_path, score_checkpoint_iter = load_export_model(score_config)
     pose_model, pose_checkpoint_path, pose_checkpoint_iter = load_export_model(pose_config)
+    score_checkpoint_hash = checkpoint_sha256(score_checkpoint_path)
+    pose_checkpoint_hash = checkpoint_sha256(pose_checkpoint_path)
     return score_model, pose_model, {
         "checkpoint_path": pose_checkpoint_path,
         "checkpoint_iter": pose_checkpoint_iter,
+        "checkpoint_sha256": pose_checkpoint_hash,
         "score_checkpoint_path": score_checkpoint_path,
         "score_checkpoint_iter": score_checkpoint_iter,
+        "score_checkpoint_sha256": score_checkpoint_hash,
         "score_ckpt": score_config.ckpt,
         "pose_checkpoint_path": pose_checkpoint_path,
         "pose_checkpoint_iter": pose_checkpoint_iter,
+        "pose_checkpoint_sha256": pose_checkpoint_hash,
         "pose_ckpt": pose_config.ckpt,
         "uses_independent_models": True,
     }
@@ -4181,8 +4273,11 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
         "grasp_type_ids": list(REAL_GRASP_TYPE_IDS),
         "grasp_type_names": list(REAL_GRASP_TYPE_NAMES),
         "test_data": OmegaConf.to_container(config.test_data, resolve=True),
+        "scene_list": _scene_list_provenance(config),
         "data_hand_pos_source": normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist")),
         "seed": int(config.seed),
+        "repository": _git_repository_provenance(),
+        "runtime": _runtime_provenance(config),
         "independent_sampling": independent_sampling_config(config) if is_independent_factorization(config) else None,
         "reverse_sampling": reverse_sampling_config(config) if is_reverse_factorization(config) else None,
         "joint_sampling": joint_sampling_config(config) if is_joint_factorization(config) else None,
