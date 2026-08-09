@@ -263,12 +263,14 @@ class DiffusionBiRT_v2(torch.nn.Module):
         result_dict["loss_diffusion"] = self.diffusion(grasp_rt_norm, cond_feat)
         return result_dict
 
-    def sample_with_t24(self, cond_feat, sample_num):
+    def sample_with_t24(self, cond_feat, sample_num, initial_noise=None):
         """Sample canonical T24 and the backward-compatible pose representation.
 
         Args:
             cond_feat: Object-conditioned feature tensor shaped ``(B, C)``.
             sample_num: Number of marginal or conditional samples per object.
+            initial_noise: Optional explicit normalized T24 diffusion noise
+                shaped ``(B * S, 24)`` for isolated per-scene RNG control.
 
         Returns:
             Tuple ``(canonical_t24, robot_pose, log_prob)`` where T24 is shaped
@@ -277,7 +279,10 @@ class DiffusionBiRT_v2(torch.nn.Module):
         """
         cond_feat = repeat(cond_feat, "b c -> (b n) c", n=sample_num)
 
-        grasp_rt, log_prob = self.diffusion.sample(cond=cond_feat)
+        if initial_noise is None:
+            grasp_rt, log_prob = self.diffusion.sample(cond=cond_feat)
+        else:
+            grasp_rt, log_prob = self.diffusion.sample(cond=cond_feat, initial_noise=initial_noise)
         log_prob = rearrange(log_prob, "(b t) -> b t", t=sample_num)
         grasp_rt = self.RMS.inv(grasp_rt)
         canonical_t24 = canonicalize_bimanual_t24(grasp_rt)
