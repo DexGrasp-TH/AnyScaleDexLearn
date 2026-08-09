@@ -255,6 +255,25 @@ centered canonical `T24` from the marginal diffusion; this GT-to-generated pose
 shift is the intentional initial train-inference gap. The marginal generator
 does not accept a contact-mode id or mode-specific sampling path.
 
+### Joint Contact-Mode / Wrist-Pose Human Prior
+
+`humanMultiJoint` implements the coupled factorization `p(c,T|o)` with one
+checkpoint. Contact mode is a five-class categorical diffusion state and wrist
+pose is the existing Gaussian T24 state. Every reverse step evaluates both
+heads from the same old `(c_t, T_t)` state before synchronously updating them;
+`0_any` is only a test-loader placeholder and is never generated.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=train algo=humanMultiJoint data=humanMulti \
+  data.sampling.train_split=all \
+  exp_name=<EXP_NAME>
+```
+
+The initial comparison budget is 10,000 iterations, record-uniform data,
+`loss_pose_v + loss_categorical`, and the same `WrappedMinkUNet` object encoder
+used by the Proposed baseline.
+
 ### Sample
 
 For the default `algo.training.mode=independent_from_scratch`, diffusion poses
@@ -365,6 +384,39 @@ CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
 
 Its default export root is
 `output/humanMulti_humanMultiReverse_<EXP_NAME>/obj_human_prior/step_<POSE_CKPT>_<SCORE_CKPT>/`.
+
+For Joint export, use the single coupled checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python dexlearn/main.py \
+  task=obj_human_prior_export \
+  data=humanMulti \
+  data.hand_pos_source=index_mcp \
+  algo=humanMultiJoint \
+  test_data=DGNMulti \
+  test_data.test_split=all \
+  task.robot_name=leap \
+  task.robot_size=1.8 \
+  task.skip_existing=false \
+  ckpt=010000 \
+  exp_name=<EXP_NAME> \
+  wandb.mode=disabled
+```
+
+Joint export draws one shared 500-sample raw pool and computes
+`budget_scores = bincount(type_ids - 1, minlength=5) / 500` before selection.
+It groups only by the sampled hard mode, caps each group at 100 candidates,
+selects 20 with `prob_pose`, and uses deterministic replacement only when a
+non-empty group has fewer than 20 raw samples. A zero-support mode receives a
+finite placeholder plus a zero score and is never filled by conditional
+generation. BimanBODex is unchanged; its formal synthesis config must keep
+`human_prior.min_type_budget=0`.
+
+The compact consumer record remains under `<asset>/<robot>/<scene>.npy` with
+the existing `budget_scores`, `index_mcp_pos`, `wrist_quat`, and
+`active_hand_mask` fields. The full raw pool is stored separately under
+`raw_joint/<scene>.npz`; the compact record saves its relative path, SHA-256,
+selected raw indices, replacement mask, zero-support mask, and checkpoint hash.
 
 To export an exact bounded scene set, set
 `test_data.test_scene_list_path=<SCENE_LIST_JSON>` and leave

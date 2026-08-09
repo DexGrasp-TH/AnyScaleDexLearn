@@ -31,12 +31,13 @@ REAL_GRASP_TYPE_IDS = tuple(range(1, len(GRASP_TYPES)))
 REAL_GRASP_TYPE_NAMES = tuple(GRASP_TYPES[type_id] for type_id in REAL_GRASP_TYPE_IDS)
 REVERSE_FACTORIZATION = "reverse_T_to_C"
 PROPOSED_FACTORIZATION = "proposed_C_to_T"
+JOINT_FACTORIZATION = "joint_C_T"
 
 
 def factorization_from_config(config: DictConfig) -> str:
     """Return the Human Prior factorization recorded in exported artifacts."""
     factorization = str(getattr(config.algo, "factorization", PROPOSED_FACTORIZATION))
-    valid_factorizations = {PROPOSED_FACTORIZATION, REVERSE_FACTORIZATION}
+    valid_factorizations = {JOINT_FACTORIZATION, PROPOSED_FACTORIZATION, REVERSE_FACTORIZATION}
     if factorization not in valid_factorizations:
         raise ValueError(
             f"Unsupported Human Prior factorization={factorization!r}; "
@@ -48,6 +49,51 @@ def factorization_from_config(config: DictConfig) -> str:
 def is_reverse_factorization(config: DictConfig) -> bool:
     """Check whether the config selects the Reverse T-to-C pipeline."""
     return factorization_from_config(config) == REVERSE_FACTORIZATION
+
+
+def is_joint_factorization(config: DictConfig) -> bool:
+    """Check whether the config selects the coupled Joint pipeline."""
+    return factorization_from_config(config) == JOINT_FACTORIZATION
+
+
+def joint_sampling_config(config: DictConfig) -> dict:
+    """Resolve and validate raw-pool and compatibility-adapter options."""
+    sampling_cfg = getattr(config.algo, "joint_sampling", None)
+    if sampling_cfg is None:
+        raise ValueError("Joint export requires algo.joint_sampling")
+    pool_size = int(getattr(sampling_cfg, "pool_size", 500))
+    candidate_cap = int(getattr(sampling_cfg, "candidate_cap", config.algo.test_grasp_num))
+    sampling_seed = int(getattr(sampling_cfg, "sampling_seed", config.seed))
+    include_raw_pool = bool(getattr(sampling_cfg, "include_raw_pool", True))
+    raw_artifact_format = str(getattr(sampling_cfg, "raw_artifact_format", "npz"))
+    zero_support_policy = str(getattr(sampling_cfg, "zero_support_policy", "finite_placeholder"))
+    low_support_policy = str(getattr(sampling_cfg, "low_support_policy", "deterministic_replacement"))
+    if pool_size <= 0 or candidate_cap <= 0:
+        raise ValueError("Joint pool_size and candidate_cap must be positive")
+    if candidate_cap > pool_size:
+        raise ValueError("Joint candidate_cap must not exceed pool_size")
+    if int(config.algo.test_topk) > candidate_cap:
+        raise ValueError("algo.test_topk must not exceed Joint candidate_cap")
+    if not include_raw_pool:
+        raise ValueError("Joint export requires include_raw_pool=true for provenance")
+    if raw_artifact_format != "npz":
+        raise ValueError("Joint export currently requires raw_artifact_format=npz")
+    if zero_support_policy != "finite_placeholder":
+        raise ValueError("Joint export currently requires zero_support_policy=finite_placeholder")
+    if low_support_policy != "deterministic_replacement":
+        raise ValueError("Joint export currently requires low_support_policy=deterministic_replacement")
+    enabled, scope, mode, _, _, _ = _sample_selection_config(config)
+    if not enabled or scope != "global" or mode != "prob_pose":
+        raise ValueError("Joint export requires enabled global prob_pose candidate selection")
+    return {
+        "pool_size": pool_size,
+        "candidate_cap": candidate_cap,
+        "sampling_seed": sampling_seed,
+        "include_raw_pool": include_raw_pool,
+        "raw_artifact_format": raw_artifact_format,
+        "zero_support_policy": zero_support_policy,
+        "low_support_policy": low_support_policy,
+    }
 
 
 def reverse_sampling_config(config: DictConfig) -> dict:
@@ -352,6 +398,34 @@ def load_export_models(config: DictConfig) -> tuple[torch.nn.Module, torch.nn.Mo
     if is_reverse_factorization(config):
         return load_reverse_export_models(config)
 
+    if is_joint_factorization(config):
+        independent_values = (
+            getattr(config.task, "score_exp_name", None),
+            getattr(config.task, "score_ckpt", None),
+            getattr(config.task, "pose_exp_name", None),
+            getattr(config.task, "pose_ckpt", None),
+        )
+        if any(value is not None for value in independent_values):
+            raise ValueError("Joint export uses one checkpoint; score_* and pose_* overrides must be empty")
+        model, checkpoint_path, checkpoint_iter = load_export_model(config)
+        checkpoint_hash = checkpoint_sha256(checkpoint_path)
+        return model, model, {
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_iter": checkpoint_iter,
+            "checkpoint_sha256": checkpoint_hash,
+            "joint_checkpoint_sha256": checkpoint_hash,
+            "score_checkpoint_path": checkpoint_path,
+            "score_checkpoint_iter": checkpoint_iter,
+            "score_checkpoint_sha256": checkpoint_hash,
+            "pose_checkpoint_path": checkpoint_path,
+            "pose_checkpoint_iter": checkpoint_iter,
+            "pose_checkpoint_sha256": checkpoint_hash,
+            "uses_independent_models": False,
+            "model_roles": {"joint": "coupled_mode_pose_generator"},
+            "score_model_config": OmegaConf.to_container(config.algo.model, resolve=True),
+            "pose_model_config": OmegaConf.to_container(config.algo.model, resolve=True),
+        }
+
     score_exp_name = getattr(config.task, "score_exp_name", None)
     score_ckpt = getattr(config.task, "score_ckpt", None)
     pose_exp_name = getattr(config.task, "pose_exp_name", None)
@@ -582,6 +656,8 @@ def score_semantics_from_config(config: DictConfig) -> str:
     """
     if is_reverse_factorization(config):
         return "monte_carlo_pose_posterior_probability"
+    if is_joint_factorization(config):
+        return "monte_carlo_joint_mode_frequency"
     objective = str(getattr(config.algo.model, "type_objective", "ce")).lower()
     if objective != "ce":
         raise ValueError("Human prior export only supports CE type scores")
@@ -841,6 +917,8 @@ def export_pose_candidate_num(config: DictConfig) -> int:
     """
     if is_reverse_factorization(config):
         candidate_num = reverse_sampling_config(config)["conditional_candidate_num"]
+    elif is_joint_factorization(config):
+        candidate_num = joint_sampling_config(config)["candidate_cap"]
     else:
         candidate_num = int(getattr(config.algo, "test_grasp_num", getattr(config.task, "samples_per_type", 20)))
     if candidate_num <= 0:
@@ -998,6 +1076,568 @@ def _stable_reverse_seed(base_seed: int, scene_id: str, type_id: int) -> int:
     payload = f"{int(base_seed)}:{scene_id}:{int(type_id)}".encode("utf-8")
     value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=False)
     return value % np.iinfo(np.int64).max
+
+
+def _stable_joint_seed(base_seed: int, scene_id: str, type_id: int = 0) -> int:
+    """Derive a batching-independent Joint sampler or adapter seed."""
+    payload = f"joint:{int(base_seed)}:{scene_id}:{int(type_id)}".encode("utf-8")
+    value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=False)
+    return value % np.iinfo(np.int64).max
+
+
+def joint_mode_budget_scores(raw_type_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute raw hard-mode counts and Monte Carlo frequencies.
+
+    Args:
+        raw_type_ids: External type ids shaped ``(B, M)`` in ``[1, 5]``.
+
+    Returns:
+        Tuple ``(budget_scores, counts)`` shaped ``(B, 5)``.
+    """
+    if raw_type_ids.ndim != 2:
+        raise ValueError(f"Expected raw_type_ids shape (B,M), got {tuple(raw_type_ids.shape)}")
+    if ((raw_type_ids < 1) | (raw_type_ids > len(REAL_GRASP_TYPE_IDS))).any():
+        raise ValueError("Joint raw type ids must be in [1, 5]")
+    counts = torch.stack(
+        [
+            torch.bincount(row.long() - 1, minlength=len(REAL_GRASP_TYPE_IDS))
+            for row in raw_type_ids
+        ],
+        dim=0,
+    )
+    return counts.float() / float(raw_type_ids.shape[1]), counts
+
+
+def _joint_selection_config(config: DictConfig, candidate_num: int, topk: int) -> DictConfig:
+    """Clone selection config with counts clamped to a variable hard-mode group."""
+    if candidate_num < topk or topk <= 0:
+        raise ValueError("Joint selection requires 0 < topk <= candidate_num")
+    selection_config = copy.deepcopy(config)
+    with open_dict(selection_config.algo):
+        selection_config.algo.test_topk = int(topk)
+    with open_dict(selection_config.algo.sample_selection):
+        selection_config.algo.sample_selection.intermediate_topk = int(candidate_num)
+    return selection_config
+
+
+def _joint_placeholder_pose(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Build one finite centered identity pose for a zero-support schema slot."""
+    pose = torch.zeros((1, 1, 14), device=device, dtype=dtype)
+    pose[..., 3] = 1.0
+    pose[..., 10] = 1.0
+    return pose
+
+
+def build_joint_hard_mode_adapter(
+    raw_robot_pose: torch.Tensor,
+    raw_path_score: torch.Tensor,
+    raw_type_ids: torch.Tensor,
+    raw_valid_mask: torch.Tensor,
+    scene_ids: list[str],
+    config: DictConfig,
+) -> dict:
+    """Adapt one raw Joint pool to the fixed five-mode consumer schema.
+
+    The adapter only groups hard sampled modes. It never reassigns a pose by a
+    soft probability and never invokes a mode-conditioned generator.
+    """
+    sampling = joint_sampling_config(config)
+    samples_per_type = export_samples_per_type(config)
+    batch_size, pool_size = raw_type_ids.shape
+    if pool_size != sampling["pool_size"]:
+        raise ValueError(f"Expected Joint pool size {sampling['pool_size']}, got {pool_size}")
+    if tuple(raw_path_score.shape) != (batch_size, pool_size):
+        raise ValueError("Joint path score shape must match raw type ids")
+    if tuple(raw_valid_mask.shape) != (batch_size, pool_size):
+        raise ValueError("Joint valid mask shape must match raw type ids")
+    if raw_robot_pose.shape[:2] != (batch_size, pool_size):
+        raise ValueError("Joint raw pose batch/pool dimensions must match raw type ids")
+    if len(scene_ids) != batch_size:
+        raise ValueError("Joint scene ids must match the batch size")
+
+    budget_scores, raw_counts = joint_mode_budget_scores(raw_type_ids)
+    selected_pose_rows = []
+    selected_index_rows = []
+    selected_score_rows = []
+    replacement_rows = []
+    zero_support_rows = []
+    unique_count_rows = []
+    valid_count_rows = []
+    candidate_count_rows = []
+    adapter_seed_rows = []
+    capped_index_rows = []
+
+    for batch_index, scene_id in enumerate(scene_ids):
+        scene_pose = []
+        scene_indices = []
+        scene_scores = []
+        scene_replacement = []
+        scene_zero_support = []
+        scene_unique_count = []
+        scene_valid_count = []
+        scene_candidate_count = []
+        scene_adapter_seeds = []
+        scene_capped_indices = []
+        for type_index, type_id in enumerate(REAL_GRASP_TYPE_IDS):
+            adapter_seed = _stable_joint_seed(sampling["sampling_seed"], scene_id, type_id)
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(adapter_seed)
+            raw_group_mask = raw_type_ids[batch_index] == type_id
+            valid_group_indices = torch.nonzero(
+                raw_group_mask & raw_valid_mask[batch_index],
+                as_tuple=False,
+            ).squeeze(-1)
+            raw_count = int(raw_counts[batch_index, type_index].item())
+            valid_count = int(valid_group_indices.numel())
+            if raw_count > 0 and valid_count == 0:
+                raise ValueError(
+                    f"Joint mode {type_id} has raw support but no valid pose for scene_id={scene_id}; "
+                    "fallback generation is forbidden"
+                )
+
+            if valid_count > sampling["candidate_cap"]:
+                order = torch.randperm(valid_count, generator=generator)[: sampling["candidate_cap"]]
+                candidate_indices = valid_group_indices[order.to(valid_group_indices.device)]
+            else:
+                candidate_indices = valid_group_indices
+            candidate_count = int(candidate_indices.numel())
+            padded_cap_indices = torch.full(
+                (sampling["candidate_cap"],),
+                -1,
+                device=raw_type_ids.device,
+                dtype=torch.long,
+            )
+            if candidate_count:
+                padded_cap_indices[:candidate_count] = candidate_indices
+
+            if candidate_count == 0:
+                selected_indices = torch.full(
+                    (samples_per_type,),
+                    -1,
+                    device=raw_type_ids.device,
+                    dtype=torch.long,
+                )
+                selected_pose = _joint_placeholder_pose(raw_robot_pose.device, raw_robot_pose.dtype).expand(
+                    samples_per_type,
+                    -1,
+                    -1,
+                )
+                selected_scores = torch.zeros(
+                    samples_per_type,
+                    device=raw_path_score.device,
+                    dtype=raw_path_score.dtype,
+                )
+                replacement_mask = torch.ones(samples_per_type, device=raw_type_ids.device, dtype=torch.bool)
+                zero_support = True
+                unique_count = 0
+            else:
+                candidate_pose = raw_robot_pose[batch_index, candidate_indices][None]
+                candidate_score = raw_path_score[batch_index, candidate_indices][None]
+                distinct_num = min(candidate_count, samples_per_type)
+                selection_config = _joint_selection_config(config, candidate_count, distinct_num)
+                distinct_local_indices = _candidate_selection_indices(
+                    candidate_pose,
+                    candidate_score,
+                    selection_config,
+                )[0]
+                distinct_raw_indices = candidate_indices[distinct_local_indices]
+                if candidate_count >= samples_per_type:
+                    selected_indices = distinct_raw_indices
+                    replacement_mask = torch.zeros(
+                        samples_per_type,
+                        device=raw_type_ids.device,
+                        dtype=torch.bool,
+                    )
+                else:
+                    replacement_num = samples_per_type - distinct_num
+                    replacement_choice = torch.randint(
+                        0,
+                        distinct_num,
+                        (replacement_num,),
+                        generator=generator,
+                    ).to(raw_type_ids.device)
+                    selected_indices = torch.cat(
+                        [distinct_raw_indices, distinct_raw_indices[replacement_choice]],
+                        dim=0,
+                    )
+                    replacement_mask = torch.cat(
+                        [
+                            torch.zeros(distinct_num, device=raw_type_ids.device, dtype=torch.bool),
+                            torch.ones(replacement_num, device=raw_type_ids.device, dtype=torch.bool),
+                        ],
+                        dim=0,
+                    )
+                selected_pose = raw_robot_pose[batch_index, selected_indices]
+                selected_scores = raw_path_score[batch_index, selected_indices]
+                zero_support = False
+                unique_count = distinct_num
+
+            scene_pose.append(selected_pose)
+            scene_indices.append(selected_indices)
+            scene_scores.append(selected_scores)
+            scene_replacement.append(replacement_mask)
+            scene_zero_support.append(zero_support)
+            scene_unique_count.append(unique_count)
+            scene_valid_count.append(valid_count)
+            scene_candidate_count.append(candidate_count)
+            scene_adapter_seeds.append(adapter_seed)
+            scene_capped_indices.append(padded_cap_indices)
+
+        selected_pose_rows.append(torch.stack(scene_pose, dim=0))
+        selected_index_rows.append(torch.stack(scene_indices, dim=0))
+        selected_score_rows.append(torch.stack(scene_scores, dim=0))
+        replacement_rows.append(torch.stack(scene_replacement, dim=0))
+        zero_support_rows.append(scene_zero_support)
+        unique_count_rows.append(scene_unique_count)
+        valid_count_rows.append(scene_valid_count)
+        candidate_count_rows.append(scene_candidate_count)
+        adapter_seed_rows.append(scene_adapter_seeds)
+        capped_index_rows.append(torch.stack(scene_capped_indices, dim=0))
+
+    return {
+        "budget_scores": budget_scores,
+        "raw_type_counts": raw_counts,
+        "selected_robot_pose": torch.stack(selected_pose_rows, dim=0),
+        "selected_raw_indices": torch.stack(selected_index_rows, dim=0),
+        "selected_path_score": torch.stack(selected_score_rows, dim=0),
+        "export_replacement_mask": torch.stack(replacement_rows, dim=0),
+        "zero_support_mask": torch.as_tensor(zero_support_rows, device=raw_type_ids.device, dtype=torch.bool),
+        "unique_sample_count": torch.as_tensor(unique_count_rows, device=raw_type_ids.device, dtype=torch.long),
+        "valid_sample_count": torch.as_tensor(valid_count_rows, device=raw_type_ids.device, dtype=torch.long),
+        "candidate_count": torch.as_tensor(candidate_count_rows, device=raw_type_ids.device, dtype=torch.long),
+        "adapter_seeds": np.asarray(adapter_seed_rows, dtype=np.int64),
+        "capped_raw_indices": torch.stack(capped_index_rows, dim=0),
+    }
+
+
+def raw_joint_file_path(output_dir: str, scene_id: str) -> str:
+    """Return the separate compressed raw-pool artifact path for one scene."""
+    normalized_scene_id = str(scene_id).replace("\\", "/").strip("/")
+    if not normalized_scene_id or any(part in {"", ".", ".."} for part in normalized_scene_id.split("/")):
+        raise ValueError(f"Invalid scene_id for raw Joint artifact: {scene_id!r}")
+    return pjoin(output_dir, "raw_joint", f"{normalized_scene_id}.npz")
+
+
+def file_sha256(path: str) -> str:
+    """Compute SHA-256 for an arbitrary artifact path."""
+    return checkpoint_sha256(path)
+
+
+def _joint_placeholder_t24(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Build one finite identity-rotation centered T24 placeholder."""
+    t24 = torch.zeros(24, device=device, dtype=dtype)
+    identity = torch.eye(3, device=device, dtype=dtype).reshape(9)
+    t24[0:9] = identity
+    t24[12:21] = identity
+    return t24
+
+
+def gather_joint_selected_t24(
+    canonical_t24: torch.Tensor,
+    selected_raw_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Gather selected raw T24 values while materializing zero-support placeholders."""
+    batch_size, type_num, selected_num = selected_raw_indices.shape
+    selected = torch.empty(
+        (batch_size, type_num, selected_num, 24),
+        device=canonical_t24.device,
+        dtype=canonical_t24.dtype,
+    )
+    placeholder = _joint_placeholder_t24(canonical_t24.device, canonical_t24.dtype)
+    for batch_index in range(batch_size):
+        for type_index in range(type_num):
+            indices = selected_raw_indices[batch_index, type_index]
+            supported = indices >= 0
+            selected[batch_index, type_index] = placeholder
+            if supported.any():
+                selected[batch_index, type_index, supported] = canonical_t24[
+                    batch_index,
+                    indices[supported],
+                ]
+    return selected
+
+
+def sample_joint_scene_scores_and_poses(
+    config: DictConfig,
+    model: torch.nn.Module,
+    split_lookup: dict[str, str],
+    output_dir: str,
+    scene_dir: str,
+    checkpoint_meta: dict,
+    skip_scene_ids: set[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Export coupled Joint priors through a hard-mode compatibility adapter."""
+    if not hasattr(model, "sample_joint"):
+        raise TypeError("Joint export model must implement sample_joint")
+    if normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist")) != "index_mcp":
+        raise ValueError("Formal Joint BimanBODex export requires data.hand_pos_source=index_mcp")
+
+    sampling = joint_sampling_config(config)
+    samples_per_type = export_samples_per_type(config)
+    include_log_prob = bool(getattr(config.task, "include_log_prob", True))
+    include_grasp_pose = bool(getattr(config.task, "include_grasp_pose", False))
+    scene_pass_grasp_types = _as_list(getattr(config.task, "score_grasp_types", ["0_any"]))[:1] or ["0_any"]
+    score_lines: list[dict] = []
+    scene_index: list[dict] = []
+    saved_scene_ids: set[str] = set()
+    skip_scene_ids = skip_scene_ids or set()
+
+    for split_name in _as_list(getattr(config.task, "object_splits", [config.test_data.test_split])):
+        pass_config = clone_config_with_grasp_types(config, scene_pass_grasp_types, str(split_name))
+        test_loader = create_test_dataloader(pass_config)
+        for data in tqdm(test_loader, desc=f"joint obj prior scene [{split_name}]"):
+            batch_metadata = [read_scene_metadata(scene_path) for scene_path in data["scene_path"]]
+            keep_indices = [
+                batch_index
+                for batch_index, metadata in enumerate(batch_metadata)
+                if metadata["scene_id"] not in skip_scene_ids
+            ]
+            if not keep_indices:
+                continue
+            data = filter_batch_data(data, keep_indices, config)
+            batch_metadata = [batch_metadata[index] for index in keep_indices]
+            scene_ids = [metadata["scene_id"] for metadata in batch_metadata]
+            scene_seeds = [
+                _stable_joint_seed(sampling["sampling_seed"], scene_id)
+                for scene_id in scene_ids
+            ]
+
+            joint_result = model.sample_joint(data, sampling["pool_size"], scene_seeds)
+            required_result_keys = {"canonical_t24", "type_ids", "robot_pose", "joint_path_score", "diagnostics"}
+            missing_result_keys = sorted(required_result_keys.difference(joint_result))
+            if missing_result_keys:
+                raise KeyError(f"Joint model result is missing keys: {missing_result_keys}")
+            canonical_t24 = joint_result["canonical_t24"]
+            raw_type_ids = joint_result["type_ids"].long()
+            raw_robot_pose = joint_result["robot_pose"]
+            raw_path_score = joint_result["joint_path_score"]
+            diagnostics = joint_result["diagnostics"]
+            batch_size = len(scene_ids)
+            expected_pool_shape = (batch_size, sampling["pool_size"])
+            if tuple(canonical_t24.shape) != (*expected_pool_shape, 24):
+                raise ValueError(f"Invalid Joint canonical_t24 shape: {tuple(canonical_t24.shape)}")
+            if tuple(raw_type_ids.shape) != expected_pool_shape:
+                raise ValueError(f"Invalid Joint type_ids shape: {tuple(raw_type_ids.shape)}")
+            if tuple(raw_robot_pose.shape) != (*expected_pool_shape, 1, 14):
+                raise ValueError(f"Invalid Joint robot_pose shape: {tuple(raw_robot_pose.shape)}")
+            if tuple(raw_path_score.shape) != expected_pool_shape:
+                raise ValueError(f"Invalid Joint joint_path_score shape: {tuple(raw_path_score.shape)}")
+            if ((raw_type_ids < 1) | (raw_type_ids > len(REAL_GRASP_TYPE_IDS))).any():
+                raise ValueError("Joint model emitted a type id outside [1, 5]")
+
+            raw_valid_mask = (
+                torch.isfinite(canonical_t24).all(dim=-1)
+                & torch.isfinite(raw_robot_pose).reshape(batch_size, sampling["pool_size"], -1).all(dim=-1)
+                & torch.isfinite(raw_path_score)
+            )
+            adapter = build_joint_hard_mode_adapter(
+                raw_robot_pose,
+                raw_path_score,
+                raw_type_ids,
+                raw_valid_mask,
+                scene_ids,
+                config,
+            )
+            selected_centered_t24 = gather_joint_selected_t24(
+                canonical_t24,
+                adapter["selected_raw_indices"],
+            )
+
+            type_num = len(REAL_GRASP_TYPE_IDS)
+            selected_pose = adapter["selected_robot_pose"].reshape(
+                batch_size,
+                type_num * samples_per_type,
+                *adapter["selected_robot_pose"].shape[3:],
+            )
+            selected_pose = rescale_human_pose_translations_for_export(selected_pose, export_robot_size(config))
+            type_ids = torch.as_tensor(REAL_GRASP_TYPE_IDS, device=selected_pose.device, dtype=torch.long)
+            type_ids_for_decenter = (
+                type_ids[None, :, None]
+                .expand(batch_size, type_num, samples_per_type)
+                .reshape(batch_size, type_num * samples_per_type)
+            )
+            if "pc_centroid" in data:
+                selected_pose = _decenter_human_pose(selected_pose, data["pc_centroid"], type_ids_for_decenter)
+            grasp_pose = pose_tensor_to_grasp_pose(selected_pose).reshape(
+                batch_size,
+                type_num,
+                samples_per_type,
+                -1,
+            )
+
+            grasp_pose_np = grasp_pose.detach().cpu().numpy().astype(np.float32)
+            budget_scores_np = adapter["budget_scores"].detach().cpu().numpy().astype(np.float32)
+            adapter_np = {
+                key: value.detach().cpu().numpy()
+                for key, value in adapter.items()
+                if torch.is_tensor(value)
+            }
+            canonical_t24_np = canonical_t24.detach().cpu().numpy().astype(np.float32)
+            raw_robot_pose_np = raw_robot_pose.detach().cpu().numpy().astype(np.float32)
+            raw_type_ids_np = raw_type_ids.detach().cpu().numpy().astype(np.int64)
+            raw_path_score_np = raw_path_score.detach().cpu().numpy().astype(np.float32)
+            raw_valid_mask_np = raw_valid_mask.detach().cpu().numpy().astype(bool)
+            diagnostic_np = {
+                key: value.detach().cpu().numpy()
+                for key, value in diagnostics.items()
+                if torch.is_tensor(value)
+            }
+
+            for batch_index, metadata in enumerate(batch_metadata):
+                scene_id = metadata["scene_id"]
+                if scene_id in saved_scene_ids:
+                    raise ValueError(f"Duplicate Joint export record for scene_id={scene_id}")
+                object_id = metadata["object_id"]
+                split = scene_split_for_record(object_id, str(split_name), split_lookup)
+                scene_path = data["scene_path"][batch_index]
+                pc_path = get_batch_value(data, "pc_path", batch_index)
+
+                raw_file = raw_joint_file_path(output_dir, scene_id)
+                os.makedirs(os.path.dirname(raw_file), exist_ok=True)
+                scene_raw_types = raw_type_ids_np[batch_index]
+                scene_raw_pose = raw_robot_pose_np[batch_index, :, 0]
+                right_quat_norm = np.linalg.norm(scene_raw_pose[:, 3:7], axis=-1)
+                left_quat_norm = np.linalg.norm(scene_raw_pose[:, 10:14], axis=-1)
+                mode_active_consistency = raw_valid_mask_np[batch_index] & np.isclose(
+                    right_quat_norm,
+                    1.0,
+                    atol=float(getattr(config.task, "quat_norm_tol", 1e-3)),
+                )
+                bimanual_raw = scene_raw_types >= 4
+                mode_active_consistency &= (~bimanual_raw) | np.isclose(
+                    left_quat_norm,
+                    1.0,
+                    atol=float(getattr(config.task, "quat_norm_tol", 1e-3)),
+                )
+                raw_unique_pose_count = np.asarray(
+                    [
+                        np.unique(canonical_t24_np[batch_index][scene_raw_types == type_id], axis=0).shape[0]
+                        for type_id in REAL_GRASP_TYPE_IDS
+                    ],
+                    dtype=np.int64,
+                )
+                raw_duplicate_pose_count = adapter_np["raw_type_counts"][batch_index] - raw_unique_pose_count
+                active_consistency_count = np.asarray(
+                    [
+                        mode_active_consistency[scene_raw_types == type_id].sum()
+                        for type_id in REAL_GRASP_TYPE_IDS
+                    ],
+                    dtype=np.int64,
+                )
+                raw_type_counts = adapter_np["raw_type_counts"][batch_index]
+                active_consistency_rate = np.divide(
+                    active_consistency_count,
+                    raw_type_counts,
+                    out=np.zeros(type_num, dtype=np.float32),
+                    where=raw_type_counts > 0,
+                )
+                raw_payload = {
+                    "scene_id": np.asarray(scene_id),
+                    "factorization": np.asarray(JOINT_FACTORIZATION),
+                    "checkpoint_sha256": np.asarray(checkpoint_meta["joint_checkpoint_sha256"]),
+                    "scene_seed": np.int64(scene_seeds[batch_index]),
+                    "type_ids": raw_type_ids_np[batch_index],
+                    "canonical_t24": canonical_t24_np[batch_index],
+                    "robot_pose": raw_robot_pose_np[batch_index],
+                    "joint_path_score": raw_path_score_np[batch_index],
+                    "valid_mask": raw_valid_mask_np[batch_index],
+                    "mode_active_hand_consistency": mode_active_consistency,
+                }
+                for key in (
+                    "preprojection_t24",
+                    "categorical_path_score",
+                    "continuous_path_score",
+                    "final_type_probability",
+                ):
+                    if key in diagnostic_np:
+                        raw_payload[key] = diagnostic_np[key][batch_index]
+                if "sampling_timesteps" in diagnostic_np:
+                    raw_payload["sampling_timesteps"] = diagnostic_np["sampling_timesteps"]
+                np.savez_compressed(raw_file, **raw_payload)
+                raw_hash = file_sha256(raw_file)
+                raw_relative_path = os.path.relpath(raw_file, output_dir)
+
+                score_record = {
+                    "scene_id": scene_id,
+                    "object_id": object_id,
+                    "split": split,
+                    "scene_path": scene_path,
+                    "pc_path": pc_path,
+                    "budget_scores": budget_scores_np[batch_index],
+                }
+                pose_record_by_type = {}
+                for type_index, grasp_type_id in enumerate(REAL_GRASP_TYPE_IDS):
+                    pose_record = convert_target_pose_to_export_pose(
+                        grasp_pose_np[batch_index, type_index],
+                        "index_mcp",
+                    )
+                    pose_record.update(
+                        {
+                            "scene_id": scene_id,
+                            "object_id": object_id,
+                            "split": split,
+                            "scene_path": scene_path,
+                            "pc_path": pc_path,
+                            "grasp_type_id": grasp_type_id,
+                            "grasp_type_name": GRASP_TYPES[grasp_type_id],
+                            "active_hand_mask": build_active_hand_mask(grasp_type_id, samples_per_type, 2),
+                        }
+                    )
+                    if include_log_prob:
+                        pose_record["log_prob"] = adapter_np["selected_path_score"][batch_index, type_index]
+                    if include_grasp_pose:
+                        pose_record["grasp_pose"] = grasp_pose_np[batch_index, type_index]
+                    pose_record_by_type[grasp_type_id] = pose_record
+
+                scene_data = build_scene_export_record(score_record, pose_record_by_type, config)
+                scene_data.update(
+                    {
+                        "joint_sampling_order": np.asarray(
+                            ["joint_pool", "hard_group", "cap", "select", "replacement", "export"]
+                        ),
+                        "joint_pool_size": np.int64(sampling["pool_size"]),
+                        "joint_candidate_cap": np.int64(sampling["candidate_cap"]),
+                        "joint_sampling_base_seed": np.int64(sampling["sampling_seed"]),
+                        "joint_scene_seed": np.int64(scene_seeds[batch_index]),
+                        "joint_adapter_seeds": adapter["adapter_seeds"][batch_index].astype(np.int64),
+                        "joint_raw_type_counts": adapter_np["raw_type_counts"][batch_index].astype(np.int64),
+                        "joint_valid_sample_count": adapter_np["valid_sample_count"][batch_index].astype(np.int64),
+                        "joint_candidate_count": adapter_np["candidate_count"][batch_index].astype(np.int64),
+                        "joint_unique_sample_count": adapter_np["unique_sample_count"][batch_index].astype(np.int64),
+                        "joint_capped_raw_indices": adapter_np["capped_raw_indices"][batch_index].astype(np.int64),
+                        "joint_selected_raw_indices": adapter_np["selected_raw_indices"][batch_index].astype(np.int64),
+                        "joint_export_replacement_mask": adapter_np["export_replacement_mask"][batch_index].astype(bool),
+                        "joint_zero_support_mask": adapter_np["zero_support_mask"][batch_index].astype(bool),
+                        "joint_selected_centered_t24": selected_centered_t24[batch_index]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32),
+                        "joint_selected_path_score": adapter_np["selected_path_score"][batch_index].astype(np.float32),
+                        "joint_raw_invalid_count": np.int64((~raw_valid_mask_np[batch_index]).sum()),
+                        "joint_raw_invalid_rate": np.float32((~raw_valid_mask_np[batch_index]).mean()),
+                        "joint_raw_unique_pose_count": raw_unique_pose_count,
+                        "joint_raw_duplicate_pose_count": raw_duplicate_pose_count.astype(np.int64),
+                        "joint_mode_active_hand_consistency_rate": active_consistency_rate,
+                        "joint_path_score_semantics": (
+                            "sampled_categorical_reverse_log_probability_plus_"
+                            "negative_predicted_noise_energy_surrogate"
+                        ),
+                        "joint_checkpoint_sha256": checkpoint_meta["joint_checkpoint_sha256"],
+                        "joint_raw_artifact_relative_path": raw_relative_path,
+                        "joint_raw_artifact_sha256": raw_hash,
+                        "joint_raw_pool_included": np.bool_(True),
+                    }
+                )
+                validate_joint_scene_export(scene_data, config, checkpoint_meta, output_dir=output_dir)
+                scene_file = scene_file_path(scene_dir, scene_id)
+                os.makedirs(os.path.dirname(scene_file), exist_ok=True)
+                np.save(scene_file, scene_data)
+                summary = scene_summary_from_data(scene_data, scene_file)
+                score_lines.append(summary)
+                scene_index.append(scene_index_from_summary(summary))
+                saved_scene_ids.add(scene_id)
+    return score_lines, scene_index
 
 
 def reverse_weighted_resample_indices(
@@ -1855,6 +2495,225 @@ def validate_reverse_scene_export(
             raise ValueError("Reverse conditional scores do not match raw-pool provenance")
 
 
+def validate_joint_scene_export(
+    scene_data: dict,
+    config: DictConfig,
+    checkpoint_meta: dict | None = None,
+    output_dir: str | None = None,
+) -> None:
+    """Validate Joint raw-pool provenance and fixed-schema adapter semantics."""
+    validate_scene_export(scene_data, float(getattr(config.task, "quat_norm_tol", 1e-3)))
+    if str(scene_data.get("factorization")) != JOINT_FACTORIZATION:
+        raise ValueError("Joint scene export has an invalid factorization tag")
+    if str(scene_data.get("score_semantics")) != "monte_carlo_joint_mode_frequency":
+        raise ValueError("Joint scene export has invalid score semantics")
+    sampling = joint_sampling_config(config)
+    type_num = len(REAL_GRASP_TYPE_IDS)
+    selected_num = export_samples_per_type(config)
+    expected_order = ["joint_pool", "hard_group", "cap", "select", "replacement", "export"]
+    if np.asarray(scene_data.get("joint_sampling_order", [])).astype(str).tolist() != expected_order:
+        raise ValueError("Joint scene export has an invalid sampling order")
+    if int(scene_data.get("joint_pool_size", -1)) != sampling["pool_size"]:
+        raise ValueError("Joint scene export uses a different raw pool size")
+    if int(scene_data.get("joint_candidate_cap", -1)) != sampling["candidate_cap"]:
+        raise ValueError("Joint scene export uses a different candidate cap")
+    if int(scene_data.get("joint_sampling_base_seed", -1)) != sampling["sampling_seed"]:
+        raise ValueError("Joint scene export uses a different sampling base seed")
+    expected_scene_seed = _stable_joint_seed(
+        sampling["sampling_seed"],
+        str(scene_data["scene_id"]),
+    )
+    if int(scene_data.get("joint_scene_seed", -1)) != expected_scene_seed:
+        raise ValueError("Joint scene export has an invalid scene seed")
+    expected_adapter_seeds = np.asarray(
+        [
+            _stable_joint_seed(sampling["sampling_seed"], str(scene_data["scene_id"]), type_id)
+            for type_id in REAL_GRASP_TYPE_IDS
+        ],
+        dtype=np.int64,
+    )
+    if not np.array_equal(np.asarray(scene_data.get("joint_adapter_seeds")), expected_adapter_seeds):
+        raise ValueError("Joint scene export has invalid per-mode adapter seeds")
+
+    expected_shapes = {
+        "joint_raw_type_counts": (type_num,),
+        "joint_valid_sample_count": (type_num,),
+        "joint_candidate_count": (type_num,),
+        "joint_unique_sample_count": (type_num,),
+        "joint_capped_raw_indices": (type_num, sampling["candidate_cap"]),
+        "joint_selected_raw_indices": (type_num, selected_num),
+        "joint_export_replacement_mask": (type_num, selected_num),
+        "joint_zero_support_mask": (type_num,),
+        "joint_selected_centered_t24": (type_num, selected_num, 24),
+        "joint_selected_path_score": (type_num, selected_num),
+        "joint_raw_unique_pose_count": (type_num,),
+        "joint_raw_duplicate_pose_count": (type_num,),
+        "joint_mode_active_hand_consistency_rate": (type_num,),
+    }
+    for key, expected_shape in expected_shapes.items():
+        if key not in scene_data:
+            raise KeyError(f"Joint scene export is missing {key}")
+        if np.asarray(scene_data[key]).shape != expected_shape:
+            raise ValueError(f"Invalid {key} shape: {np.asarray(scene_data[key]).shape}, expected {expected_shape}")
+    for key in ("joint_selected_centered_t24", "joint_selected_path_score"):
+        if not np.isfinite(np.asarray(scene_data[key])).all():
+            raise ValueError(f"Joint scene export contains non-finite values in {key}")
+
+    raw_counts = np.asarray(scene_data["joint_raw_type_counts"], dtype=np.int64)
+    valid_counts = np.asarray(scene_data["joint_valid_sample_count"], dtype=np.int64)
+    candidate_counts = np.asarray(scene_data["joint_candidate_count"], dtype=np.int64)
+    unique_counts = np.asarray(scene_data["joint_unique_sample_count"], dtype=np.int64)
+    zero_support = np.asarray(scene_data["joint_zero_support_mask"], dtype=bool)
+    selected_indices = np.asarray(scene_data["joint_selected_raw_indices"], dtype=np.int64)
+    replacement_mask = np.asarray(scene_data["joint_export_replacement_mask"], dtype=bool)
+    capped_indices = np.asarray(scene_data["joint_capped_raw_indices"], dtype=np.int64)
+    if raw_counts.sum() != sampling["pool_size"] or (raw_counts < 0).any():
+        raise ValueError("Joint raw type counts must be non-negative and sum to pool_size")
+    expected_budget = raw_counts.astype(np.float32) / float(sampling["pool_size"])
+    if not np.allclose(np.asarray(scene_data["budget_scores"]), expected_budget, atol=1e-7):
+        raise ValueError("Joint budget scores must equal raw hard-mode counts divided by pool_size")
+    if not np.array_equal(zero_support, raw_counts == 0):
+        raise ValueError("Joint zero-support mask must match raw hard-mode support")
+    if (valid_counts < 0).any() or (valid_counts > raw_counts).any():
+        raise ValueError("Joint valid counts must lie between zero and raw counts")
+    if ((raw_counts > 0) & (valid_counts == 0)).any():
+        raise ValueError("Joint supported modes must retain at least one valid raw pose")
+    expected_candidate_counts = np.minimum(valid_counts, sampling["candidate_cap"])
+    if not np.array_equal(candidate_counts, expected_candidate_counts):
+        raise ValueError("Joint candidate counts do not match cap(valid_count)")
+    expected_unique_counts = np.minimum(candidate_counts, selected_num)
+    if not np.array_equal(unique_counts, expected_unique_counts):
+        raise ValueError("Joint unique sample counts do not match selected distinct support")
+
+    for type_index in range(type_num):
+        candidate_count = int(candidate_counts[type_index])
+        if candidate_count:
+            valid_cap = capped_indices[type_index, :candidate_count]
+            if (valid_cap < 0).any() or (valid_cap >= sampling["pool_size"]).any():
+                raise ValueError("Joint capped raw indices are out of range")
+            if np.unique(valid_cap).size != candidate_count:
+                raise ValueError("Joint capped raw indices must be unique within each mode")
+        if not np.all(capped_indices[type_index, candidate_count:] == -1):
+            raise ValueError("Joint capped raw index padding must use -1")
+
+        if zero_support[type_index]:
+            if not np.all(selected_indices[type_index] == -1):
+                raise ValueError("Joint zero-support selected indices must use -1 placeholders")
+            if not replacement_mask[type_index].all():
+                raise ValueError("Joint zero-support placeholders must be marked in replacement_mask")
+            continue
+        if (selected_indices[type_index] < 0).any() or (
+            selected_indices[type_index] >= sampling["pool_size"]
+        ).any():
+            raise ValueError("Joint selected raw indices are out of range")
+        distinct_num = int(unique_counts[type_index])
+        if np.unique(selected_indices[type_index, :distinct_num]).size != distinct_num:
+            raise ValueError("Joint distinct selected prefix contains duplicate raw indices")
+        if replacement_mask[type_index, :distinct_num].any():
+            raise ValueError("Joint distinct selected prefix must not be marked as replacement")
+        if not replacement_mask[type_index, distinct_num:].all():
+            raise ValueError("Joint padded selected suffix must be marked as replacement")
+
+    expected_active_hand_mask = np.stack(
+        [build_active_hand_mask(type_id, selected_num, hand_num=2) for type_id in REAL_GRASP_TYPE_IDS],
+        axis=0,
+    )
+    if not np.array_equal(np.asarray(scene_data["active_hand_mask"], dtype=bool), expected_active_hand_mask):
+        raise ValueError("Joint active-hand mask does not match exported hard modes")
+    if int(scene_data.get("joint_raw_invalid_count", -1)) < 0:
+        raise ValueError("Joint raw invalid count must be non-negative")
+    invalid_rate = float(scene_data.get("joint_raw_invalid_rate", np.nan))
+    if not np.isfinite(invalid_rate) or invalid_rate < 0.0 or invalid_rate > 1.0:
+        raise ValueError("Joint raw invalid rate must be finite in [0, 1]")
+    unique_pose_count = np.asarray(scene_data["joint_raw_unique_pose_count"], dtype=np.int64)
+    duplicate_pose_count = np.asarray(scene_data["joint_raw_duplicate_pose_count"], dtype=np.int64)
+    if (unique_pose_count < 0).any() or not np.array_equal(unique_pose_count + duplicate_pose_count, raw_counts):
+        raise ValueError("Joint raw unique/duplicate pose counts do not match raw type counts")
+    consistency_rate = np.asarray(scene_data["joint_mode_active_hand_consistency_rate"], dtype=np.float32)
+    if not np.isfinite(consistency_rate).all() or ((consistency_rate < 0.0) | (consistency_rate > 1.0)).any():
+        raise ValueError("Joint mode-active-hand consistency rates must be finite in [0, 1]")
+    if not bool(scene_data.get("joint_raw_pool_included", False)):
+        raise ValueError("Joint raw-pool artifact must be included")
+    checkpoint_hash = str(scene_data.get("joint_checkpoint_sha256", ""))
+    if len(checkpoint_hash) != 64:
+        raise ValueError("Joint scene export has an invalid checkpoint hash")
+    if checkpoint_meta is not None and checkpoint_hash != str(checkpoint_meta["joint_checkpoint_sha256"]):
+        raise ValueError("Joint scene export uses a different checkpoint")
+
+    if output_dir is None:
+        if checkpoint_meta is None:
+            raise ValueError("Joint raw artifact validation requires output_dir or checkpoint metadata")
+        output_dir = resolve_output_dir(config, checkpoint_meta)
+    raw_relative_path = str(scene_data.get("joint_raw_artifact_relative_path", ""))
+    raw_path = os.path.abspath(pjoin(output_dir, raw_relative_path))
+    raw_root = os.path.abspath(pjoin(output_dir, "raw_joint"))
+    if os.path.commonpath([raw_path, raw_root]) != raw_root:
+        raise ValueError("Joint raw artifact path escapes raw_joint root")
+    if not os.path.isfile(raw_path):
+        raise FileNotFoundError(f"Joint raw artifact does not exist: {raw_path}")
+    if file_sha256(raw_path) != str(scene_data.get("joint_raw_artifact_sha256", "")):
+        raise ValueError("Joint raw artifact hash mismatch")
+    with np.load(raw_path, allow_pickle=False) as raw_artifact:
+        raw_type_ids = np.asarray(raw_artifact["type_ids"], dtype=np.int64)
+        raw_t24 = np.asarray(raw_artifact["canonical_t24"], dtype=np.float32)
+        raw_score = np.asarray(raw_artifact["joint_path_score"], dtype=np.float32)
+        raw_valid = np.asarray(raw_artifact["valid_mask"], dtype=bool)
+        raw_consistency = np.asarray(raw_artifact["mode_active_hand_consistency"], dtype=bool)
+        if raw_type_ids.shape != (sampling["pool_size"],):
+            raise ValueError("Joint raw artifact has invalid type_ids shape")
+        if raw_t24.shape != (sampling["pool_size"], 24):
+            raise ValueError("Joint raw artifact has invalid canonical_t24 shape")
+        if (
+            raw_score.shape != (sampling["pool_size"],)
+            or raw_valid.shape != (sampling["pool_size"],)
+            or raw_consistency.shape != (sampling["pool_size"],)
+        ):
+            raise ValueError("Joint raw artifact has invalid score or validity shape")
+        if not np.isfinite(raw_t24).all() or not np.isfinite(raw_score).all():
+            raise ValueError("Joint raw artifact contains non-finite pose or path score")
+        artifact_counts = np.bincount(raw_type_ids - 1, minlength=type_num)
+        if not np.array_equal(artifact_counts, raw_counts):
+            raise ValueError("Joint compact raw counts do not match raw artifact")
+        if int((~raw_valid).sum()) != int(scene_data["joint_raw_invalid_count"]):
+            raise ValueError("Joint raw invalid count does not match raw artifact")
+        artifact_consistency_count = np.asarray(
+            [raw_consistency[raw_type_ids == type_id].sum() for type_id in REAL_GRASP_TYPE_IDS],
+            dtype=np.int64,
+        )
+        artifact_consistency_rate = np.divide(
+            artifact_consistency_count,
+            raw_counts,
+            out=np.zeros(type_num, dtype=np.float32),
+            where=raw_counts > 0,
+        )
+        if not np.allclose(consistency_rate, artifact_consistency_rate, atol=1e-7):
+            raise ValueError("Joint mode-active-hand consistency rates do not match raw artifact")
+        artifact_unique_count = np.asarray(
+            [np.unique(raw_t24[raw_type_ids == type_id], axis=0).shape[0] for type_id in REAL_GRASP_TYPE_IDS],
+            dtype=np.int64,
+        )
+        if not np.array_equal(unique_pose_count, artifact_unique_count):
+            raise ValueError("Joint raw unique pose counts do not match raw artifact")
+        for type_index in range(type_num):
+            indices = selected_indices[type_index]
+            supported = indices >= 0
+            if supported.any():
+                if not np.all(raw_type_ids[indices[supported]] == type_index + 1):
+                    raise ValueError("Joint selected pose was assigned to a different hard mode")
+                if not np.allclose(
+                    np.asarray(scene_data["joint_selected_centered_t24"])[type_index, supported],
+                    raw_t24[indices[supported]],
+                    atol=1e-6,
+                ):
+                    raise ValueError("Joint selected T24 does not match raw artifact provenance")
+                if not np.allclose(
+                    np.asarray(scene_data["joint_selected_path_score"])[type_index, supported],
+                    raw_score[indices[supported]],
+                    atol=1e-6,
+                ):
+                    raise ValueError("Joint selected path score does not match raw artifact provenance")
+
+
 def validate_scene_export_completeness(
     scene_data: dict,
     config: DictConfig,
@@ -1912,6 +2771,8 @@ def validate_scene_export_completeness(
 
     if is_reverse_factorization(config):
         validate_reverse_scene_export(scene_data, config, checkpoint_meta)
+    if is_joint_factorization(config):
+        validate_joint_scene_export(scene_data, config, checkpoint_meta)
 
     position = np.asarray(scene_data[position_key])
     wrist_quat = np.asarray(scene_data["wrist_quat"])
@@ -2266,6 +3127,8 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
         "factorization": factorization_from_config(config),
         "checkpoint_path": checkpoint_meta["checkpoint_path"],
         "checkpoint_iter": checkpoint_meta["checkpoint_iter"],
+        "checkpoint_sha256": checkpoint_meta.get("checkpoint_sha256"),
+        "joint_checkpoint_sha256": checkpoint_meta.get("joint_checkpoint_sha256"),
         "uses_independent_models": bool(checkpoint_meta["uses_independent_models"]),
         "robot_name": export_robot_name(config),
         "robot_size": export_robot_size(config),
@@ -2306,6 +3169,23 @@ def build_manifest(config: DictConfig, checkpoint_meta: dict) -> dict:
         "data_hand_pos_source": normalize_hand_pos_source(getattr(config.data, "hand_pos_source", "wrist")),
         "seed": int(config.seed),
         "reverse_sampling": reverse_sampling_config(config) if is_reverse_factorization(config) else None,
+        "joint_sampling": joint_sampling_config(config) if is_joint_factorization(config) else None,
+        "joint_path_score_semantics": (
+            "sampled_categorical_reverse_log_probability_plus_"
+            "negative_predicted_noise_energy_surrogate"
+            if is_joint_factorization(config)
+            else None
+        ),
+        "consumer_contract": (
+            {
+                "schema": "bimanbodex_existing_human_prior_v1",
+                "requires_min_type_budget": 0,
+                "zero_support_placeholder_must_not_be_selected": True,
+                "bimanbodex_modified": False,
+            }
+            if is_joint_factorization(config)
+            else None
+        ),
         "posterior_contract": (
             OmegaConf.to_container(config.algo.posterior_contract, resolve=True)
             if is_reverse_factorization(config)
@@ -2355,6 +3235,16 @@ def task_obj_human_prior_export(config: DictConfig) -> None:
                 score_model,
                 pose_model,
                 split_lookup,
+                scene_dir,
+                checkpoint_meta,
+                skip_scene_ids=skip_scene_ids,
+            )
+        elif is_joint_factorization(config):
+            new_score_lines, new_scene_index = sample_joint_scene_scores_and_poses(
+                config,
+                score_model,
+                split_lookup,
+                output_dir,
                 scene_dir,
                 checkpoint_meta,
                 skip_scene_ids=skip_scene_ids,

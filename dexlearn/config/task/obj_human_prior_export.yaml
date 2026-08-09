@@ -6,6 +6,8 @@ object_splits:
   - all
 
 # One score pass predicts the 5 real grasp-type budget scores for each scene.
+# Joint export uses this pass only to enumerate scenes; the placeholder type is
+# not consumed by the coupled model.
 score_grasp_types:
   - 0_any
 
